@@ -14,6 +14,7 @@ const ORIGIN_DOMAIN: u8 = 1;
 const REPOSITORY_DOMAIN: u8 = 2;
 const REVISION_DOMAIN: u8 = 3;
 const SELECTION_DOMAIN: u8 = 4;
+const HUB_BLOB_BINDING_DOMAIN: u8 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct CacheKey([u8; 32]);
@@ -114,6 +115,28 @@ impl SelectionId {
 }
 
 impl Display for SelectionId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.0, formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(super) struct HubBlobBindingKey(CacheKey);
+
+impl HubBlobBindingKey {
+    pub(super) fn derive(
+        repository: &RepositoryKey,
+        hub_blob_key: &str,
+    ) -> Result<Self, ValidationError> {
+        derive_key(
+            HUB_BLOB_BINDING_DOMAIN,
+            &[repository.as_bytes(), hub_blob_key.as_bytes()],
+        )
+        .map(Self)
+    }
+}
+
+impl Display for HubBlobBindingKey {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         Display::fmt(&self.0, formatter)
     }
@@ -252,6 +275,24 @@ mod tests {
         let direct_selection = derive_key(SELECTION_DOMAIN, &[source])?;
 
         assert_ne!(origin, direct_selection);
+
+        Ok(())
+    }
+
+    #[test]
+    fn hub_blob_binding_keys_match_an_independent_golden_vector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let origin = OriginKey::derive(&endpoint)?;
+        let repository = RepositoryKey::derive(&origin, &spec)?;
+
+        let binding = HubBlobBindingKey::derive(&repository, "45f2f2d3b0f6f8f9e61a")?;
+
+        assert_eq!(
+            binding.to_string(),
+            "bef25933d4ec07adbf83915e72961d87b86c1008e72985ed927bea3e183723c1"
+        );
 
         Ok(())
     }

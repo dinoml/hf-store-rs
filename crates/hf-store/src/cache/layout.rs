@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use crate::validation::ValidationError;
 use crate::{CommitId, Endpoint, RepositorySpec, Revision};
 
-use super::key::{BlobDigest, OriginKey, RepositoryKey, RevisionKey, SelectionId};
+use super::hub_layout::HubBlobKey;
+use super::key::{
+    BlobDigest, HubBlobBindingKey, OriginKey, RepositoryKey, RevisionKey, SelectionId,
+};
 
 const CACHE_DIRECTORY: &str = "hf-store-v1";
 
@@ -111,6 +114,46 @@ impl CacheLayout {
         self.repository_directory()
             .join("snapshots")
             .join(format!("{commit}-{selection}"))
+    }
+
+    pub(super) fn snapshot_manifest(&self, commit: &CommitId, selection: &SelectionId) -> PathBuf {
+        self.snapshot_directory(commit, selection)
+            .join("manifest.json")
+    }
+
+    pub(super) fn snapshot_lock(&self, commit: &CommitId, selection: &SelectionId) -> PathBuf {
+        self.repository_directory()
+            .join("locks")
+            .join("snapshots")
+            .join(format!("{commit}-{selection}.lock"))
+    }
+
+    pub(super) fn hub_blob_binding_record(
+        &self,
+        hub_blob_key: &HubBlobKey,
+    ) -> Result<PathBuf, ValidationError> {
+        let binding = HubBlobBindingKey::derive(&self.repository, hub_blob_key.as_str())?;
+        let binding = binding.to_string();
+        let (prefix, suffix) = binding.split_at(2);
+        Ok(self
+            .repository_directory()
+            .join("bindings")
+            .join("hub-blobs")
+            .join(prefix)
+            .join(format!("{suffix}.json")))
+    }
+
+    pub(super) fn hub_blob_binding_lock(
+        &self,
+        hub_blob_key: &HubBlobKey,
+    ) -> Result<PathBuf, ValidationError> {
+        let binding = HubBlobBindingKey::derive(&self.repository, hub_blob_key.as_str())?;
+        Ok(self
+            .repository_directory()
+            .join("locks")
+            .join("bindings")
+            .join("hub-blobs")
+            .join(format!("{binding}.lock")))
     }
 }
 

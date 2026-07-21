@@ -126,6 +126,7 @@ fn join_repo_path(base: &Path, path: &RepoPath) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use crate::RepositoryId;
+    use crate::cache::key::SelectionId;
 
     use super::*;
 
@@ -249,6 +250,74 @@ mod tests {
             layout.sidecar().repository_directory(),
             layout.repository_directory()
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_sidecar_uses_fixed_keys_and_exact_selection_manifests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PathBuf::from("hub-cache");
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let layout = HubCacheLayout::shared(&root, &endpoint, &spec)?;
+        let blob_key = HubBlobKey::parse("45f2f2d3b0f6f8f9e61a")?;
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let selection = SelectionId::derive(&[
+            RepoPath::parse("config.json")?,
+            RepoPath::parse("weights/model.safetensors")?,
+        ])?;
+
+        let binding = layout.sidecar().hub_blob_binding_record(&blob_key)?;
+        let binding_lock = layout.sidecar().hub_blob_binding_lock(&blob_key)?;
+        let manifest = layout.sidecar().snapshot_manifest(&commit, &selection);
+        let manifest_lock = layout.sidecar().snapshot_lock(&commit, &selection);
+        let sidecar_root = root
+            .join("models--org--repo")
+            .join(".hf-store")
+            .join("hf-store-v1");
+
+        assert!(binding.starts_with(&sidecar_root));
+        assert!(binding_lock.starts_with(&sidecar_root));
+        assert!(manifest.starts_with(&sidecar_root));
+        assert!(manifest_lock.starts_with(&sidecar_root));
+        assert!(
+            binding.ends_with(
+                PathBuf::from("bindings")
+                    .join("hub-blobs")
+                    .join("be")
+                    .join("f25933d4ec07adbf83915e72961d87b86c1008e72985ed927bea3e183723c1.json")
+            )
+        );
+        assert!(
+            manifest.ends_with(
+                PathBuf::from("snapshots")
+                    .join(format!("{commit}-{selection}"))
+                    .join("manifest.json")
+            )
+        );
+        assert!(
+            binding_lock.ends_with(
+                PathBuf::from("locks")
+                    .join("bindings")
+                    .join("hub-blobs")
+                    .join("bef25933d4ec07adbf83915e72961d87b86c1008e72985ed927bea3e183723c1.lock")
+            )
+        );
+        assert!(
+            manifest_lock.ends_with(
+                PathBuf::from("locks")
+                    .join("snapshots")
+                    .join(format!("{commit}-{selection}.lock"))
+            )
+        );
+
+        for path in [binding, binding_lock, manifest, manifest_lock] {
+            let rendered = path.to_string_lossy();
+            assert!(!rendered.contains(blob_key.as_str()));
+            assert!(!rendered.contains("config.json"));
+            assert!(!rendered.contains("model.safetensors"));
+        }
 
         Ok(())
     }
