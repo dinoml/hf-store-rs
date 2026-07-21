@@ -512,6 +512,21 @@ impl SnapshotFileRecord {
         &self.path
     }
 
+    pub(super) fn digest(&self) -> Result<BlobDigest, ValidationError> {
+        BlobDigest::parse(&self.sha256)
+    }
+
+    pub(super) const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(super) fn hub_blob_key(&self) -> Result<Option<HubBlobKey>, ValidationError> {
+        self.hub_blob_key
+            .as_deref()
+            .map(HubBlobKey::parse)
+            .transpose()
+    }
+
     fn validate(&self) -> Result<RepoPath, ValidationError> {
         let path = RepoPath::parse(&self.path)?;
         validate_sha256_hex(&self.sha256, "snapshot blob digest")?;
@@ -545,6 +560,14 @@ impl SnapshotManifestRecord {
 
     pub(super) fn files(&self) -> &[SnapshotFileRecord] {
         &self.files
+    }
+
+    pub(super) fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub(super) fn selection_id(&self) -> &str {
+        &self.selection_id
     }
 }
 
@@ -788,6 +811,11 @@ mod tests {
 
         assert_eq!(tree.files()[0].path(), "a.json");
         assert_eq!(manifest.files()[0].path(), "a.json");
+        assert_eq!(manifest.commit(), COMMIT);
+        assert_eq!(manifest.selection_id(), selection.to_string());
+        assert_eq!(manifest.files()[0].digest()?, digest);
+        assert_eq!(manifest.files()[0].size(), 1);
+        assert!(manifest.files()[0].hub_blob_key()?.is_none());
 
         Ok(())
     }
