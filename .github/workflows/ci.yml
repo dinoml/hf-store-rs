@@ -74,3 +74,61 @@ jobs:
 
       - name: Run tests
         run: cargo +1.85.0 test --workspace --all-features --locked
+
+  python-cache-conformance:
+    name: Pinned Python cache conformance
+    runs-on: ubuntu-latest
+    env:
+      HF_HUB_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      DO_NOT_TRACK: "1"
+      PYTHONPATH: ${{ github.workspace }}/.conformance/huggingface_hub/src
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Check out pinned huggingface_hub source
+        uses: actions/checkout@v7
+        with:
+          repository: huggingface/huggingface_hub
+          ref: 36fd32c84d630f455a23b9a3bc4dc7b76d19cdde
+          path: .conformance/huggingface_hub
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: .conformance/huggingface_hub/pyproject.toml
+
+      - name: Install pinned huggingface_hub checkout
+        run: python -m pip install --disable-pip-version-check --editable .conformance/huggingface_hub
+
+      - name: Test conformance harness
+        run: python -m unittest discover -s conformance/python -p "test_*.py" -v
+
+      - name: Regenerate portable standard-cache corpus
+        run: >-
+          python crates/hf-store/tests/fixtures/huggingface_hub-v1.24.0/generate.py
+          --output "${RUNNER_TEMP}/hf-store-python-portable"
+
+      - name: Compare checked-in portable fixture bytes
+        run: >-
+          python conformance/python/portable_fixture_comparison.py
+          --checked-in crates/hf-store/tests/fixtures/huggingface_hub-v1.24.0
+          --generated "${RUNNER_TEMP}/hf-store-python-portable"
+
+      - name: Generate pinned standard-cache corpus
+        run: >-
+          python crates/hf-store/tests/fixtures/huggingface_hub-v1.24.0/generate.py
+          --output "${RUNNER_TEMP}/hf-store-python-conformance"
+          --runtime-symlinks
+
+      - name: Exercise pinned Python cache readers offline
+        run: >-
+          python conformance/python/cache_conformance.py
+          --reference-root .conformance/huggingface_hub
+          --inventory "${RUNNER_TEMP}/hf-store-python-conformance/inventory.json"
