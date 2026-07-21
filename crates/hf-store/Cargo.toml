@@ -14,10 +14,13 @@ publish = false
 
 [dependencies]
 atomic-write-file.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 fs4.workspace = true
 getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 unicode-normalization.workspace = true
 unicode-casefold.workspace = true

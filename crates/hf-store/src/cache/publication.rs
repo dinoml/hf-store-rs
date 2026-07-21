@@ -3,11 +3,15 @@ use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use atomic_write_file::AtomicWriteFile;
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsSyncExt;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use sha2::{Digest, Sha256};
 
 use crate::validation::ValidationError;
@@ -108,7 +112,24 @@ pub(super) enum EntryKind {
     Other,
 }
 
+pub(super) enum RegularFileOpen {
+    File {
+        reader: Box<dyn Read + Send>,
+        size: u64,
+    },
+    Missing,
+    Other,
+}
+
+pub(super) trait CacheDirectory: Debug + Send + Sync {
+    fn open_dir_nofollow(&self, path: &Path) -> io::Result<Arc<dyn CacheDirectory>>;
+    fn open_regular(&self, path: &Path) -> io::Result<RegularFileOpen>;
+    fn entry_kind(&self, path: &Path) -> io::Result<EntryKind>;
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf>;
+}
+
 pub(super) trait FileSystem: Debug + Send + Sync {
+    fn open_directory(&self, path: &Path) -> io::Result<Arc<dyn CacheDirectory>>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
     fn create_new(&self, path: &Path) -> io::Result<Box<dyn DurableWrite>>;
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>>;
@@ -125,6 +146,16 @@ pub(super) trait FileSystem: Debug + Send + Sync {
 pub(super) struct OsFileSystem;
 
 impl FileSystem for OsFileSystem {
+    fn open_directory(&self, path: &Path) -> io::Result<Arc<dyn CacheDirectory>> {
+        let path = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        let directory = Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
+        Ok(Arc::new(OsCacheDirectory { directory }))
+    }
+
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
     }
@@ -181,6 +212,107 @@ impl FileSystem for OsFileSystem {
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
     }
+}
+
+#[derive(Debug)]
+struct OsCacheDirectory {
+    directory: Dir,
+}
+
+impl OsCacheDirectory {
+    fn open_dir_chain(&self, path: &Path) -> io::Result<Dir> {
+        let mut directory = self.directory.try_clone()?;
+        for component in path.components() {
+            let Component::Normal(name) = component else {
+                return Err(invalid_cache_relative_path());
+            };
+            directory = directory.open_dir_nofollow(name)?;
+        }
+        Ok(directory)
+    }
+
+    fn open_parent_and_name(&self, path: &Path) -> io::Result<(Dir, PathBuf)> {
+        let Some(Component::Normal(name)) = path.components().next_back() else {
+            return Err(invalid_cache_relative_path());
+        };
+        let Some(parent) = path.parent() else {
+            return Err(invalid_cache_relative_path());
+        };
+        Ok((self.open_dir_chain(parent)?, PathBuf::from(name)))
+    }
+}
+
+impl CacheDirectory for OsCacheDirectory {
+    fn open_dir_nofollow(&self, path: &Path) -> io::Result<Arc<dyn CacheDirectory>> {
+        let directory = self.open_dir_chain(path)?;
+        Ok(Arc::new(Self { directory }))
+    }
+
+    fn open_regular(&self, path: &Path) -> io::Result<RegularFileOpen> {
+        let (parent, name) = match self.open_parent_and_name(path) {
+            Ok(location) => location,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RegularFileOpen::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        match parent.symlink_metadata(&name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RegularFileOpen::Missing);
+            }
+            Err(error) => return Err(error),
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_metadata) => return Ok(RegularFileOpen::Other),
+        }
+
+        let mut options = CapOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        options.nonblock(true);
+        let file = match parent.open_with(&name, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RegularFileOpen::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Ok(RegularFileOpen::Other);
+        }
+        Ok(RegularFileOpen::File {
+            reader: Box::new(file),
+            size: metadata.len(),
+        })
+    }
+
+    fn entry_kind(&self, path: &Path) -> io::Result<EntryKind> {
+        let (parent, name) = match self.open_parent_and_name(path) {
+            Ok(location) => location,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(EntryKind::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        match parent.symlink_metadata(name) {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(EntryKind::RegularFile),
+            Ok(_metadata) => Ok(EntryKind::Other),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(EntryKind::Missing),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+        let (parent, name) = self.open_parent_and_name(path)?;
+        parent.read_link_contents(name)
+    }
+}
+
+fn invalid_cache_relative_path() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "cache capability path must contain only relative normal components",
+    )
 }
 
 #[derive(Debug)]
@@ -1550,6 +1682,10 @@ mod tests {
     }
 
     impl FileSystem for SyncFaultFileSystem {
+        fn open_directory(&self, path: &Path) -> io::Result<Arc<dyn CacheDirectory>> {
+            OsFileSystem.open_directory(path)
+        }
+
         fn create_dir_all(&self, path: &Path) -> io::Result<()> {
             OsFileSystem.create_dir_all(path)
         }

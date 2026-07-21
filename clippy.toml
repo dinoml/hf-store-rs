@@ -1,0 +1,17 @@
+# The capability-security stack currently spans io-lifetimes 2 and 3, while
+# its Windows support and hf-store's existing fs4 dependency span adjacent
+# windows-sys/windows-targets compatibility lines. Cargo cannot unify these
+# transitive versions without replacing the audited no-follow implementation.
+allowed-duplicate-crates = [
+    "io-lifetimes",
+    "windows-sys",
+    "windows-targets",
+    "windows_aarch64_gnullvm",
+    "windows_aarch64_msvc",
+    "windows_i686_gnu",
+    "windows_i686_gnullvm",
+    "windows_i686_msvc",
+    "windows_x86_64_gnu",
+    "windows_x86_64_gnullvm",
+    "windows_x86_64_msvc",
+]
