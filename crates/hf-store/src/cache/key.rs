@@ -153,6 +153,21 @@ impl BlobDigest {
     pub(super) const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    pub(super) fn parse(value: &str) -> Result<Self, ValidationError> {
+        let encoded = value.as_bytes();
+        if encoded.len() != 64 {
+            return Err(blob_digest_malformed());
+        }
+
+        let mut decoded = [0_u8; 32];
+        for (index, pair) in encoded.chunks_exact(2).enumerate() {
+            let high = lower_hex_nibble(pair[0]).ok_or_else(blob_digest_malformed)?;
+            let low = lower_hex_nibble(pair[1]).ok_or_else(blob_digest_malformed)?;
+            decoded[index] = (high << 4) | low;
+        }
+        Ok(Self(decoded))
+    }
 }
 
 impl Display for BlobDigest {
@@ -218,6 +233,18 @@ fn materialization_collision() -> ValidationError {
 
 fn key_input_too_long() -> ValidationError {
     ValidationError::new("cache key input", ValidationErrorKind::TooLong)
+}
+
+const fn lower_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn blob_digest_malformed() -> ValidationError {
+    ValidationError::new("blob digest", ValidationErrorKind::Malformed)
 }
 
 fn write_hex(bytes: &[u8], formatter: &mut Formatter<'_>) -> fmt::Result {
@@ -293,6 +320,25 @@ mod tests {
             binding.to_string(),
             "bef25933d4ec07adbf83915e72961d87b86c1008e72985ed927bea3e183723c1"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn blob_digests_decode_only_canonical_lowercase_sha256()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = BlobDigest::for_bytes(b"validated payload");
+        let encoded = expected.to_string();
+
+        assert_eq!(BlobDigest::parse(&encoded)?, expected);
+        for invalid in [
+            encoded.to_ascii_uppercase(),
+            "0".repeat(63),
+            "0".repeat(65),
+            format!("{}g", "0".repeat(63)),
+        ] {
+            BlobDigest::parse(&invalid).expect_err("accepted a non-canonical blob digest");
+        }
 
         Ok(())
     }
