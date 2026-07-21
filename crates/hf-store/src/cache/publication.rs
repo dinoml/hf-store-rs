@@ -17,15 +17,18 @@ use sha2::{Digest, Sha256};
 use crate::validation::ValidationError;
 use crate::{CommitId, Endpoint, RepoPath, RepositorySpec, Revision};
 
-use super::key::{BlobDigest, OriginKey, RepositoryKey};
+use super::hub_layout::HubBlobKey;
+use super::key::{BlobDigest, OriginKey, RepositoryKey, SelectionId};
 use super::layout::CacheLayout;
 use super::metadata::{
-    CacheRecord, FormatRecord, MetadataError, OriginRecord, PartialTransferRecord, RefRecord,
-    RepositoryRecord, decode_record, encode_record,
+    CacheRecord, FormatRecord, HubBlobBindingRecord, MetadataError, OriginRecord,
+    PartialTransferRecord, RefRecord, RepositoryRecord, SnapshotFileRecord, SnapshotManifestRecord,
+    decode_record, encode_record,
 };
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_SMALL_RECORD_BYTES: usize = 64 * 1024;
+const MAX_MANIFEST_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PublicationPoint {
@@ -498,15 +501,71 @@ impl CacheKernel {
 
     pub(super) fn read_ref(&self, revision: &Revision) -> Result<CommitId, CacheError> {
         let path = self.layout.ref_record(revision)?;
-        if self.effects.file_system.entry_kind(&path)? == EntryKind::Other {
-            return Err(CacheError::conflicting_record());
-        }
-        let bytes = read_all(self.effects.file_system.as_ref(), &path)?;
-        let record = decode_record::<RefRecord>(&bytes)?;
+        let record: RefRecord = self.read_record(&path, MAX_SMALL_RECORD_BYTES)?;
         if record.revision() != revision.as_str() {
             return Err(CacheError::conflicting_record());
         }
         Ok(CommitId::parse(record.commit())?)
+    }
+
+    pub(super) fn publish_hub_blob_binding(
+        &self,
+        hub_blob_key: &HubBlobKey,
+        digest: BlobDigest,
+        size: u64,
+    ) -> Result<(), CacheError> {
+        let destination = self.layout.hub_blob_binding_record(hub_blob_key)?;
+        let lock_path = self.layout.hub_blob_binding_lock(hub_blob_key)?;
+        let record = HubBlobBindingRecord::new(hub_blob_key, digest, size);
+        self.publish_immutable_record(&destination, &lock_path, &record, MAX_SMALL_RECORD_BYTES)
+    }
+
+    pub(super) fn read_hub_blob_binding(
+        &self,
+        hub_blob_key: &HubBlobKey,
+    ) -> Result<HubBlobBindingRecord, CacheError> {
+        let destination = self.layout.hub_blob_binding_record(hub_blob_key)?;
+        let record: HubBlobBindingRecord =
+            self.read_record(&destination, MAX_SMALL_RECORD_BYTES)?;
+        if record.hub_blob_key() != hub_blob_key.as_str() {
+            return Err(CacheError::conflicting_record());
+        }
+        Ok(record)
+    }
+
+    pub(super) fn publish_compatible_manifest(
+        &self,
+        commit: &CommitId,
+        selection: &SelectionId,
+        files: Vec<SnapshotFileRecord>,
+    ) -> Result<(), CacheError> {
+        let record = SnapshotManifestRecord::new(commit, selection, files)?;
+        let encoded = encode_record_bounded(&record, MAX_MANIFEST_RECORD_BYTES)?;
+        self.verify_compatible_manifest_bindings(&record)?;
+
+        let destination = self.layout.snapshot_manifest(commit, selection);
+        let lock_path = self.layout.snapshot_lock(commit, selection);
+        self.publish_encoded_immutable_record(
+            &destination,
+            &lock_path,
+            &record,
+            &encoded,
+            MAX_MANIFEST_RECORD_BYTES,
+        )
+    }
+
+    pub(super) fn read_snapshot_manifest(
+        &self,
+        commit: &CommitId,
+        selection: &SelectionId,
+    ) -> Result<SnapshotManifestRecord, CacheError> {
+        let destination = self.layout.snapshot_manifest(commit, selection);
+        let record: SnapshotManifestRecord =
+            self.read_record(&destination, MAX_MANIFEST_RECORD_BYTES)?;
+        if record.commit() != commit.as_str() || record.selection_id() != selection.to_string() {
+            return Err(CacheError::conflicting_record());
+        }
+        Ok(record)
     }
 
     pub(super) fn new_partial_record(
@@ -535,19 +594,109 @@ impl CacheKernel {
         destination: &Path,
         record: &T,
     ) -> Result<(), CacheError> {
-        let encoded = encode_record(record)?;
-        if encoded.len() > MAX_SMALL_RECORD_BYTES {
-            return Err(CacheError::record_too_large());
-        }
+        let encoded = encode_record_bounded(record, MAX_SMALL_RECORD_BYTES)?;
+        self.replace_encoded_record(destination, &encoded)
+    }
+
+    fn replace_encoded_record(&self, destination: &Path, encoded: &[u8]) -> Result<(), CacheError> {
         create_parent_directories(self.effects.file_system.as_ref(), destination)?;
         self.check_fault(PublicationPoint::BeforeAtomicReplace, false)?;
         self.effects
             .file_system
-            .atomic_replace(destination, &encoded)
+            .atomic_replace(destination, encoded)
             .map_err(|source| CacheError::io(source, true))?;
         self.check_fault(PublicationPoint::AfterAtomicReplace, true)?;
         sync_parent_directory(self.effects.file_system.as_ref(), destination)
             .map_err(|source| CacheError::io(source, true))
+    }
+
+    fn publish_immutable_record<T>(
+        &self,
+        destination: &Path,
+        lock_path: &Path,
+        expected: &T,
+        max_bytes: usize,
+    ) -> Result<(), CacheError>
+    where
+        T: CacheRecord + Eq,
+    {
+        let encoded = encode_record_bounded(expected, max_bytes)?;
+        self.publish_encoded_immutable_record(destination, lock_path, expected, &encoded, max_bytes)
+    }
+
+    fn publish_encoded_immutable_record<T>(
+        &self,
+        destination: &Path,
+        lock_path: &Path,
+        expected: &T,
+        encoded: &[u8],
+        max_bytes: usize,
+    ) -> Result<(), CacheError>
+    where
+        T: CacheRecord + Eq,
+    {
+        create_parent_directories(self.effects.file_system.as_ref(), lock_path)?;
+        let _guard = self.effects.file_system.lock_exclusive(lock_path)?;
+        match self.effects.file_system.entry_kind(destination)? {
+            EntryKind::RegularFile => {
+                let existing = self.read_record::<T>(destination, max_bytes)?;
+                if &existing == expected {
+                    Ok(())
+                } else {
+                    Err(CacheError::conflicting_record())
+                }
+            }
+            EntryKind::Missing => self.replace_encoded_record(destination, encoded),
+            EntryKind::Other => Err(CacheError::conflicting_record()),
+        }
+    }
+
+    fn read_record<T: CacheRecord>(
+        &self,
+        destination: &Path,
+        max_bytes: usize,
+    ) -> Result<T, CacheError> {
+        let cache_root = self
+            .effects
+            .file_system
+            .open_directory(self.layout.cache_root())?;
+        let relative = destination
+            .strip_prefix(self.layout.cache_root())
+            .map_err(|_outside| io::Error::other("cache record is outside its capability root"))?;
+        let bytes = match cache_root.open_regular(relative)? {
+            RegularFileOpen::File { mut reader, size } => {
+                let max_size = u64::try_from(max_bytes).map_err(io::Error::other)?;
+                if size > max_size {
+                    return Err(CacheError::record_too_large());
+                }
+                read_bounded(reader.as_mut(), max_bytes)?
+            }
+            RegularFileOpen::Missing => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cache metadata record is missing",
+                )
+                .into());
+            }
+            RegularFileOpen::Other => return Err(CacheError::conflicting_record()),
+        };
+        Ok(decode_record::<T>(&bytes)?)
+    }
+
+    fn verify_compatible_manifest_bindings(
+        &self,
+        manifest: &SnapshotManifestRecord,
+    ) -> Result<(), CacheError> {
+        for file in manifest.files() {
+            let Some(hub_blob_key) = file.hub_blob_key()? else {
+                return Err(CacheError::conflicting_record());
+            };
+            let binding = self.read_hub_blob_binding(&hub_blob_key)?;
+            if binding.digest()? != file.digest()? || binding.size() != file.size() {
+                return Err(CacheError::conflicting_record());
+            }
+        }
+        Ok(())
     }
 
     fn ensure_record<T>(&self, destination: &Path, expected: &T) -> Result<(), CacheError>
@@ -556,8 +705,7 @@ impl CacheKernel {
     {
         match self.effects.file_system.entry_kind(destination)? {
             EntryKind::RegularFile => {
-                let bytes = read_all(self.effects.file_system.as_ref(), destination)?;
-                let existing = decode_record::<T>(&bytes)?;
+                let existing = self.read_record::<T>(destination, MAX_SMALL_RECORD_BYTES)?;
                 if &existing != expected {
                     return Err(CacheError::conflicting_record());
                 }
@@ -829,18 +977,26 @@ fn sync_parent_directory(file_system: &dyn FileSystem, path: &Path) -> io::Resul
     file_system.sync_directory(parent)
 }
 
-fn read_all(file_system: &dyn FileSystem, path: &Path) -> io::Result<Vec<u8>> {
-    let reader = file_system.open_read(path)?;
+fn encode_record_bounded<T: CacheRecord>(
+    record: &T,
+    max_bytes: usize,
+) -> Result<Vec<u8>, CacheError> {
+    let encoded = encode_record(record)?;
+    if encoded.len() > max_bytes {
+        Err(CacheError::record_too_large())
+    } else {
+        Ok(encoded)
+    }
+}
+
+fn read_bounded(reader: &mut dyn Read, max_bytes: usize) -> Result<Vec<u8>, CacheError> {
     let mut bytes = Vec::new();
-    let limit = u64::try_from(MAX_SMALL_RECORD_BYTES)
+    let limit = u64::try_from(max_bytes)
         .map_err(io::Error::other)?
         .saturating_add(1);
     reader.take(limit).read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_SMALL_RECORD_BYTES {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cache metadata record exceeds its size limit",
-        ))
+    if bytes.len() > max_bytes {
+        Err(CacheError::record_too_large())
     } else {
         Ok(bytes)
     }
@@ -1302,6 +1458,294 @@ mod tests {
             .kernel
             .read_ref(&requested)
             .expect_err("a ref record must be bound to its requested revision");
+
+        Ok(())
+    }
+
+    #[test]
+    fn hub_blob_bindings_are_immutable_idempotent_and_reject_non_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let key = HubBlobKey::parse("0123456789abcdef")?;
+        let digest = BlobDigest::for_bytes(b"compatible blob");
+        let destination = fixture.kernel.layout.hub_blob_binding_record(&key)?;
+
+        fixture.kernel.publish_hub_blob_binding(&key, digest, 15)?;
+        let first = std::fs::read(&destination)?;
+        fixture.kernel.publish_hub_blob_binding(&key, digest, 15)?;
+        assert_eq!(std::fs::read(&destination)?, first);
+
+        fixture
+            .kernel
+            .publish_hub_blob_binding(&key, BlobDigest::for_bytes(b"different"), 9)
+            .expect_err("a conflicting immutable binding must be rejected");
+        assert_eq!(std::fs::read(&destination)?, first);
+
+        let non_file_key = HubBlobKey::parse("fedcba9876543210")?;
+        let non_file_destination = fixture
+            .kernel
+            .layout
+            .hub_blob_binding_record(&non_file_key)?;
+        std::fs::create_dir_all(&non_file_destination)?;
+        fixture
+            .kernel
+            .publish_hub_blob_binding(&non_file_key, digest, 15)
+            .expect_err("a non-file binding destination must be rejected");
+        assert!(non_file_destination.is_dir());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hub_blob_binding_fault_boundaries_expose_only_missing_or_complete_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let digest = BlobDigest::for_bytes(b"compatible blob");
+        let before_key = HubBlobKey::parse("before-replace")?;
+        let before_destination = fixture.kernel.layout.hub_blob_binding_record(&before_key)?;
+        fixture
+            .faults
+            .fail_once(PublicationPoint::BeforeAtomicReplace);
+        let before = fixture
+            .kernel
+            .publish_hub_blob_binding(&before_key, digest, 15)
+            .expect_err("the pre-replace fault must surface");
+        assert!(!before.may_have_published());
+        assert!(!before_destination.try_exists()?);
+
+        let after_key = HubBlobKey::parse("after-replace")?;
+        fixture
+            .faults
+            .fail_once(PublicationPoint::AfterAtomicReplace);
+        let after = fixture
+            .kernel
+            .publish_hub_blob_binding(&after_key, digest, 15)
+            .expect_err("the post-replace fault must surface");
+        assert!(after.may_have_published());
+        let record = fixture.kernel.read_hub_blob_binding(&after_key)?;
+        assert_eq!(record.hub_blob_key(), after_key.as_str());
+        assert_eq!(record.digest()?, digest);
+        assert_eq!(record.size(), 15);
+
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_manifest_requires_matching_bindings_and_is_published_sorted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let commit = CommitId::parse(FIRST_COMMIT)?;
+        let first_path = RepoPath::parse("config.json")?;
+        let second_path = RepoPath::parse("weights/model.bin")?;
+        let selection = SelectionId::derive(&[second_path.clone(), first_path.clone()])?;
+        let key = HubBlobKey::parse("compatible-key")?;
+        let digest = BlobDigest::for_bytes(b"shared bytes");
+        let files = vec![
+            SnapshotFileRecord::new(&second_path, digest, 12, Some(key.clone())),
+            SnapshotFileRecord::new(&first_path, digest, 12, Some(key.clone())),
+        ];
+        let destination = fixture.kernel.layout.snapshot_manifest(&commit, &selection);
+
+        fixture
+            .kernel
+            .publish_compatible_manifest(&commit, &selection, files.clone())
+            .expect_err("a compatible manifest must not precede its bindings");
+        assert!(!destination.try_exists()?);
+
+        fixture.kernel.publish_hub_blob_binding(&key, digest, 12)?;
+        let missing_key_file = SnapshotFileRecord::new(&first_path, digest, 12, None);
+        fixture
+            .kernel
+            .publish_compatible_manifest(
+                &commit,
+                &SelectionId::derive(std::slice::from_ref(&first_path))?,
+                vec![missing_key_file],
+            )
+            .expect_err("every compatible manifest file must name a Hub blob key");
+
+        let mismatched = SnapshotFileRecord::new(
+            &first_path,
+            BlobDigest::for_bytes(b"other bytes"),
+            11,
+            Some(key.clone()),
+        );
+        fixture
+            .kernel
+            .publish_compatible_manifest(
+                &commit,
+                &SelectionId::derive(&[first_path])?,
+                vec![mismatched],
+            )
+            .expect_err("the binding digest and size must match the manifest entry");
+
+        fixture
+            .kernel
+            .publish_compatible_manifest(&commit, &selection, files)?;
+        let record = fixture.kernel.read_snapshot_manifest(&commit, &selection)?;
+        let paths = record
+            .files()
+            .iter()
+            .map(SnapshotFileRecord::path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["config.json", "weights/model.bin"]);
+        assert_eq!(record.commit(), commit.as_str());
+        assert_eq!(record.selection_id(), selection.to_string());
+
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_manifests_are_immutable_idempotent_and_reject_non_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let commit = CommitId::parse(FIRST_COMMIT)?;
+        let path = RepoPath::parse("model.bin")?;
+        let selection = SelectionId::derive(std::slice::from_ref(&path))?;
+        let first_key = HubBlobKey::parse("first-key")?;
+        let first_digest = BlobDigest::for_bytes(b"first bytes");
+        fixture
+            .kernel
+            .publish_hub_blob_binding(&first_key, first_digest, 11)?;
+        let first_files = vec![SnapshotFileRecord::new(
+            &path,
+            first_digest,
+            11,
+            Some(first_key),
+        )];
+        fixture
+            .kernel
+            .publish_compatible_manifest(&commit, &selection, first_files.clone())?;
+        let destination = fixture.kernel.layout.snapshot_manifest(&commit, &selection);
+        let first = std::fs::read(&destination)?;
+        fixture
+            .kernel
+            .publish_compatible_manifest(&commit, &selection, first_files)?;
+        assert_eq!(std::fs::read(&destination)?, first);
+
+        let second_key = HubBlobKey::parse("second-key")?;
+        let second_digest = BlobDigest::for_bytes(b"second bytes");
+        fixture
+            .kernel
+            .publish_hub_blob_binding(&second_key, second_digest, 12)?;
+        let conflicting_files = vec![SnapshotFileRecord::new(
+            &path,
+            second_digest,
+            12,
+            Some(second_key),
+        )];
+        fixture
+            .kernel
+            .publish_compatible_manifest(&commit, &selection, conflicting_files)
+            .expect_err("a conflicting immutable manifest must be rejected");
+        assert_eq!(std::fs::read(&destination)?, first);
+
+        let other_path = RepoPath::parse("other.bin")?;
+        let other_selection = SelectionId::derive(std::slice::from_ref(&other_path))?;
+        let other_destination = fixture
+            .kernel
+            .layout
+            .snapshot_manifest(&commit, &other_selection);
+        std::fs::create_dir_all(&other_destination)?;
+        fixture
+            .kernel
+            .publish_compatible_manifest(
+                &commit,
+                &other_selection,
+                vec![SnapshotFileRecord::new(
+                    &other_path,
+                    second_digest,
+                    12,
+                    Some(HubBlobKey::parse("second-key")?),
+                )],
+            )
+            .expect_err("a non-file manifest destination must be rejected");
+        assert!(other_destination.is_dir());
+
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_manifest_fault_boundaries_expose_only_missing_or_complete_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("model.bin")?;
+        let selection = SelectionId::derive(std::slice::from_ref(&path))?;
+        let key = HubBlobKey::parse("compatible-key")?;
+        let digest = BlobDigest::for_bytes(b"shared bytes");
+        fixture.kernel.publish_hub_blob_binding(&key, digest, 12)?;
+        let files = vec![SnapshotFileRecord::new(&path, digest, 12, Some(key))];
+
+        let before_commit = CommitId::parse(FIRST_COMMIT)?;
+        let before_destination = fixture
+            .kernel
+            .layout
+            .snapshot_manifest(&before_commit, &selection);
+        fixture
+            .faults
+            .fail_once(PublicationPoint::BeforeAtomicReplace);
+        let before = fixture
+            .kernel
+            .publish_compatible_manifest(&before_commit, &selection, files.clone())
+            .expect_err("the pre-replace fault must surface");
+        assert!(!before.may_have_published());
+        assert!(!before_destination.try_exists()?);
+
+        let after_commit = CommitId::parse(SECOND_COMMIT)?;
+        fixture
+            .faults
+            .fail_once(PublicationPoint::AfterAtomicReplace);
+        let after = fixture
+            .kernel
+            .publish_compatible_manifest(&after_commit, &selection, files)
+            .expect_err("the post-replace fault must surface");
+        assert!(after.may_have_published());
+        let record = fixture
+            .kernel
+            .read_snapshot_manifest(&after_commit, &selection)?;
+        assert_eq!(record.commit(), after_commit.as_str());
+        assert_eq!(record.selection_id(), selection.to_string());
+
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_manifests_use_a_larger_explicit_bounded_record_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let commit = CommitId::parse(FIRST_COMMIT)?;
+        let key = HubBlobKey::parse("shared-key")?;
+        let digest = BlobDigest::for_bytes(b"x");
+        fixture.kernel.publish_hub_blob_binding(&key, digest, 1)?;
+        let paths = (0..700)
+            .map(|index| RepoPath::parse(format!("nested/file-{index:04}.bin")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let selection = SelectionId::derive(&paths)?;
+        let files = paths
+            .iter()
+            .map(|path| SnapshotFileRecord::new(path, digest, 1, Some(key.clone())))
+            .collect::<Vec<_>>();
+
+        fixture
+            .kernel
+            .publish_compatible_manifest(&commit, &selection, files)?;
+        let destination = fixture.kernel.layout.snapshot_manifest(&commit, &selection);
+        let encoded = std::fs::read(&destination)?;
+        assert!(encoded.len() > MAX_SMALL_RECORD_BYTES);
+        assert!(encoded.len() <= MAX_MANIFEST_RECORD_BYTES);
+        assert_eq!(
+            fixture
+                .kernel
+                .read_snapshot_manifest(&commit, &selection)?
+                .files()
+                .len(),
+            700
+        );
+
+        std::fs::write(&destination, vec![b'x'; MAX_MANIFEST_RECORD_BYTES + 1])?;
+        fixture
+            .kernel
+            .read_snapshot_manifest(&commit, &selection)
+            .expect_err("an oversized manifest must be rejected by its bounded reader");
 
         Ok(())
     }
