@@ -6,13 +6,15 @@ These instructions apply to the entire repository.
 
 Read these files before implementation work:
 
-1. `docs/implementation-handoff.md`
-2. `rfcs/0001-hub-store-v0.1.md`
-3. `adr/0001-hub-transport-and-cache-boundary.md`
-4. [GitHub tracking issue #1](https://github.com/dinoml/hf-store-rs/issues/1)
+1. `rfcs/0001-hub-store-v0.1.md`
+2. `adr/0001-hub-transport-and-cache-boundary.md`
+3. `adr/0002-cache-identity-and-format.md`
+4. `adr/0003-cache-publication-and-coordination.md`
+5. [GitHub tracking issue #1](https://github.com/dinoml/hf-store-rs/issues/1)
 
-The RFC is proposed. Resolve its blocking decisions before stabilizing a public
-API or on-disk layout. Record accepted choices as ADRs.
+RFC 0001 is accepted, but later-phase contracts remain private until their
+blocking decisions are recorded as ADRs. Do not stabilize a public API or
+on-disk layout ahead of those decisions.
 
 ## Boundary
 

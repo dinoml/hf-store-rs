@@ -11,5 +11,11 @@ after the first publishable version is approved.
 ### Added
 
 - Initial Rust workspace and quality gates.
-- Proposed v0.1 RFC and accepted repository-boundary ADR.
-- Contributor, security, and implementation-handoff documentation.
+- Accepted v0.1 RFC plus repository-boundary, cache-format, and publication ADRs.
+- Contributor and security documentation.
+- Validated repository, revision, commit, path, endpoint, and redacted-token
+  value types.
+- Internal versioned cache keys, layouts, metadata records, and process-crash-safe
+  atomic-visibility publication primitives with deterministic failure tests.
+- Initial pure path models for future shared `huggingface_hub` cache and
+  `local_dir` conformance work.

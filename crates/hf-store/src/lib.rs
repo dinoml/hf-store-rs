@@ -1,7 +1,8 @@
 //! Rust-native storage primitives for Hugging Face Hub repositories.
 //!
-//! This pre-alpha crate currently exposes repository identity vocabulary only.
-//! It does not yet perform network or filesystem operations.
+//! This pre-alpha crate currently exposes validated repository, revision, path,
+//! endpoint, and request-time authentication vocabulary. It does not yet expose
+//! a Hub transport or cache service.
 //!
 //! # Examples
 //!
@@ -11,7 +12,28 @@
 //! assert_eq!(RepositoryKind::Model.to_string(), "model");
 //! ```
 
+mod auth;
+#[allow(
+    dead_code,
+    reason = "the local cache kernel is internal until the HubStore service is introduced"
+)]
+mod cache;
+mod endpoint;
 mod repo;
+mod repo_path;
+mod revision;
+mod validation;
 
 #[doc(inline)]
-pub use repo::RepositoryKind;
+pub use auth::AuthToken;
+#[doc(inline)]
+pub use endpoint::Endpoint;
+
+#[doc(inline)]
+pub use repo::{RepositoryId, RepositoryKind, RepositorySpec};
+#[doc(inline)]
+pub use repo_path::RepoPath;
+#[doc(inline)]
+pub use revision::{CommitId, Revision};
+#[doc(inline)]
+pub use validation::ValidationError;

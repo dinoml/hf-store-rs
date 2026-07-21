@@ -1,7 +1,7 @@
 ---
 rfc: "0001"
 title: Hub store v0.1
-status: proposed
+status: accepted
 owners: [hlky]
 created: 2026-07-21
 updated: 2026-07-21
@@ -22,8 +22,8 @@ validate a selected file set, and atomically expose an immutable local snapshot.
 The same request must later work without network access when its complete,
 validated content is present.
 
-This RFC proposes behavior and invariants. It deliberately does not yet accept a
-public async/runtime contract or a permanent cache layout.
+This RFC accepts the v0.1 behavior, invariants, and phased delivery plan. Later
+phase contracts remain private until their decisions are recorded as ADRs.
 
 ## Outcome
 
@@ -44,6 +44,9 @@ macOS, and Windows. Windows correctness must not require symlink privileges.
 - Validate remote identity, expected size, and available content digests.
 - Compute a local cryptographic digest before publishing every blob.
 - Keep shared content-addressed blobs and immutable snapshot manifests.
+- Reuse a conformance-tested `huggingface_hub` cache without trusting partial
+  upstream snapshots as complete.
+- Materialize selected files into an explicit local directory when requested.
 - Publish snapshots and mutable refs atomically.
 - Report progress and support cooperative cancellation.
 - Open complete snapshots without contacting the network.
@@ -57,9 +60,7 @@ macOS, and Windows. Windows correctness must not require symlink privileges.
 - Device execution, sessions, scheduling, or memory placement.
 - Python execution or pickle loading.
 - Credential persistence, browser login, or ambient global authentication state.
-- Exact on-disk compatibility with Python `huggingface_hub` unless separately
-  approved.
-- `local_dir` mirroring semantics, a cache daemon, or automatic quota eviction.
+- A cache daemon or automatic quota eviction.
 - Multi-endpoint failover, Xet acceleration, or remote shard leases in v0.1.
 
 ## Boundary
@@ -71,9 +72,10 @@ offline lookup, inspection, and garbage collection.
 DinoML's application service owns installation policy, package activation,
 artifact selection, model lifecycle, and execution.
 
-## Proposed public seams
+## Illustrative future public seams
 
-Names are illustrative until this RFC is accepted:
+Names remain illustrative until the decisions for their delivery phase are
+accepted and the corresponding behavior is implemented:
 
 ```rust,ignore
 let store = HubStore::builder(cache_root)
@@ -209,6 +211,8 @@ Exit: blocking choices have ADRs and tests describe the v0.1 contract.
 - Add a versioned layout, metadata records, atomic writes, and blob publication.
 - Add collision, traversal, corruption, competing-writer, and crash-boundary
   tests.
+- Define owned and Hub-compatible layout adapters without claiming compatibility
+  before pinned bidirectional fixtures pass.
 
 Exit: local content can be validated and published without exposing partial data.
 
@@ -231,6 +235,8 @@ Exit: interruption and concurrency tests converge on validated blobs.
 ### Phase 4: activation and offline operation
 
 - Materialize, validate, and atomically publish immutable snapshots.
+- Add explicit `local_dir` materialization with versioned completion metadata
+  and portable copy fallback behavior.
 - Update refs last and implement strict cache-only lookup.
 
 Exit: no failure point exposes an incomplete snapshot, and offline tests prove
@@ -267,19 +273,27 @@ Exit: every published v0.1 support claim is fixture-backed.
 - Garbage collection never removes reachable or busy data.
 - Authenticated and gated fixture flows work without diagnostic secret leakage.
 - The crate builds without DinoML dependencies.
+- A pinned Python cache fixture is reused without downloading duplicate bytes,
+  and Python can read entries written through the compatible adapter.
+- `local_dir` requests materialize the selected validated files outside the
+  cache without weakening cache-only completeness checks.
 - Formatting, strict linting, tests, docs, MSRV, and three-OS CI pass.
 
-## Decisions required before Phase 1
+## Decisions required before affected phases
 
-1. Behavioral compatibility or shared on-disk compatibility with
-   `huggingface_hub`.
-2. Async runtime, HTTP client, TLS defaults, and feature policy.
-3. Canonical blob digest and interpretation of Git/LFS metadata and ETags.
-4. Snapshot materialization fallback order.
-5. Cross-process locking, reader leases, stale-lock handling, and durability.
-6. Filter grammar and filtered-snapshot identity.
-7. Garbage-collection reachability and retention rules.
-8. Initial CLI scope and stable machine-readable output.
+1. Cache compatibility, fixed-size path keys, local blob identity, and metadata
+   versioning are accepted in [ADR 0002](../adr/0002-cache-identity-and-format.md).
+2. Staging, atomic replacement, cross-process locking, reader leases,
+   materialization, and durability are accepted in
+   [ADR 0003](../adr/0003-cache-publication-and-coordination.md).
+3. Async runtime, HTTP client, TLS defaults, and feature policy must be accepted
+   before Phase 2 exposes a transport-backed service contract.
+4. Filter grammar must be accepted before Phase 2. ADR 0002 already fixes the
+   filtered-snapshot identity as the canonical selected path set.
+5. Garbage-collection reachability and retention rules must be accepted before
+   Phase 5 executes a plan.
+6. Initial CLI scope and stable machine-readable output must be accepted before
+   Phase 5 exposes a CLI.
 
 The locking and atomic-replacement model requires a focused Windows/Linux spike.
 The RFC must not assume identical rename or directory-durability semantics across
