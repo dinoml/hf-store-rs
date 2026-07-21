@@ -112,7 +112,7 @@ impl HubCacheReader {
             EntryKind::Other => {
                 #[cfg(unix)]
                 {
-                    return self.read_relative_symlink(
+                    return Self::read_relative_symlink(
                         index.directory.as_ref(),
                         &snapshot_path,
                         &snapshot_relative,
@@ -161,7 +161,6 @@ impl HubCacheReader {
 
     #[cfg(unix)]
     fn read_relative_symlink(
-        &self,
         directory: &dyn CacheDirectory,
         snapshot_path: &Path,
         snapshot_relative: &Path,
