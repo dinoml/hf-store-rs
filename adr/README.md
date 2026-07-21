@@ -12,3 +12,4 @@ belong in an RFC until a decision is made.
 - [ADR 0005: Repository filter grammar and matching semantics](0005-repository-filter-grammar.md) — Accepted
 - [ADR 0006: Local directory reconciliation and completion](0006-local-directory-reconciliation-and-completion.md) — Accepted
 - [ADR 0007: Cache garbage-collection reachability and retention](0007-cache-garbage-collection.md) — Accepted
+- [ADR 0008: Initial command-line interface and output contract](0008-command-line-interface.md) — Accepted
