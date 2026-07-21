@@ -6,6 +6,12 @@
 repositories. It will resolve revisions, download and validate files, and expose
 immutable local snapshots through a cross-platform cache.
 
+Its primary integration surface is a typed Rust library for in-process runtimes
+and user interfaces, including future DinoML consumers. Those consumers can
+reuse existing `huggingface_hub` downloads or fetch missing repository content
+without understanding cache internals. The CLI is a thin adapter over the same
+library contracts, not the application integration boundary.
+
 > [!IMPORTANT]
 > This repository is a pre-alpha bootstrap. Version `0.0.0` does not yet fetch
 > repositories and makes no compatibility or stability claim.
@@ -39,15 +45,12 @@ contract, invariants, and delivery phases live in
 [RFC 0001](rfcs/0001-hub-store-v0.1.md). Progress is tracked in
 [issue #1](https://github.com/dinoml/hf-store-rs/issues/1).
 
-The API below is a design target, not implemented or stable:
-
-```rust,ignore
-let snapshot = HubStore::new(cache_dir)
-    .model("org/model")
-    .revision("commit-or-tag")
-    .allow(["*.json", "*.safetensors", "*.model"])
-    .fetch()?;
-```
+The library-first downstream contract is accepted in
+[ADR 0009](adr/0009-library-first-integration.md). Exact public type names remain
+unstable until their phase gates pass, but online acquisition and transport-free
+offline lookup will be distinct capabilities returning validated, lease-backed
+snapshot and file handles. See the [ADR index](adr/README.md) for all accepted
+decisions.
 
 ## Development
 
