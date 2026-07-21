@@ -34,17 +34,12 @@ pub(super) struct HubTree {
 }
 
 impl HubTree {
-    pub(super) fn files(&self) -> &BTreeMap<RepoPath, HubTreeEntry> {
-        &self.files
-    }
-
-    fn from_raw(raw: RawTreeRecord) -> Result<Self, HubMetadataError> {
+    pub(super) fn new(
+        entries: impl IntoIterator<Item = (RepoPath, HubTreeEntry)>,
+    ) -> Result<Self, HubMetadataError> {
         let mut files = BTreeMap::new();
-        for (path, entry) in raw.files.0 {
-            let path = RepoPath::parse(path).map_err(HubMetadataError::invalid)?;
-            let entry = HubTreeEntry::from_raw(entry)?;
-            let previous = files.insert(path, entry);
-            if previous.is_some() {
+        for (path, entry) in entries {
+            if files.insert(path, entry).is_some() {
                 return Err(HubMetadataError::malformed());
             }
         }
@@ -52,6 +47,20 @@ impl HubTree {
         let tree = Self { files };
         tree.validate()?;
         Ok(tree)
+    }
+
+    pub(super) fn files(&self) -> &BTreeMap<RepoPath, HubTreeEntry> {
+        &self.files
+    }
+
+    fn from_raw(raw: RawTreeRecord) -> Result<Self, HubMetadataError> {
+        let mut entries = Vec::with_capacity(raw.files.0.len());
+        for (path, entry) in raw.files.0 {
+            let path = RepoPath::parse(path).map_err(HubMetadataError::invalid)?;
+            let entry = HubTreeEntry::from_raw(entry)?;
+            entries.push((path, entry));
+        }
+        Self::new(entries)
     }
 
     fn validate(&self) -> Result<(), HubMetadataError> {
@@ -77,6 +86,37 @@ pub(super) struct HubTreeEntry {
 }
 
 impl HubTreeEntry {
+    pub(super) fn new(size: u64, blob_id: impl AsRef<str>) -> Result<Self, HubMetadataError> {
+        Ok(Self {
+            size,
+            blob_id: validate_opaque(blob_id.as_ref().to_owned(), "Hub tree blob identifier")?,
+            lfs_sha256: None,
+            lfs_size: None,
+            xet_hash: None,
+        })
+    }
+
+    pub(super) fn with_lfs(
+        mut self,
+        sha256: impl AsRef<str>,
+        size: u64,
+    ) -> Result<Self, HubMetadataError> {
+        self.lfs_sha256 = Some(validate_opaque(
+            sha256.as_ref().to_owned(),
+            "Hub tree LFS identifier",
+        )?);
+        self.lfs_size = Some(size);
+        Ok(self)
+    }
+
+    pub(super) fn with_xet(mut self, hash: impl AsRef<str>) -> Result<Self, HubMetadataError> {
+        self.xet_hash = Some(validate_opaque(
+            hash.as_ref().to_owned(),
+            "Hub tree Xet identifier",
+        )?);
+        Ok(self)
+    }
+
     pub(super) const fn size(&self) -> u64 {
         self.size
     }
@@ -98,14 +138,20 @@ impl HubTreeEntry {
     }
 
     fn from_raw(raw: RawTreeEntry) -> Result<Self, HubMetadataError> {
-        let entry = Self {
-            size: raw.size,
-            blob_id: validate_opaque(raw.blob_id, "Hub tree blob identifier")?,
-            lfs_sha256: validate_optional_opaque(raw.lfs_sha256, "Hub tree LFS identifier")?,
-            lfs_size: raw.lfs_size,
-            xet_hash: validate_optional_opaque(raw.xet_hash, "Hub tree Xet identifier")?,
-        };
-        entry.validate()?;
+        if raw.lfs_sha256.is_some() != raw.lfs_size.is_some() {
+            return Err(HubMetadataError::invalid(ValidationError::new(
+                "Hub tree LFS metadata",
+                ValidationErrorKind::Malformed,
+            )));
+        }
+
+        let mut entry = Self::new(raw.size, raw.blob_id)?;
+        if let (Some(sha256), Some(size)) = (raw.lfs_sha256, raw.lfs_size) {
+            entry = entry.with_lfs(sha256, size)?;
+        }
+        if let Some(hash) = raw.xet_hash {
+            entry = entry.with_xet(hash)?;
+        }
         Ok(entry)
     }
 
@@ -231,6 +277,19 @@ pub(super) struct LocalDownloadMetadata {
 }
 
 impl LocalDownloadMetadata {
+    pub(super) fn new(
+        commit: CommitId,
+        etag: impl AsRef<str>,
+        timestamp: f64,
+    ) -> Result<Self, HubMetadataError> {
+        validate_timestamp(timestamp)?;
+        Ok(Self {
+            commit,
+            etag: validate_opaque(etag.as_ref().to_owned(), "Hub local-dir ETag")?,
+            timestamp,
+        })
+    }
+
     pub(super) const fn commit(&self) -> &CommitId {
         &self.commit
     }
@@ -249,19 +308,10 @@ pub(super) fn decode_local_download(
 ) -> Result<LocalDownloadMetadata, HubMetadataError> {
     let [commit, etag, timestamp] = three_lines(bytes)?;
     let commit = CommitId::parse(commit).map_err(HubMetadataError::invalid)?;
-    let etag = validate_opaque(etag.to_owned(), "Hub local-dir ETag")?;
     let timestamp = timestamp
         .parse::<f64>()
         .map_err(HubMetadataError::timestamp)?;
-    if !timestamp.is_finite() || timestamp.is_sign_negative() {
-        return Err(HubMetadataError::malformed());
-    }
-
-    Ok(LocalDownloadMetadata {
-        commit,
-        etag,
-        timestamp,
-    })
+    LocalDownloadMetadata::new(commit, etag, timestamp)
 }
 
 pub(super) fn encode_local_download(metadata: &LocalDownloadMetadata) -> Vec<u8> {
@@ -302,18 +352,17 @@ fn portable_line(line: &str) -> Result<&str, HubMetadataError> {
     }
 }
 
+fn validate_timestamp(timestamp: f64) -> Result<(), HubMetadataError> {
+    if !timestamp.is_finite() || timestamp.is_sign_negative() {
+        Err(HubMetadataError::malformed())
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_opaque(value: String, subject: &'static str) -> Result<Box<str>, HubMetadataError> {
     validate_opaque_ref(&value, subject)?;
     Ok(value.into_boxed_str())
-}
-
-fn validate_optional_opaque(
-    value: Option<String>,
-    subject: &'static str,
-) -> Result<Option<Box<str>>, HubMetadataError> {
-    value
-        .map(|value| validate_opaque(value, subject))
-        .transpose()
 }
 
 fn validate_optional_opaque_ref(
@@ -448,17 +497,19 @@ mod tests {
         include_bytes!("../../tests/fixtures/huggingface_hub-v1.24.0/local-dir-download.metadata");
 
     #[test]
-    fn pinned_standard_ref_round_trips_exactly() -> Result<(), Box<dyn std::error::Error>> {
-        let commit = decode_ref(REF_FIXTURE)?;
+    fn pinned_standard_ref_decodes_and_rust_encoding_matches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decoded = decode_ref(REF_FIXTURE)?;
+        let constructed = CommitId::parse(COMMIT)?;
 
-        assert_eq!(commit.as_str(), COMMIT);
-        assert_eq!(encode_ref(&commit), REF_FIXTURE);
+        assert_eq!(decoded.as_str(), COMMIT);
+        assert_eq!(encode_ref(&constructed), REF_FIXTURE);
 
         Ok(())
     }
 
     #[test]
-    fn pinned_tree_round_trips_exactly() -> Result<(), Box<dyn std::error::Error>> {
+    fn pinned_tree_decodes() -> Result<(), Box<dyn std::error::Error>> {
         let tree = decode_tree(TREE_FIXTURE)?;
         let paths = tree
             .files()
@@ -472,14 +523,32 @@ mod tests {
             tree.files()[&RepoPath::parse("nested/model.safetensors")?].lfs_size(),
             Some(1024)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rust_tree_encoding_matches_the_pinned_python_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = HubTreeEntry::new(5, "1111111111111111111111111111111111111111")?;
+        let model = HubTreeEntry::new(42, "2222222222222222222222222222222222222222")?
+            .with_lfs(
+                "3333333333333333333333333333333333333333333333333333333333333333",
+                1024,
+            )?
+            .with_xet("4444444444444444444444444444444444444444444444444444444444444444")?;
+        let tree = HubTree::new([
+            (RepoPath::parse("nested/model.safetensors")?, model),
+            (RepoPath::parse("config.json")?, config),
+        ])?;
+
         assert_eq!(encode_tree(&tree)?, TREE_FIXTURE);
 
         Ok(())
     }
 
     #[test]
-    fn pinned_local_download_metadata_round_trips_exactly() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn pinned_local_download_metadata_decodes() -> Result<(), Box<dyn std::error::Error>> {
         let metadata = decode_local_download(LOCAL_DOWNLOAD_FIXTURE)?;
 
         assert_eq!(metadata.commit().as_str(), COMMIT);
@@ -491,7 +560,38 @@ mod tests {
             metadata.timestamp().to_bits(),
             1_720_000_000.25_f64.to_bits()
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rust_local_download_encoding_matches_the_pinned_python_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metadata = LocalDownloadMetadata::new(
+            CommitId::parse(COMMIT)?,
+            "3333333333333333333333333333333333333333333333333333333333333333",
+            1_720_000_000.25,
+        )?;
+
         assert_eq!(encode_local_download(&metadata), LOCAL_DOWNLOAD_FIXTURE);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rust_record_constructors_enforce_writer_invariants() -> Result<(), Box<dyn std::error::Error>>
+    {
+        HubTreeEntry::new(1, "").expect_err("accepted an empty blob identifier");
+        LocalDownloadMetadata::new(CommitId::parse(COMMIT)?, "etag", f64::NAN)
+            .expect_err("accepted a non-finite timestamp");
+
+        let first = HubTreeEntry::new(1, "abc")?;
+        let second = HubTreeEntry::new(1, "def")?;
+        HubTree::new([
+            (RepoPath::parse("Config.json")?, first),
+            (RepoPath::parse("config.json")?, second),
+        ])
+        .expect_err("accepted a portable path collision");
 
         Ok(())
     }
