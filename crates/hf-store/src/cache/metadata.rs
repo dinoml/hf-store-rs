@@ -307,6 +307,45 @@ impl CacheRecord for BlobRecord {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct HubBlobBindingRecord {
+    hub_blob_key: String,
+    sha256: String,
+    size: u64,
+}
+
+impl HubBlobBindingRecord {
+    pub(super) fn new(hub_blob_key: &HubBlobKey, digest: BlobDigest, size: u64) -> Self {
+        Self {
+            hub_blob_key: hub_blob_key.as_str().to_owned(),
+            sha256: digest.to_string(),
+            size,
+        }
+    }
+
+    pub(super) fn hub_blob_key(&self) -> &str {
+        &self.hub_blob_key
+    }
+
+    pub(super) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(super) const fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl CacheRecord for HubBlobBindingRecord {
+    const KIND: &'static str = "hub_blob_binding";
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        let _hub_blob_key = HubBlobKey::parse(&self.hub_blob_key)?;
+        validate_sha256_hex(&self.sha256, "Hub blob binding digest")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RemoteFileRecord {
     path: String,
     size: u64,
@@ -623,6 +662,7 @@ mod tests {
         assert_round_trip(&RepositoryRecord::new(&origin_key, &repository_key, &spec))?;
         assert_round_trip(&RefRecord::new(&revision, &commit))?;
         assert_round_trip(&BlobRecord::new(&digest, 7, Some(&hub_blob)))?;
+        assert_round_trip(&HubBlobBindingRecord::new(&hub_blob, digest, 7))?;
         assert_round_trip(&RemoteTreeRecord::new(
             &commit,
             vec![RemoteFileRecord::new(&path, 7, Some(hub_blob.clone()))],
@@ -641,6 +681,25 @@ mod tests {
             &selection,
             vec![SnapshotFileRecord::new(&path, digest, 7, Some(hub_blob))],
         )?)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn hub_blob_binding_has_stable_canonical_json() -> Result<(), Box<dyn std::error::Error>> {
+        let hub_blob = HubBlobKey::parse("0123456789abcdef")?;
+        let digest = BlobDigest::for_bytes(b"payload");
+        let encoded = encode_record(&HubBlobBindingRecord::new(&hub_blob, digest, 7))?;
+
+        assert_eq!(
+            String::from_utf8(encoded)?,
+            concat!(
+                "{\"format_version\":1,\"record_kind\":\"hub_blob_binding\",\"payload\":{",
+                "\"hub_blob_key\":\"0123456789abcdef\",",
+                "\"sha256\":\"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5\",",
+                "\"size\":7}}\n"
+            )
+        );
 
         Ok(())
     }
