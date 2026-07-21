@@ -1,0 +1,11 @@
+{
+ "format_version": 1,
+ "files": {
+  "data/train.jsonl": {
+   "size": 35,
+   "blob_id": "da60683925f47d433804d08c7128d3fd1bd850f1",
+   "lfs_sha256": "c57254400e0fe6ea150986e0a0e1f94bac4ee4b0bb8dba97a13a9daa044e6844",
+   "lfs_size": 35
+  }
+ }
+}

@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "git_commit": "36fd32c84d630f455a23b9a3bc4dc7b76d19cdde",
+  "git_tag": "v1.24.0",
+  "package": "huggingface_hub",
+  "package_version": "1.24.0",
+  "writer_sources": {
+    "src/huggingface_hub/_local_folder.py": "2e60361293d0bd45b8a877e55291882144279e42",
+    "src/huggingface_hub/_tree_cache.py": "09fe01f8e9d2fb1d7264647e3456e261bed95f50",
+    "src/huggingface_hub/file_download.py": "67d60b626fb7a38d330105345930080c7a1cb580"
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "cache_root": "cache",
+  "format_version": 1,
+  "repositories": [
+    {
+      "cache_directory": "models--fixture-model",
+      "commit": "1111111111111111111111111111111111111111",
+      "files": [
+        {
+          "blob_id": "2a90aae99746563212682db129aa431699537cb2",
+          "content_sha256": "da2dcf17b64bf30e3ac0d1353b6a7fcdbb75a3255c953c8c9c38cb7f4bc92dcc",
+          "etag": "2a90aae99746563212682db129aa431699537cb2",
+          "lfs_sha256": null,
+          "lfs_size": null,
+          "path": "config.json",
+          "size": 40,
+          "snapshot_form": "snapshot_only_regular"
+        }
+      ],
+      "missing_paths": [
+        "missing/config.json"
+      ],
+      "refs": [
+        {
+          "path": "refs/main",
+          "revision": "main"
+        }
+      ],
+      "repo_id": "fixture-model",
+      "repo_type": "model",
+      "tree_path": "trees/1111111111111111111111111111111111111111.json"
+    },
+    {
+      "cache_directory": "datasets--fixture-org--fixture-dataset",
+      "commit": "2222222222222222222222222222222222222222",
+      "files": [
+        {
+          "blob_id": "da60683925f47d433804d08c7128d3fd1bd850f1",
+          "content_sha256": "c57254400e0fe6ea150986e0a0e1f94bac4ee4b0bb8dba97a13a9daa044e6844",
+          "etag": "c57254400e0fe6ea150986e0a0e1f94bac4ee4b0bb8dba97a13a9daa044e6844",
+          "lfs_sha256": "c57254400e0fe6ea150986e0a0e1f94bac4ee4b0bb8dba97a13a9daa044e6844",
+          "lfs_size": 35,
+          "path": "data/train.jsonl",
+          "size": 35,
+          "snapshot_form": "copied_regular_with_blob"
+        }
+      ],
+      "missing_paths": [
+        "data/validation.jsonl"
+      ],
+      "refs": [
+        {
+          "path": "refs/main",
+          "revision": "main"
+        },
+        {
+          "path": "refs/refs/pr/7",
+          "revision": "refs/pr/7"
+        }
+      ],
+      "repo_id": "fixture-org/fixture-dataset",
+      "repo_type": "dataset",
+      "tree_path": "trees/2222222222222222222222222222222222222222.json"
+    },
+    {
+      "cache_directory": "spaces--fixture-org--fixture-space",
+      "commit": "3333333333333333333333333333333333333333",
+      "files": [
+        {
+          "blob_id": "8d7bedcfa905ca2dc23b3a5c5f048cd8d4eacd05",
+          "content_sha256": "329ab5ce0c3179d1dfb17f3fddc1c420ec9f04d2ad1e6a3bea07e09b278b806e",
+          "etag": "8d7bedcfa905ca2dc23b3a5c5f048cd8d4eacd05",
+          "lfs_sha256": null,
+          "lfs_size": null,
+          "path": "src/app.py",
+          "size": 49,
+          "snapshot_form": "relative_symlink_runtime"
+        }
+      ],
+      "missing_paths": [
+        "assets/missing.css"
+      ],
+      "refs": [
+        {
+          "path": "refs/main",
+          "revision": "main"
+        }
+      ],
+      "repo_id": "fixture-org/fixture-space",
+      "repo_type": "space",
+      "tree_path": "trees/3333333333333333333333333333333333333333.json"
+    }
+  ],
+  "runtime_symlinks_materialized": false
+}
