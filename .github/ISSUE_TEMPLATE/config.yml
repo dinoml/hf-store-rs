@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/dinoml/hf-store-rs/security/advisories/new
+    about: Report secrets, traversal, cache poisoning, and validation bypasses privately.

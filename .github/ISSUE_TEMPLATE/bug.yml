@@ -1,0 +1,53 @@
+name: Bug report
+description: Report incorrect repository, transfer, validation, or cache behavior.
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not include access tokens, signed URLs, or private repository content.
+        Report security-sensitive problems through a private security advisory.
+  - type: input
+    id: revision
+    attributes:
+      label: hf-store-rs version or commit
+      placeholder: commit SHA or release version
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Prefer a public or local-fixture reproduction with secrets removed.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Remove tokens, authorization headers, signed URLs, and private paths.

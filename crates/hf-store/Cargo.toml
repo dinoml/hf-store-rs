@@ -1,0 +1,16 @@
+[package]
+name = "hf-store"
+description = "Rust-native Hugging Face Hub repository storage and cache primitives"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["cache", "huggingface", "machine-learning", "storage"]
+categories = ["caching", "web-programming::http-client"]
+publish = false
+
+[lints]
+workspace = true
