@@ -63,7 +63,10 @@ impl Pattern {
         let mut index = 0;
 
         while index < characters.len() {
-            match characters[index] {
+            let Some(&character) = characters.get(index) else {
+                break;
+            };
+            match character {
                 '*' => {
                     if !matches!(tokens.last(), Some(Token::Star)) {
                         tokens.push(Token::Star);
