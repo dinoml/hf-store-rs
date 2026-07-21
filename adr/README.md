@@ -8,3 +8,5 @@ belong in an RFC until a decision is made.
 - [ADR 0001: Hub transport and cache boundary](0001-hub-transport-and-cache-boundary.md) — Accepted
 - [ADR 0002: Cache identity, interoperability, and format](0002-cache-identity-and-format.md) — Accepted
 - [ADR 0003: Cache publication and coordination](0003-cache-publication-and-coordination.md) — Accepted
+- [ADR 0004: Transport runtime, TLS, proxy, and feature policy](0004-transport-runtime-tls-and-features.md) — Accepted
+- [ADR 0005: Repository filter grammar and matching semantics](0005-repository-filter-grammar.md) — Accepted
