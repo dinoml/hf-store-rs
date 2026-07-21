@@ -330,6 +330,10 @@ impl HubBlobBindingRecord {
         &self.sha256
     }
 
+    pub(super) fn digest(&self) -> Result<BlobDigest, ValidationError> {
+        BlobDigest::parse(&self.sha256)
+    }
+
     pub(super) const fn size(&self) -> u64 {
         self.size
     }
@@ -692,7 +696,7 @@ mod tests {
         let encoded = encode_record(&HubBlobBindingRecord::new(&hub_blob, digest, 7))?;
 
         assert_eq!(
-            String::from_utf8(encoded)?,
+            std::str::from_utf8(&encoded)?,
             concat!(
                 "{\"format_version\":1,\"record_kind\":\"hub_blob_binding\",\"payload\":{",
                 "\"hub_blob_key\":\"0123456789abcdef\",",
@@ -700,6 +704,10 @@ mod tests {
                 "\"size\":7}}\n"
             )
         );
+        let decoded = decode_record::<HubBlobBindingRecord>(&encoded)?;
+        assert_eq!(decoded.hub_blob_key(), hub_blob.as_str());
+        assert_eq!(decoded.digest()?, digest);
+        assert_eq!(decoded.size(), 7);
 
         Ok(())
     }
