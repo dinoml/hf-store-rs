@@ -10,7 +10,7 @@ import sys
 from typing import Sequence
 
 
-EXCLUDED_ROOT_ENTRIES = frozenset({"README.md", "generate.py"})
+EXCLUDED_ROOT_ENTRIES = frozenset({"README.md", "generate.py", "__pycache__"})
 
 
 class ComparisonError(RuntimeError):

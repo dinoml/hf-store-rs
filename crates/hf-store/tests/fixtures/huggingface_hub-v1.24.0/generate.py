@@ -1,4 +1,4 @@
-"""Regenerate the pinned upstream standard-cache fixtures."""
+"""Regenerate the pinned upstream standard-cache and local_dir fixtures."""
 
 import argparse
 import hashlib
@@ -12,7 +12,11 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import huggingface_hub
-from huggingface_hub._local_folder import _create_cachedir_tag, write_download_metadata
+from huggingface_hub._local_folder import (
+    _create_cachedir_tag,
+    get_local_download_paths,
+    write_download_metadata,
+)
 from huggingface_hub._tree_cache import TreeCacheEntry, write_tree_cache
 from huggingface_hub.file_download import (
     _cache_commit_hash_for_specific_revision,
@@ -25,6 +29,8 @@ EXPECTED_VERSION = "1.24.0"
 EXPECTED_COMMIT = "36fd32c84d630f455a23b9a3bc4dc7b76d19cdde"
 EXPECTED_TAG = "v1.24.0"
 LEGACY_METADATA_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+LOCAL_DIR_COMMIT = "4444444444444444444444444444444444444444"
+LOCAL_DIR_METADATA_TIMESTAMP = 1_720_000_000.25
 FIXTURE_DIRECTORY = Path(__file__).resolve().parent
 WRITER_SOURCES = (
     "src/huggingface_hub/_local_folder.py",
@@ -53,6 +59,15 @@ class RepositorySpec:
     revisions: tuple[str, ...]
     files: tuple[FileSpec, ...]
     missing_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LocalDirFileSpec:
+    """A deterministic remote file materialized into a local_dir fixture."""
+
+    path: str
+    content: bytes
+    lfs: bool = False
 
 
 REPOSITORIES = (
@@ -102,6 +117,19 @@ REPOSITORIES = (
 )
 
 
+LOCAL_DIR_FILES = (
+    LocalDirFileSpec(
+        path="config/fixture.json",
+        content=b'{\n  "model_type": "fixture-local-dir"\n}\n',
+    ),
+    LocalDirFileSpec(
+        path="weights/nested/model.safetensors",
+        content=b"fixture-local-dir-lfs-bytes\x00\x01\x02\n",
+        lfs=True,
+    ),
+)
+
+
 def parse_args() -> argparse.Namespace:
     """Parse deterministic generator options."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -143,10 +171,14 @@ def git_output(checkout: Path, *arguments: str) -> str:
 def verify_upstream_checkout() -> tuple[Path, dict[str, object]]:
     """Verify package and source provenance before writing any fixture."""
     imported_module_root = Path(huggingface_hub.__file__).resolve().parent
-    checkout = Path(git_output(imported_module_root, "rev-parse", "--show-toplevel")).resolve()
+    checkout = Path(
+        git_output(imported_module_root, "rev-parse", "--show-toplevel")
+    ).resolve()
     expected_module_root = (checkout / "src" / "huggingface_hub").resolve()
     if imported_module_root != expected_module_root:
-        raise RuntimeError("huggingface_hub was not imported from the pinned source tree")
+        raise RuntimeError(
+            "huggingface_hub was not imported from the pinned source tree"
+        )
 
     if huggingface_hub.__version__ != EXPECTED_VERSION:
         raise RuntimeError(f"expected huggingface_hub {EXPECTED_VERSION}")
@@ -169,7 +201,9 @@ def verify_upstream_checkout() -> tuple[Path, dict[str, object]]:
         "src/huggingface_hub",
     )
     if tracked_changes:
-        raise RuntimeError("pinned huggingface_hub source files contain tracked changes")
+        raise RuntimeError(
+            "pinned huggingface_hub source files contain tracked changes"
+        )
 
     writer_sources = {
         source: git_output(checkout, "rev-parse", f"HEAD:{source}")
@@ -188,7 +222,9 @@ def verify_upstream_checkout() -> tuple[Path, dict[str, object]]:
 
 def write_json(path: Path, value: object) -> None:
     """Write deterministic UTF-8 JSON with LF newlines."""
-    path.write_bytes((json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    path.write_bytes(
+        (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
 
 
 def git_blob_id(content: bytes) -> str:
@@ -240,16 +276,25 @@ def materialize_file(
     blob_path.write_bytes(spec.content)
 
     if spec.snapshot_form == "snapshot_only_regular":
-        with patch("huggingface_hub.file_download.are_symlinks_supported", return_value=False):
+        with patch(
+            "huggingface_hub.file_download.are_symlinks_supported", return_value=False
+        ):
             _create_symlink(str(blob_path), str(snapshot_path), new_blob=True)
     elif spec.snapshot_form == "copied_regular_with_blob":
-        with patch("huggingface_hub.file_download.are_symlinks_supported", return_value=False):
+        with patch(
+            "huggingface_hub.file_download.are_symlinks_supported", return_value=False
+        ):
             _create_symlink(str(blob_path), str(snapshot_path), new_blob=False)
     elif spec.snapshot_form == "relative_symlink_runtime":
         if runtime_symlinks:
             if os.name == "nt":
-                raise RuntimeError("runtime relative symlinks are supported only on Unix")
-            with patch("huggingface_hub.file_download.are_symlinks_supported", return_value=True):
+                raise RuntimeError(
+                    "runtime relative symlinks are supported only on Unix"
+                )
+            with patch(
+                "huggingface_hub.file_download.are_symlinks_supported",
+                return_value=True,
+            ):
                 _create_symlink(str(blob_path), str(snapshot_path), new_blob=False)
     else:
         raise RuntimeError(f"unknown snapshot form {spec.snapshot_form}")
@@ -271,7 +316,9 @@ def generate_standard_cache(output: Path, runtime_symlinks: bool) -> dict[str, o
     """Generate the complete portable standard-cache corpus."""
     cache_root = output / "cache"
     if cache_root.is_symlink() or (cache_root.exists() and not cache_root.is_dir()):
-        raise RuntimeError(f"refusing to replace non-directory cache output {cache_root}")
+        raise RuntimeError(
+            f"refusing to replace non-directory cache output {cache_root}"
+        )
     if cache_root.exists():
         shutil.rmtree(cache_root)
     cache_root.mkdir(parents=True)
@@ -280,7 +327,9 @@ def generate_standard_cache(output: Path, runtime_symlinks: bool) -> dict[str, o
 
     repositories = []
     for spec in REPOSITORIES:
-        cache_directory = repo_folder_name(repo_id=spec.repo_id, repo_type=spec.repo_type)
+        cache_directory = repo_folder_name(
+            repo_id=spec.repo_id, repo_type=spec.repo_type
+        )
         storage = cache_root / cache_directory
         tree_entries = {}
         files = []
@@ -347,6 +396,99 @@ def prune_empty_directories(root: Path) -> None:
             directory.rmdir()
 
 
+def generate_local_dir(output: Path) -> dict[str, object]:
+    """Generate a portable local_dir through the pinned upstream writers."""
+
+    local_dir = output / "local-dir"
+    if local_dir.is_symlink() or (local_dir.exists() and not local_dir.is_dir()):
+        raise RuntimeError(
+            f"refusing to replace non-directory local_dir output {local_dir}"
+        )
+    if local_dir.exists():
+        shutil.rmtree(local_dir)
+    local_dir.mkdir(parents=True)
+
+    tree_entries = {}
+    files = []
+    for spec in LOCAL_DIR_FILES:
+        content_sha256 = hashlib.sha256(spec.content).hexdigest()
+        if spec.lfs:
+            etag = content_sha256
+            blob_id = lfs_pointer_blob_id(content_sha256, len(spec.content))
+            tree_entry = TreeCacheEntry(
+                size=len(spec.content),
+                blob_id=blob_id,
+                lfs_sha256=content_sha256,
+                lfs_size=len(spec.content),
+            )
+        else:
+            etag = git_blob_id(spec.content)
+            blob_id = etag
+            tree_entry = TreeCacheEntry(size=len(spec.content), blob_id=blob_id)
+
+        file_path = relative_path(local_dir, spec.path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(spec.content)
+        with patch(
+            "huggingface_hub._local_folder.time.time",
+            return_value=LOCAL_DIR_METADATA_TIMESTAMP,
+        ):
+            write_download_metadata(
+                local_dir,
+                filename=spec.path,
+                commit_hash=LOCAL_DIR_COMMIT,
+                etag=etag,
+            )
+        download_paths = get_local_download_paths(local_dir, spec.path)
+        normalize_text(download_paths.metadata_path)
+        # File-lock persistence differs by host and is not upstream cache metadata.
+        if download_paths.lock_path.exists():
+            download_paths.lock_path.unlink()
+
+        tree_entries[spec.path] = tree_entry
+        metadata_path = download_paths.metadata_path.relative_to(local_dir).as_posix()
+        files.append(
+            {
+                "path": spec.path,
+                "metadata_path": metadata_path,
+                "etag": etag,
+                "blob_id": blob_id,
+                "lfs_sha256": tree_entry.lfs_sha256,
+                "lfs_size": tree_entry.lfs_size,
+                "size": len(spec.content),
+                "content_sha256": content_sha256,
+                "metadata_timestamp": LOCAL_DIR_METADATA_TIMESTAMP,
+            }
+        )
+
+    cache_directory = local_dir / ".cache" / "huggingface"
+    write_tree_cache(str(cache_directory), LOCAL_DIR_COMMIT, tree_entries)
+    tree_path = cache_directory / "trees" / f"{LOCAL_DIR_COMMIT}.json"
+    normalize_text(tree_path)
+    normalize_text(cache_directory / ".gitignore")
+    normalize_text(cache_directory / "CACHEDIR.TAG")
+
+    return {
+        "format_version": 1,
+        "local_directories": [
+            {
+                "path": "local-dir",
+                "repo_type": "model",
+                "repo_id": "fixture-org/fixture-local-dir",
+                "commit": LOCAL_DIR_COMMIT,
+                "tree_path": tree_path.relative_to(local_dir).as_posix(),
+                "gitignore_path": (cache_directory / ".gitignore")
+                .relative_to(local_dir)
+                .as_posix(),
+                "cachedir_tag_path": (cache_directory / "CACHEDIR.TAG")
+                .relative_to(local_dir)
+                .as_posix(),
+                "files": files,
+            }
+        ],
+    }
+
+
 def generate_legacy_metadata_records(output: Path) -> None:
     """Preserve the original isolated metadata-codec fixtures."""
     with TemporaryDirectory() as temporary_directory:
@@ -354,7 +496,9 @@ def generate_legacy_metadata_records(output: Path) -> None:
         standard = temporary / "standard"
         local_dir = temporary / "local-dir"
 
-        _cache_commit_hash_for_specific_revision(standard, "main", LEGACY_METADATA_COMMIT)
+        _cache_commit_hash_for_specific_revision(
+            standard, "main", LEGACY_METADATA_COMMIT
+        )
         write_tree_cache(
             str(standard),
             LEGACY_METADATA_COMMIT,
@@ -372,7 +516,9 @@ def generate_legacy_metadata_records(output: Path) -> None:
                 ),
             },
         )
-        with patch("huggingface_hub._local_folder.time.time", return_value=1_720_000_000.25):
+        with patch(
+            "huggingface_hub._local_folder.time.time", return_value=1_720_000_000.25
+        ):
             write_download_metadata(
                 local_dir,
                 filename="nested/model.safetensors",
@@ -380,7 +526,9 @@ def generate_legacy_metadata_records(output: Path) -> None:
                 etag="3333333333333333333333333333333333333333333333333333333333333333",
             )
 
-        (output / "standard-ref-main").write_bytes((standard / "refs" / "main").read_bytes())
+        (output / "standard-ref-main").write_bytes(
+            (standard / "refs" / "main").read_bytes()
+        )
         (output / "tree-v1.json").write_bytes(
             portable_text(standard / "trees" / f"{LEGACY_METADATA_COMMIT}.json")
         )
@@ -404,9 +552,11 @@ def main() -> None:
 
     output.mkdir(parents=True, exist_ok=True)
     inventory = generate_standard_cache(output, arguments.runtime_symlinks)
+    local_dir_inventory = generate_local_dir(output)
     generate_legacy_metadata_records(output)
     write_json(output / "provenance.json", provenance)
     write_json(output / "inventory.json", inventory)
+    write_json(output / "local-dir-inventory.json", local_dir_inventory)
 
 
 if __name__ == "__main__":

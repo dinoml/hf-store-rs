@@ -15,10 +15,20 @@ Unix to construct that pointer through the pinned upstream helper.
 Each inventory file record pins the upstream tree blob ID, optional LFS digest
 and size, physical ETag name, local content SHA-256, size, and snapshot form.
 
+`local-dir-inventory.json` describes the Python-written local directory below
+`local-dir/`. It contains two real nested files covering regular Git-blob and
+LFS identity shapes, each file's three-line download metadata, the per-commit
+tree cache, `.cache/huggingface/.gitignore`, and `CACHEDIR.TAG`. The metadata
+timestamp is fixed for deterministic bytes. Conformance tests copy the directory
+and set each file's mtime to that recorded timestamp before asking pinned Python
+to read it. Transient lock files, whose persistence varies by host, are removed
+only after the pinned writer releases them.
+
 The original isolated ref, tree-cache, and `local_dir` metadata codec records
 remain alongside the corpus. Text records are normalized to LF after the pinned
 writers run so that the checked-in bytes are deterministic across Python hosts.
-Fixture presence alone does not establish full Hub-cache compatibility.
+Fixture presence and Python acceptance do not establish hf-store offline
+completeness or full Hub-cache compatibility.
 
 To regenerate them, check out the pinned commit in the reference repository and
 run:

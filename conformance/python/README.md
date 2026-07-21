@@ -2,8 +2,8 @@
 
 This lane runs separately from the Rust test suite. It verifies the exact
 `huggingface_hub` v1.24.0 source commit, validates the generated fixture
-provenance, and exercises the pinned Python cache readers without network
-access.
+provenance, and exercises the pinned Python standard-cache and `local_dir`
+readers without network access.
 
 From a Unix host with the pinned reference checkout installed from source:
 
@@ -29,9 +29,18 @@ the upstream writer modules.
 
 The portable comparison requires exact generated paths, entry types, symlink
 targets, and file bytes. Only the source-maintained `README.md` and
-`generate.py` at the fixture root are excluded.
+`generate.py`, plus their transient root `__pycache__/`, are excluded. This
+includes the complete `local-dir/` tree and `local-dir-inventory.json`.
+
+The `local_dir` check copies the deterministic checked-in tree to a temporary
+directory and sets each real file's mtime to its recorded three-line metadata
+timestamp. It then exercises `read_download_metadata`, `read_tree_cache`,
+`get_cached_repo_tree`, and
+`snapshot_download(..., local_dir=..., local_files_only=True, token=False)`.
+The repository-info method is patched to fail if that offline call attempts a
+network lookup.
 
 Passing this lane means the pinned Python readers accept the Python-written
-corpus. It does not yet claim that Python can read Rust-written cache entries or
-that Rust can completely import the Python cache; those remain separate roadmap
-gates.
+corpus. It does not claim hf-store offline completeness, that Python can read
+Rust-written entries, or that Rust can completely import Python cache or
+`local_dir` state; those remain separate roadmap gates.

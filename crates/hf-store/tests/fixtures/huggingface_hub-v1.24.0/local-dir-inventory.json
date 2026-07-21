@@ -1,0 +1,38 @@
+{
+  "format_version": 1,
+  "local_directories": [
+    {
+      "cachedir_tag_path": ".cache/huggingface/CACHEDIR.TAG",
+      "commit": "4444444444444444444444444444444444444444",
+      "files": [
+        {
+          "blob_id": "1d3e832db20793bc16ef45d42eace92e9b3d09ef",
+          "content_sha256": "3d3662c17282a5207d8b0959f8cb360938ad1353331188abec48b420da48ddb3",
+          "etag": "1d3e832db20793bc16ef45d42eace92e9b3d09ef",
+          "lfs_sha256": null,
+          "lfs_size": null,
+          "metadata_path": ".cache/huggingface/download/config/fixture.json.metadata",
+          "metadata_timestamp": 1720000000.25,
+          "path": "config/fixture.json",
+          "size": 40
+        },
+        {
+          "blob_id": "3995220defb3805bcc59e11a08ec28acfbb402e8",
+          "content_sha256": "56b93e7dc344b0707e63012ae0b7bce9c78180a7a416a72237fa01c6f5254184",
+          "etag": "56b93e7dc344b0707e63012ae0b7bce9c78180a7a416a72237fa01c6f5254184",
+          "lfs_sha256": "56b93e7dc344b0707e63012ae0b7bce9c78180a7a416a72237fa01c6f5254184",
+          "lfs_size": 31,
+          "metadata_path": ".cache/huggingface/download/weights/nested/model.safetensors.metadata",
+          "metadata_timestamp": 1720000000.25,
+          "path": "weights/nested/model.safetensors",
+          "size": 31
+        }
+      ],
+      "gitignore_path": ".cache/huggingface/.gitignore",
+      "path": "local-dir",
+      "repo_id": "fixture-org/fixture-local-dir",
+      "repo_type": "model",
+      "tree_path": ".cache/huggingface/trees/4444444444444444444444444444444444444444.json"
+    }
+  ]
+}

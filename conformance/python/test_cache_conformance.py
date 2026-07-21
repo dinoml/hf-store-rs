@@ -10,6 +10,8 @@ from cache_conformance import (
     EXPECTED_HUGGINGFACE_HUB_VERSION,
     ConformanceError,
     load_inventory,
+    load_local_dir_inventory,
+    prepare_local_dir_fixture,
     validate_imported_source,
     validate_upstream_identity,
 )
@@ -132,15 +134,123 @@ class InventoryTests(unittest.TestCase):
                 load_inventory(path)
 
     def test_rejects_an_unsafe_inventory_path(self) -> None:
+        for unsafe_path in ("../token", "C:/outside", "name:stream"):
+            with self.subTest(unsafe_path=unsafe_path):
+                inventory = self.inventory()
+                repository = inventory["repositories"][0]  # type: ignore[index]
+                repository["files"][0]["path"] = unsafe_path  # type: ignore[index]
+                with TemporaryDirectory() as temporary_directory:
+                    path = self.write_inventory(Path(temporary_directory), inventory)
+                    with self.assertRaisesRegex(
+                        ConformanceError, "normalized relative POSIX path"
+                    ):
+                        load_inventory(path)
+
+
+class LocalDirInventoryTests(unittest.TestCase):
+    """Keep the Python-written local_dir corpus explicit and path-safe."""
+
+    def inventory(self) -> dict[str, object]:
+        commit = "4" * 40
+        return {
+            "format_version": 1,
+            "local_directories": [
+                {
+                    "path": "local-dir",
+                    "repo_type": "model",
+                    "repo_id": "fixture-org/fixture-local-dir",
+                    "commit": commit,
+                    "tree_path": f".cache/huggingface/trees/{commit}.json",
+                    "gitignore_path": ".cache/huggingface/.gitignore",
+                    "cachedir_tag_path": ".cache/huggingface/CACHEDIR.TAG",
+                    "files": [
+                        {
+                            "path": "nested/config.json",
+                            "metadata_path": (
+                                ".cache/huggingface/download/"
+                                "nested/config.json.metadata"
+                            ),
+                            "etag": "1" * 40,
+                            "blob_id": "1" * 40,
+                            "lfs_sha256": None,
+                            "lfs_size": None,
+                            "size": 2,
+                            "content_sha256": "2" * 64,
+                            "metadata_timestamp": 1_720_000_000.25,
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def write_inventory(self, directory: Path, inventory: dict[str, object]) -> Path:
+        path = directory / "local-dir-inventory.json"
+        path.write_text(json.dumps(inventory), encoding="utf-8")
+        return path
+
+    def test_loads_the_version_one_local_dir_inventory(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = self.write_inventory(Path(temporary_directory), self.inventory())
+            inventory = load_local_dir_inventory(path)
+
+        self.assertEqual(len(inventory.local_directories), 1)
+        fixture = inventory.local_directories[0]
+        self.assertEqual(fixture.path.as_posix(), "local-dir")
+        self.assertEqual(fixture.files[0].metadata_timestamp, 1_720_000_000.25)
+
+    def test_rejects_an_unsafe_local_dir_metadata_path(self) -> None:
         inventory = self.inventory()
-        repository = inventory["repositories"][0]  # type: ignore[index]
-        repository["files"][0]["path"] = "../token"  # type: ignore[index]
+        local_directory = inventory["local_directories"][0]  # type: ignore[index]
+        local_directory["files"][0]["metadata_path"] = "../token"  # type: ignore[index]
         with TemporaryDirectory() as temporary_directory:
             path = self.write_inventory(Path(temporary_directory), inventory)
             with self.assertRaisesRegex(
                 ConformanceError, "normalized relative POSIX path"
             ):
-                load_inventory(path)
+                load_local_dir_inventory(path)
+
+    def test_rejects_a_windows_drive_local_dir_path(self) -> None:
+        inventory = self.inventory()
+        local_directory = inventory["local_directories"][0]  # type: ignore[index]
+        local_directory["path"] = "C:/outside"  # type: ignore[index]
+        with TemporaryDirectory() as temporary_directory:
+            path = self.write_inventory(Path(temporary_directory), inventory)
+            with self.assertRaisesRegex(
+                ConformanceError, "normalized relative POSIX path"
+            ):
+                load_local_dir_inventory(path)
+
+    def test_prepares_an_independent_copy_with_fresh_file_metadata(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            inventory_path = self.write_inventory(temporary, self.inventory())
+            fixture = load_local_dir_inventory(inventory_path).local_directories[0]
+            source = temporary / "local-dir"
+            file_path = source / "nested" / "config.json"
+            metadata_path = (
+                source
+                / ".cache"
+                / "huggingface"
+                / "download"
+                / "nested"
+                / "config.json.metadata"
+            )
+            file_path.parent.mkdir(parents=True)
+            metadata_path.parent.mkdir(parents=True)
+            file_path.write_bytes(b"{}")
+            metadata_path.write_text(
+                f"{'4' * 40}\n{'1' * 40}\n1720000000.25\n",
+                encoding="utf-8",
+            )
+
+            prepared = prepare_local_dir_fixture(
+                temporary, fixture, temporary / "prepared"
+            )
+
+            prepared_file = prepared / "nested" / "config.json"
+            self.assertTrue(prepared_file.is_file())
+            self.assertLessEqual(prepared_file.stat().st_mtime - 1, 1_720_000_000.25)
+            self.assertNotEqual(prepared, source)
 
 
 if __name__ == "__main__":

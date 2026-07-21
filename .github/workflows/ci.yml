@@ -110,7 +110,7 @@ jobs:
       - name: Test conformance harness
         run: python -m unittest discover -s conformance/python -p "test_*.py" -v
 
-      - name: Regenerate portable standard-cache corpus
+      - name: Regenerate portable standard-cache and local_dir corpus
         run: >-
           python crates/hf-store/tests/fixtures/huggingface_hub-v1.24.0/generate.py
           --output "${RUNNER_TEMP}/hf-store-python-portable"
@@ -121,13 +121,13 @@ jobs:
           --checked-in crates/hf-store/tests/fixtures/huggingface_hub-v1.24.0
           --generated "${RUNNER_TEMP}/hf-store-python-portable"
 
-      - name: Generate pinned standard-cache corpus
+      - name: Generate pinned cache and local_dir conformance corpus
         run: >-
           python crates/hf-store/tests/fixtures/huggingface_hub-v1.24.0/generate.py
           --output "${RUNNER_TEMP}/hf-store-python-conformance"
           --runtime-symlinks
 
-      - name: Exercise pinned Python cache readers offline
+      - name: Exercise pinned Python cache and local_dir readers offline
         run: >-
           python conformance/python/cache_conformance.py
           --reference-root .conformance/huggingface_hub

@@ -1,0 +1,15 @@
+{
+ "format_version": 1,
+ "files": {
+  "config/fixture.json": {
+   "size": 40,
+   "blob_id": "1d3e832db20793bc16ef45d42eace92e9b3d09ef"
+  },
+  "weights/nested/model.safetensors": {
+   "size": 31,
+   "blob_id": "3995220defb3805bcc59e11a08ec28acfbb402e8",
+   "lfs_sha256": "56b93e7dc344b0707e63012ae0b7bce9c78180a7a416a72237fa01c6f5254184",
+   "lfs_size": 31
+  }
+ }
+}

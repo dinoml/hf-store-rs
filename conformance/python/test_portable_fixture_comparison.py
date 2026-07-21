@@ -33,6 +33,8 @@ class PortableFixtureComparisonTests(unittest.TestCase):
                 )
             (checked_in / "README.md").write_text("documentation\n", encoding="utf-8")
             (checked_in / "generate.py").write_text("# generator\n", encoding="utf-8")
+            (checked_in / "__pycache__").mkdir()
+            (checked_in / "__pycache__" / "generate.pyc").write_bytes(b"transient")
 
             compare_portable_fixture_trees(checked_in, generated)
 

@@ -11,12 +11,16 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import string
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 from typing import Any, Callable, Sequence
+from unittest.mock import patch
 
 
 EXPECTED_HUGGINGFACE_HUB_VERSION = "1.24.0"
@@ -87,6 +91,42 @@ class Inventory:
 
 
 @dataclass(frozen=True)
+class LocalDirFileFixture:
+    """Expected content and pinned download metadata for one local_dir file."""
+
+    path: PurePosixPath
+    metadata_path: PurePosixPath
+    etag: str
+    blob_id: str
+    lfs_sha256: str | None
+    lfs_size: int | None
+    size: int
+    content_sha256: str
+    metadata_timestamp: float
+
+
+@dataclass(frozen=True)
+class LocalDirFixture:
+    """One Python-written local_dir and its cached repository tree."""
+
+    path: PurePosixPath
+    repo_type: str
+    repo_id: str
+    commit: str
+    tree_path: PurePosixPath
+    gitignore_path: PurePosixPath
+    cachedir_tag_path: PurePosixPath
+    files: tuple[LocalDirFileFixture, ...]
+
+
+@dataclass(frozen=True)
+class LocalDirInventory:
+    """Versioned inventory for generated Python local_dir fixtures."""
+
+    local_directories: tuple[LocalDirFixture, ...]
+
+
+@dataclass(frozen=True)
 class PythonReaders:
     """Pinned upstream cache-reader entry points used by this lane."""
 
@@ -94,6 +134,8 @@ class PythonReaders:
     snapshot_download: Callable[..., str]
     scan_cache_dir: Callable[..., object]
     read_tree_cache: Callable[[str, str], object]
+    read_download_metadata: Callable[[Path, str], object]
+    get_cached_repo_tree: Callable[..., list[object]]
     cached_no_exist: object
 
 
@@ -214,6 +256,15 @@ def _integer(value: object, context: str) -> int:
     return value
 
 
+def _timestamp(value: object, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConformanceError(f"{context} must be a finite non-negative number")
+    timestamp = float(value)
+    if not math.isfinite(timestamp) or timestamp < 0:
+        raise ConformanceError(f"{context} must be a finite non-negative number")
+    return timestamp
+
+
 def _boolean(value: object, context: str) -> bool:
     if not isinstance(value, bool):
         raise ConformanceError(f"{context} must be a boolean")
@@ -227,6 +278,7 @@ def _relative_path(value: object, context: str) -> PurePosixPath:
         path.is_absolute()
         or text != path.as_posix()
         or "\\" in text
+        or ":" in text
         or any(part in {"", ".", ".."} for part in path.parts)
     ):
         raise ConformanceError(f"{context} is not a normalized relative POSIX path")
@@ -412,6 +464,188 @@ def load_inventory(path: Path) -> Inventory:
     )
 
 
+def load_local_dir_inventory(path: Path) -> LocalDirInventory:
+    """Load and strictly validate the generated local_dir fixture inventory."""
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ConformanceError(
+            f"could not read local_dir fixture inventory {path}: {error}"
+        ) from error
+    root = _object(raw, "local_dir fixture inventory")
+    format_version = _integer(
+        _required(root, "format_version", "local_dir fixture inventory"),
+        "local_dir fixture inventory format_version",
+    )
+    if format_version != INVENTORY_FORMAT_VERSION:
+        raise ConformanceError(
+            f"unsupported local_dir fixture inventory version {format_version}"
+        )
+
+    local_directories: list[LocalDirFixture] = []
+    local_paths: set[PurePosixPath] = set()
+    for index, raw_local_directory in enumerate(
+        _array(
+            _required(root, "local_directories", "local_dir fixture inventory"),
+            "local_directories",
+        )
+    ):
+        context = f"local_directories[{index}]"
+        local_directory = _object(raw_local_directory, context)
+        local_path = _relative_path(
+            _required(local_directory, "path", context), f"{context}.path"
+        )
+        if local_path in local_paths:
+            raise ConformanceError(
+                f"duplicate local_dir fixture path {local_path.as_posix()}"
+            )
+        local_paths.add(local_path)
+
+        repo_type = _string(
+            _required(local_directory, "repo_type", context),
+            f"{context}.repo_type",
+        )
+        if repo_type not in {"model", "dataset", "space"}:
+            raise ConformanceError(f"{context}.repo_type is unsupported: {repo_type}")
+        repo_id = _string(
+            _required(local_directory, "repo_id", context), f"{context}.repo_id"
+        )
+        commit = _hex(
+            _required(local_directory, "commit", context), 40, f"{context}.commit"
+        )
+        tree_path = _relative_path(
+            _required(local_directory, "tree_path", context),
+            f"{context}.tree_path",
+        )
+        expected_tree_path = PurePosixPath(f".cache/huggingface/trees/{commit}.json")
+        if tree_path != expected_tree_path:
+            raise ConformanceError(
+                f"{context}.tree_path does not match its commit: {tree_path}"
+            )
+        gitignore_path = _relative_path(
+            _required(local_directory, "gitignore_path", context),
+            f"{context}.gitignore_path",
+        )
+        if gitignore_path != PurePosixPath(".cache/huggingface/.gitignore"):
+            raise ConformanceError(f"{context}.gitignore_path is not canonical")
+        cachedir_tag_path = _relative_path(
+            _required(local_directory, "cachedir_tag_path", context),
+            f"{context}.cachedir_tag_path",
+        )
+        if cachedir_tag_path != PurePosixPath(".cache/huggingface/CACHEDIR.TAG"):
+            raise ConformanceError(f"{context}.cachedir_tag_path is not canonical")
+
+        files: list[LocalDirFileFixture] = []
+        file_paths: set[PurePosixPath] = set()
+        for file_index, raw_file in enumerate(
+            _array(_required(local_directory, "files", context), f"{context}.files")
+        ):
+            file_context = f"{context}.files[{file_index}]"
+            file_record = _object(raw_file, file_context)
+            file_path = _relative_path(
+                _required(file_record, "path", file_context),
+                f"{file_context}.path",
+            )
+            if file_path in file_paths:
+                raise ConformanceError(
+                    f"duplicate local_dir fixture file {local_path}/{file_path}"
+                )
+            file_paths.add(file_path)
+            metadata_path = _relative_path(
+                _required(file_record, "metadata_path", file_context),
+                f"{file_context}.metadata_path",
+            )
+            expected_metadata_path = PurePosixPath(
+                ".cache/huggingface/download"
+            ) / PurePosixPath(f"{file_path.as_posix()}.metadata")
+            if metadata_path != expected_metadata_path:
+                raise ConformanceError(
+                    f"{file_context}.metadata_path does not match its file path"
+                )
+
+            raw_lfs_sha256 = _required(file_record, "lfs_sha256", file_context)
+            lfs_sha256 = (
+                None
+                if raw_lfs_sha256 is None
+                else _hex(raw_lfs_sha256, 64, f"{file_context}.lfs_sha256")
+            )
+            raw_lfs_size = _required(file_record, "lfs_size", file_context)
+            lfs_size = (
+                None
+                if raw_lfs_size is None
+                else _integer(raw_lfs_size, f"{file_context}.lfs_size")
+            )
+            if (lfs_sha256 is None) != (lfs_size is None):
+                raise ConformanceError(
+                    f"{file_context} must provide LFS SHA-256 and size together"
+                )
+            size = _integer(
+                _required(file_record, "size", file_context),
+                f"{file_context}.size",
+            )
+            content_sha256 = _hex(
+                _required(file_record, "content_sha256", file_context),
+                64,
+                f"{file_context}.content_sha256",
+            )
+            etag = _string(
+                _required(file_record, "etag", file_context), f"{file_context}.etag"
+            )
+            blob_id = _hex(
+                _required(file_record, "blob_id", file_context),
+                40,
+                f"{file_context}.blob_id",
+            )
+            if lfs_sha256 is None:
+                if etag != blob_id:
+                    raise ConformanceError(
+                        f"{file_context} regular ETag must equal its Git blob identity"
+                    )
+            elif etag != lfs_sha256 or content_sha256 != lfs_sha256 or size != lfs_size:
+                raise ConformanceError(
+                    f"{file_context} LFS ETag, content digest, and size disagree"
+                )
+
+            files.append(
+                LocalDirFileFixture(
+                    path=file_path,
+                    metadata_path=metadata_path,
+                    etag=etag,
+                    blob_id=blob_id,
+                    lfs_sha256=lfs_sha256,
+                    lfs_size=lfs_size,
+                    size=size,
+                    content_sha256=content_sha256,
+                    metadata_timestamp=_timestamp(
+                        _required(file_record, "metadata_timestamp", file_context),
+                        f"{file_context}.metadata_timestamp",
+                    ),
+                )
+            )
+        if not files:
+            raise ConformanceError(f"{context} must contain at least one file")
+
+        local_directories.append(
+            LocalDirFixture(
+                path=local_path,
+                repo_type=repo_type,
+                repo_id=repo_id,
+                commit=commit,
+                tree_path=tree_path,
+                gitignore_path=gitignore_path,
+                cachedir_tag_path=cachedir_tag_path,
+                files=tuple(files),
+            )
+        )
+
+    if not local_directories:
+        raise ConformanceError(
+            "local_dir fixture inventory must contain at least one local directory"
+        )
+    return LocalDirInventory(local_directories=tuple(local_directories))
+
+
 def verify_fixture_provenance(path: Path, reference_root: Path) -> None:
     """Verify the corpus baseline and the exact pinned upstream source blobs."""
 
@@ -485,10 +719,12 @@ def load_python_readers() -> tuple[Any, PythonReaders]:
     import huggingface_hub
     from huggingface_hub import (
         _CACHED_NO_EXIST,
+        get_cached_repo_tree,
         scan_cache_dir,
         snapshot_download,
         try_to_load_from_cache,
     )
+    from huggingface_hub._local_folder import read_download_metadata
     from huggingface_hub._tree_cache import read_tree_cache
 
     return huggingface_hub, PythonReaders(
@@ -496,6 +732,8 @@ def load_python_readers() -> tuple[Any, PythonReaders]:
         snapshot_download=snapshot_download,
         scan_cache_dir=scan_cache_dir,
         read_tree_cache=read_tree_cache,
+        read_download_metadata=read_download_metadata,
+        get_cached_repo_tree=get_cached_repo_tree,
         cached_no_exist=_CACHED_NO_EXIST,
     )
 
@@ -807,6 +1045,189 @@ def exercise_python_cache_readers(
     return len(inventory.repositories), file_count
 
 
+def prepare_local_dir_fixture(
+    inventory_directory: Path, fixture: LocalDirFixture, destination: Path
+) -> Path:
+    """Copy a checked-in local_dir and make its deterministic metadata fresh."""
+
+    source = _host_path(inventory_directory.resolve(), fixture.path)
+    if source.is_symlink() or not source.is_dir():
+        raise ConformanceError(f"local_dir fixture does not exist: {source}")
+    if destination.exists() or destination.is_symlink():
+        raise ConformanceError(
+            f"local_dir conformance destination already exists: {destination}"
+        )
+    try:
+        shutil.copytree(source, destination, symlinks=True)
+        for file_fixture in fixture.files:
+            file_path = _host_path(destination, file_fixture.path)
+            if file_path.is_symlink() or not file_path.is_file():
+                raise ConformanceError(
+                    f"local_dir fixture file is not a regular file: {file_path}"
+                )
+            os.utime(
+                file_path,
+                (file_fixture.metadata_timestamp, file_fixture.metadata_timestamp),
+            )
+    except OSError as error:
+        raise ConformanceError(
+            f"could not prepare local_dir fixture {source}: {error}"
+        ) from error
+    return destination
+
+
+def _assert_local_dir_file(
+    path: Path, fixture: LocalDirFileFixture, context: str
+) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ConformanceError(f"{context} is not an independent regular file: {path}")
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise ConformanceError(
+            f"could not inspect local_dir file {path}: {error}"
+        ) from error
+    if size != fixture.size:
+        raise ConformanceError(
+            f"{context} has size {size}, wanted {fixture.size}: {path}"
+        )
+    digest = _digest(path)
+    if digest != fixture.content_sha256:
+        raise ConformanceError(
+            f"{context} has SHA-256 {digest}, wanted {fixture.content_sha256}: {path}"
+        )
+
+
+def exercise_python_local_dir_readers(
+    inventory: LocalDirInventory,
+    inventory_directory: Path,
+    readers: PythonReaders,
+) -> tuple[int, int]:
+    """Exercise pinned offline readers over fresh copies of every local_dir."""
+
+    file_count = 0
+    with TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        for index, fixture in enumerate(inventory.local_directories):
+            local_dir = prepare_local_dir_fixture(
+                inventory_directory,
+                fixture,
+                temporary / f"local-dir-{index}",
+            )
+            gitignore = _host_path(local_dir, fixture.gitignore_path)
+            cachedir_tag = _host_path(local_dir, fixture.cachedir_tag_path)
+            try:
+                if gitignore.read_bytes() != b"*":
+                    raise ConformanceError(
+                        f"pinned local_dir .gitignore has unexpected bytes: {gitignore}"
+                    )
+                if not cachedir_tag.read_bytes().startswith(
+                    b"Signature: 8a477f597d28d172789f06886806bc55"
+                ):
+                    raise ConformanceError(
+                        f"pinned local_dir CACHEDIR.TAG has the wrong signature: {cachedir_tag}"
+                    )
+            except OSError as error:
+                raise ConformanceError(
+                    f"could not read local_dir bookkeeping files: {error}"
+                ) from error
+
+            tree_cache_directory = local_dir / ".cache" / "huggingface"
+            tree = readers.read_tree_cache(str(tree_cache_directory), fixture.commit)
+            if not isinstance(tree, dict):
+                raise ConformanceError(
+                    f"pinned read_tree_cache rejected local_dir {fixture.path}"
+                )
+            expected_paths = {file.path.as_posix() for file in fixture.files}
+            if set(tree) != expected_paths:
+                raise ConformanceError(
+                    f"pinned read_tree_cache returned the wrong local_dir paths for {fixture.path}"
+                )
+
+            for file_fixture in fixture.files:
+                filename = file_fixture.path.as_posix()
+                tree_entry = tree[filename]
+                if (
+                    getattr(tree_entry, "size", None) != file_fixture.size
+                    or getattr(tree_entry, "blob_id", None) != file_fixture.blob_id
+                    or getattr(tree_entry, "lfs_sha256", None)
+                    != file_fixture.lfs_sha256
+                    or getattr(tree_entry, "lfs_size", None) != file_fixture.lfs_size
+                ):
+                    raise ConformanceError(
+                        f"pinned read_tree_cache changed local_dir identity fields for {filename}"
+                    )
+
+                metadata = readers.read_download_metadata(local_dir, filename)
+                if metadata is None:
+                    raise ConformanceError(
+                        f"pinned read_download_metadata rejected fresh metadata for {filename}"
+                    )
+                if (
+                    getattr(metadata, "filename", None) != filename
+                    or getattr(metadata, "commit_hash", None) != fixture.commit
+                    or getattr(metadata, "etag", None) != file_fixture.etag
+                    or getattr(metadata, "timestamp", None)
+                    != file_fixture.metadata_timestamp
+                ):
+                    raise ConformanceError(
+                        f"pinned read_download_metadata changed fields for {filename}"
+                    )
+                _assert_local_dir_file(
+                    _host_path(local_dir, file_fixture.path),
+                    file_fixture,
+                    "local_dir fixture",
+                )
+                file_count += 1
+
+            cached_tree = readers.get_cached_repo_tree(
+                fixture.repo_id,
+                repo_type=fixture.repo_type,
+                revision=fixture.commit,
+                cache_dir=temporary / "unused-standard-cache",
+                local_dir=local_dir,
+            )
+            cached_tree_records = {
+                str(getattr(entry, "path", "")): (
+                    getattr(entry, "size", None),
+                    getattr(entry, "blob_id", None),
+                )
+                for entry in cached_tree
+            }
+            expected_tree_records = {
+                file.path.as_posix(): (file.size, file.blob_id)
+                for file in fixture.files
+            }
+            if cached_tree_records != expected_tree_records:
+                raise ConformanceError(
+                    f"pinned get_cached_repo_tree changed local_dir records for {fixture.path}"
+                )
+
+            with patch(
+                "huggingface_hub._snapshot_download.HfApi.repo_info",
+                side_effect=ConformanceError(
+                    "snapshot_download attempted a network repository lookup"
+                ),
+            ):
+                snapshot = Path(
+                    readers.snapshot_download(
+                        repo_id=fixture.repo_id,
+                        repo_type=fixture.repo_type,
+                        revision=fixture.commit,
+                        cache_dir=temporary / "unused-standard-cache",
+                        local_dir=local_dir,
+                        local_files_only=True,
+                        token=False,
+                    )
+                )
+            if not _same_lexical_path(snapshot, local_dir):
+                raise ConformanceError(
+                    f"pinned snapshot_download returned {snapshot}, wanted {local_dir}"
+                )
+
+    return len(inventory.local_directories), file_count
+
+
 def _arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -826,6 +1247,14 @@ def _arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
         type=Path,
         help="provenance.json emitted by the generator (defaults beside inventory)",
     )
+    parser.add_argument(
+        "--local-dir-inventory",
+        type=Path,
+        help=(
+            "local-dir-inventory.json emitted by the generator "
+            "(defaults beside inventory)"
+        ),
+    )
     return parser.parse_args(arguments)
 
 
@@ -834,6 +1263,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     parsed = _arguments(arguments)
     provenance = parsed.provenance or parsed.inventory.with_name("provenance.json")
+    local_dir_inventory_path = parsed.local_dir_inventory or parsed.inventory.with_name(
+        "local-dir-inventory.json"
+    )
 
     # Set these before importing huggingface_hub so the test cannot silently use
     # network or ambient telemetry if a reader's local-only behavior regresses.
@@ -847,8 +1279,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
         verify_reference_checkout(parsed.reference_root, module)
         verify_fixture_provenance(provenance, parsed.reference_root)
         inventory = load_inventory(parsed.inventory)
+        local_dir_inventory = load_local_dir_inventory(local_dir_inventory_path)
         repositories, files = exercise_python_cache_readers(
             inventory, parsed.inventory.parent, readers
+        )
+        local_directories, local_dir_files = exercise_python_local_dir_readers(
+            local_dir_inventory, local_dir_inventory_path.parent, readers
         )
     except ConformanceError as error:
         print(f"conformance error: {error}", file=sys.stderr)
@@ -858,10 +1294,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
         "verified pinned Python readers: "
         f"huggingface_hub {EXPECTED_HUGGINGFACE_HUB_VERSION} "
         f"at {EXPECTED_HUGGINGFACE_HUB_COMMIT}; "
-        f"{repositories} Python-written repositories and {files} files"
+        f"{repositories} Python-written standard-cache repositories and {files} files; "
+        f"{local_directories} Python-written local_dir and {local_dir_files} files"
     )
     print(
-        "scope: Python reads of Python-written fixtures; Rust-writer conformance is not asserted"
+        "scope: Python reads of Python-written fixtures; Rust-writer and hf-store "
+        "offline-completeness conformance are not asserted"
     )
     return 0
 
