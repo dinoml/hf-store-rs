@@ -10,3 +10,4 @@ belong in an RFC until a decision is made.
 - [ADR 0003: Cache publication and coordination](0003-cache-publication-and-coordination.md) — Accepted
 - [ADR 0004: Transport runtime, TLS, proxy, and feature policy](0004-transport-runtime-tls-and-features.md) — Accepted
 - [ADR 0005: Repository filter grammar and matching semantics](0005-repository-filter-grammar.md) — Accepted
+- [ADR 0006: Local directory reconciliation and completion](0006-local-directory-reconciliation-and-completion.md) — Accepted
