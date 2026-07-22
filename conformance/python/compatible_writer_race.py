@@ -262,6 +262,24 @@ def run_writer(config: RaceConfig) -> dict[str, Any]:
     protocol.mark("python.ready")
     protocol.wait("start")
 
+    storage_name = file_download.repo_folder_name(
+        repo_id=config.repo_id,
+        repo_type=config.repo_type,
+    )
+    storage = config.cache_root / storage_name
+    tree_entry = TreeCacheEntry(
+        size=len(content),
+        blob_id=config.blob_id,
+        lfs_sha256=config.lfs_sha256,
+        lfs_size=len(content) if config.lfs_sha256 is not None else None,
+    )
+    # snapshot_download publishes the commit-bound tree before its workers
+    # contend for per-blob locks. Preserve that ordering while exercising the
+    # lower-level pinned file writer with deterministic metadata and body I/O.
+    write_tree_cache(str(storage), config.commit, {config.filename: tree_entry})
+    protocol.mark("python.tree-written")
+    _crash_if_requested(config, protocol, "tree-written")
+
     real_weak_file_lock = file_download.WeakFileLock
     observed_lock_path: str | None = None
     observed_lock_backend: str | None = None
@@ -334,21 +352,6 @@ def run_writer(config: RaceConfig) -> dict[str, Any]:
 
     protocol.mark("python.writer-returned")
     _crash_if_requested(config, protocol, "writer-returned")
-
-    storage_name = file_download.repo_folder_name(
-        repo_id=config.repo_id,
-        repo_type=config.repo_type,
-    )
-    storage = config.cache_root / storage_name
-    tree_entry = TreeCacheEntry(
-        size=len(content),
-        blob_id=config.blob_id,
-        lfs_sha256=config.lfs_sha256,
-        lfs_size=len(content) if config.lfs_sha256 is not None else None,
-    )
-    write_tree_cache(str(storage), config.commit, {config.filename: tree_entry})
-    protocol.mark("python.tree-written")
-    _crash_if_requested(config, protocol, "tree-written")
 
     expected_lock = config.cache_root / ".locks" / storage_name / f"{config.etag}.lock"
     if observed_lock_path is None or observed_lock_backend is None:
