@@ -39,6 +39,12 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo +stable doc --workspace --all-features --no-deps --locked
 
+      - name: Test cache-only library surface
+        run: cargo +stable test -p hf-store --no-default-features --locked
+
+      - name: Verify library package contents
+        run: cargo +stable package -p hf-store --locked
+
   test:
     name: Test (${{ matrix.os }})
     strategy:

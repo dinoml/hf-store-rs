@@ -1,21 +1,17 @@
 # Changelog
 
-All notable changes will be documented in this file.
+All notable user-visible changes are recorded here. The project follows
+[Semantic Versioning](https://semver.org/) for its public Rust and CLI
+contracts.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and releases will use [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-after the first publishable version is approved.
+## 0.1.0 - 2026-07-22
 
-## Unreleased
-
-### Added
-
-- Initial Rust workspace and quality gates.
-- Accepted v0.1 RFC plus repository-boundary, cache-format, and publication ADRs.
-- Contributor and security documentation.
-- Validated repository, revision, commit, path, endpoint, and redacted-token
-  value types.
-- Internal versioned cache keys, layouts, metadata records, and process-crash-safe
-  atomic-visibility publication primitives with deterministic failure tests.
-- Initial pure path models for future shared `huggingface_hub` cache and
-  `local_dir` conformance work.
+- Add typed asynchronous Hub planning and acquisition for model, dataset, and
+  Space repositories.
+- Add owned and `huggingface_hub` v1.24.0-compatible cache modes.
+- Add strict transport-free offline lookup and independent `local_dir`
+  materialization.
+- Add resumable, validated, bounded-concurrency transfers with cancellation and
+  structured progress.
+- Add cache inventory, verification, immutable GC plans, conservative GC
+  execution, and the thin `hf-store` CLI.
