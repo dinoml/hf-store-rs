@@ -100,10 +100,10 @@ impl Display for RevisionKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(super) struct SelectionId(CacheKey);
+pub(crate) struct SelectionId(CacheKey);
 
 impl SelectionId {
-    pub(super) fn derive(paths: &[RepoPath]) -> Result<Self, ValidationError> {
+    pub(crate) fn derive(paths: &[RepoPath]) -> Result<Self, ValidationError> {
         let mut exact = paths.iter().map(RepoPath::as_str).collect::<Vec<_>>();
         exact.sort_unstable();
         exact.dedup();

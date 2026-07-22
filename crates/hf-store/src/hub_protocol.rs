@@ -3,8 +3,9 @@ use std::sync::Arc;
 use serde::Deserialize;
 use url::Url;
 
-use crate::cache::{HubTree, HubTreeEntry};
+use crate::cache::{HubTree, HubTreeEntry, RepositoryFilter};
 use crate::error::HubOperationError;
+use crate::fetch_plan::FetchPlan;
 use crate::transport::{RedirectFollower, Transport, TransportMethod, TransportRequest};
 use crate::{AuthToken, CommitId, Endpoint, RepositoryKind, RepositorySpec, Revision};
 
@@ -61,6 +62,30 @@ impl HubProtocol {
         let info: RepositoryInfo =
             serde_json::from_slice(&body).map_err(|_source| HubOperationError::protocol())?;
         CommitId::parse(info.sha).map_err(HubOperationError::validation)
+    }
+
+    pub(crate) async fn build_plan(
+        &self,
+        repository: &RepositorySpec,
+        revision: &Revision,
+        filter: &RepositoryFilter,
+        authorization: Option<&AuthToken>,
+    ) -> Result<FetchPlan, HubOperationError> {
+        let commit = self
+            .resolve_revision(repository, revision, authorization)
+            .await?;
+        let tree = self
+            .retrieve_tree(repository, &commit, authorization)
+            .await?;
+        FetchPlan::build(
+            self.endpoint.clone(),
+            repository.clone(),
+            revision.clone(),
+            commit,
+            &tree,
+            filter,
+        )
+        .map_err(HubOperationError::validation)
     }
 
     pub(crate) async fn retrieve_tree(
@@ -489,6 +514,49 @@ mod tests {
                 .expect_err("followed untrusted pagination")
                 .is_protocol()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn end_to_end_planning_binds_symbolic_revision_to_one_commit() -> Result<(), Box<dyn Error>> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let protocol = protocol_with_responses(
+            [
+                response(200, [format!(r#"{{"sha":"{COMMIT}"}}"#).as_bytes()])?,
+                response(
+                    200,
+                    [
+                        br#"[{"type":"file","path":"config.json","oid":"git-id","size":2}]"#
+                            .as_slice(),
+                    ],
+                )?,
+            ],
+            Arc::clone(&requests),
+        )?;
+        let plan = run_ready(protocol.build_plan(
+            &repository()?,
+            &Revision::parse("main")?,
+            &RepositoryFilter::new(None, &[]),
+            None,
+        ))?;
+        assert_eq!(plan.commit().as_str(), COMMIT);
+        assert_eq!(
+            plan.files()
+                .keys()
+                .map(crate::RepoPath::as_str)
+                .collect::<Vec<_>>(),
+            ["config.json"]
+        );
+        let requests = requests
+            .lock()
+            .map_err(|_poisoned| "request lock poisoned")?;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .0
+                .ends_with("/api/models/owner/repo/revision/main")
+        );
+        assert!(requests[1].0.contains(&format!("/tree/{COMMIT}?")));
         Ok(())
     }
 

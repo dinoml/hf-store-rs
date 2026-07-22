@@ -26,6 +26,11 @@ mod endpoint;
 mod error;
 #[allow(
     dead_code,
+    reason = "private fetch plans precede the public request and snapshot APIs"
+)]
+mod fetch_plan;
+#[allow(
+    dead_code,
     reason = "private Hub protocol implementation precedes the public request API"
 )]
 mod hub_protocol;

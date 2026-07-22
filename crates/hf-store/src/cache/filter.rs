@@ -4,20 +4,20 @@ use crate::validation::{ValidationError, ValidationErrorKind};
 use super::key::SelectionId;
 
 #[derive(Clone, Debug)]
-pub(super) struct RepositoryFilter {
+pub(crate) struct RepositoryFilter {
     allow: Option<Box<[Pattern]>>,
     ignore: Box<[Pattern]>,
 }
 
 impl RepositoryFilter {
-    pub(super) fn new(allow_patterns: Option<&[&str]>, ignore_patterns: &[&str]) -> Self {
+    pub(crate) fn new(allow_patterns: Option<&[&str]>, ignore_patterns: &[&str]) -> Self {
         Self {
             allow: allow_patterns.map(compile_patterns),
             ignore: compile_patterns(ignore_patterns),
         }
     }
 
-    pub(super) fn select(
+    pub(crate) fn select(
         &self,
         paths: impl IntoIterator<Item = RepoPath>,
     ) -> Result<RepositorySelection, ValidationError> {
@@ -263,17 +263,17 @@ fn duplicate_tree_path() -> ValidationError {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct RepositorySelection {
+pub(crate) struct RepositorySelection {
     paths: Box<[RepoPath]>,
     selection_id: SelectionId,
 }
 
 impl RepositorySelection {
-    pub(super) fn paths(&self) -> &[RepoPath] {
+    pub(crate) fn paths(&self) -> &[RepoPath] {
         &self.paths
     }
 
-    pub(super) const fn selection_id(&self) -> &SelectionId {
+    pub(crate) const fn selection_id(&self) -> &SelectionId {
         &self.selection_id
     }
 }
