@@ -855,41 +855,77 @@ impl CacheKernel {
         let lock_path = self.layout.snapshot_lock(commit, selection);
         self.ensure_parent(&lock_path)?;
         let _guard = self.root.lock_exclusive(self.relative_path(&lock_path)?)?;
+        let staging_directory = self.layout.staging_directory();
+        self.root
+            .ensure_dir(self.relative_path(&staging_directory)?)?;
         let mut records = Vec::with_capacity(files.len());
-        for (path, digest, size) in files {
+        let mut staged_files = Vec::with_capacity(files.len());
+        for (index, (path, digest, size)) in files.iter().enumerate() {
             let source_path = self.layout.blob_path(digest);
             let source = self.relative_path(&source_path)?;
-            let destination_path = self.layout.snapshot_file(commit, selection, path);
-            self.ensure_parent(&destination_path)?;
-            let destination = self.relative_path(&destination_path)?;
-            let staging = self.next_staging_name()?;
-            let outcome = self
-                .root
-                .copy_regular_create_once(source, destination, &staging)?;
-            validate_existing_blob(self.root.as_ref(), destination, *size, *digest)?;
-            if outcome == CreateOnceOutcome::Created {
-                self.sync_parent(&destination_path)?;
+            let operation = self.next_staging_name()?;
+            let staging_path =
+                staging_directory.join(format!("{operation}-snapshot-{index}.entry"));
+            let staging = self.relative_path(&staging_path)?;
+            if self.root.stage_regular_hard_link(source, staging).is_err() {
+                let _cleanup_result = self.root.remove_file(staging);
+                if let Err(error) = self.root.stage_regular_copy(source, staging) {
+                    self.cleanup_staged_snapshot(&staged_files);
+                    return Err(error.into());
+                }
             }
+            if let Err(error) = validate_existing_blob(self.root.as_ref(), staging, *size, *digest)
+            {
+                let _cleanup_result = self.root.remove_file(staging);
+                self.cleanup_staged_snapshot(&staged_files);
+                return Err(error);
+            }
+            staged_files.push((path, *digest, *size, staging_path));
             records.push(SnapshotFileRecord::new(path, *digest, *size, None));
         }
         let manifest = SnapshotManifestRecord::new(commit, selection, records)?;
         let encoded = encode_record_bounded(&manifest, MAX_MANIFEST_RECORD_BYTES)?;
+        let operation = self.next_staging_name()?;
+        let manifest_staging_path = staging_directory.join(format!("{operation}-manifest.entry"));
+        let manifest_staging = self.relative_path(&manifest_staging_path)?;
+        if let Err(error) = self.root.stage_bytes(manifest_staging, &encoded) {
+            self.cleanup_staged_snapshot(&staged_files);
+            return Err(error.into());
+        }
+        for (path, digest, size, staging_path) in &staged_files {
+            let destination_path = self.layout.snapshot_file(commit, selection, path);
+            self.ensure_parent(&destination_path)?;
+            let destination = self.relative_path(&destination_path)?;
+            let staging = self.relative_path(staging_path)?;
+            let outcome = self.root.install_staged_create_once(staging, destination)?;
+            let _cleanup_result = self.root.remove_file(staging);
+            validate_existing_blob(self.root.as_ref(), destination, *size, *digest)?;
+            if outcome == CreateOnceOutcome::Created {
+                self.sync_parent(&destination_path)?;
+            }
+        }
         let destination = self.layout.snapshot_manifest(commit, selection);
         match self.root.entry_kind(self.relative_path(&destination)?)? {
-            RootedEntryKind::Missing => self.publish_encoded_create_once(
-                &destination,
-                &manifest,
-                &encoded,
-                MAX_MANIFEST_RECORD_BYTES,
-            )?,
-            RootedEntryKind::RegularFile => {
-                if self.read_snapshot_manifest(commit, selection)? != manifest {
-                    return Err(CacheError::conflicting_record());
+            RootedEntryKind::Missing => {
+                let outcome = self.root.install_staged_create_once(
+                    manifest_staging,
+                    self.relative_path(&destination)?,
+                )?;
+                if outcome == CreateOnceOutcome::Created {
+                    self.sync_parent(&destination)?;
                 }
             }
+            RootedEntryKind::RegularFile => {
+                let _cleanup_result = self.root.remove_file(manifest_staging);
+            }
             RootedEntryKind::Directory | RootedEntryKind::Other => {
+                let _cleanup_result = self.root.remove_file(manifest_staging);
                 return Err(CacheError::conflicting_record());
             }
+        }
+        let _cleanup_result = self.root.remove_file(manifest_staging);
+        if self.read_snapshot_manifest(commit, selection)? != manifest {
+            return Err(CacheError::conflicting_record());
         }
         self.open_owned_snapshot(
             &Revision::parse(commit.as_str())?,
@@ -899,6 +935,14 @@ impl CacheKernel {
                 .collect::<Vec<_>>()
                 .as_slice(),
         )
+    }
+
+    fn cleanup_staged_snapshot(&self, files: &[(&RepoPath, BlobDigest, u64, PathBuf)]) {
+        for (_, _, _, path) in files {
+            if let Ok(relative) = self.relative_path(path) {
+                let _cleanup_result = self.root.remove_file(relative);
+            }
+        }
     }
 
     pub(super) fn open_owned_snapshot(
@@ -1981,6 +2025,51 @@ mod tests {
                 .try_snapshot_maintenance_lease(&commit, &selection)?,
             RootedLockAttempt::Acquired(_)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn owned_snapshot_stages_every_entry_before_publishing_any_final_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let payload = b"first complete blob";
+        let digest = BlobDigest::for_bytes(payload);
+        fixture
+            .kernel
+            .publish_blob(Cursor::new(payload), u64::try_from(payload.len())?, digest)?;
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let first = RepoPath::parse("config.json")?;
+        let missing = RepoPath::parse("weights/model.bin")?;
+        let selection = SelectionId::derive(&[first.clone(), missing.clone()])?;
+        let missing_digest = BlobDigest::for_bytes(b"absent");
+
+        fixture
+            .kernel
+            .publish_owned_snapshot(
+                &commit,
+                &selection,
+                &[
+                    (first.clone(), digest, u64::try_from(payload.len())?),
+                    (missing, missing_digest, 6),
+                ],
+            )
+            .expect_err("a missing late source unexpectedly published a snapshot");
+
+        assert!(
+            !fixture
+                .kernel
+                .layout
+                .snapshot_file(&commit, &selection, &first)
+                .exists()
+        );
+        assert!(
+            !fixture
+                .kernel
+                .layout
+                .snapshot_manifest(&commit, &selection)
+                .exists()
+        );
+        assert!(fixture.kernel.staging_entries()?.is_empty());
         Ok(())
     }
 

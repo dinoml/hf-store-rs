@@ -299,6 +299,52 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         let cleanup = self.remove_file(staging_path);
         finish_staging_cleanup(publication, cleanup)
     }
+    fn stage_regular_copy(&self, source: &Path, staging: &Path) -> io::Result<()> {
+        let (mut reader, expected_size) = match self.open_regular(source)? {
+            RootedRegularFile::File { reader, size, .. } => (reader, size),
+            RootedRegularFile::Missing => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cache copy source does not exist",
+                ));
+            }
+            RootedRegularFile::Other => {
+                return Err(invalid_data("cache copy source is not a regular file"));
+            }
+        };
+        let mut writer = self.create_new(staging)?;
+        let result = io::copy(&mut reader, &mut writer)
+            .and_then(|copied| {
+                if copied == expected_size {
+                    Ok(())
+                } else {
+                    Err(invalid_data("cache copy source changed while being copied"))
+                }
+            })
+            .and_then(|()| writer.sync_all());
+        drop(writer);
+        if result.is_err() {
+            let _cleanup_result = self.remove_file(staging);
+        }
+        result
+    }
+
+    fn stage_regular_hard_link(&self, _source: &Path, _staging: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hard-link staging is unsupported by this filesystem adapter",
+        ))
+    }
+
+    fn stage_bytes(&self, staging: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut writer = self.create_new(staging)?;
+        let result = writer.write_all(bytes).and_then(|()| writer.sync_all());
+        drop(writer);
+        if result.is_err() {
+            let _cleanup_result = self.remove_file(staging);
+        }
+        result
+    }
     fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()>;
     fn replace_from_staging(
         &self,
@@ -570,6 +616,18 @@ impl RootedFileSystem for CacheRoot {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let (parent, name) = self.open_parent_and_name(path, false)?;
         parent.remove_file(name)
+    }
+
+    fn stage_regular_hard_link(&self, source: &Path, staging: &Path) -> io::Result<()> {
+        if self.entry_kind(source)? != RootedEntryKind::RegularFile {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "cache hard-link source is not a regular file",
+            ));
+        }
+        let (source_parent, source_name) = self.open_parent_and_name(source, false)?;
+        let (staging_parent, staging_name) = self.open_parent_and_name(staging, true)?;
+        source_parent.hard_link(source_name, &staging_parent, staging_name)
     }
 
     fn install_staged_create_once(
