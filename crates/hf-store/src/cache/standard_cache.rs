@@ -128,37 +128,70 @@ impl StandardCacheWriter {
             Err(error) if error.is_incomplete() => None,
             Err(error) => return Err(error.into()),
         };
+        let mut published_any = false;
         for (key, blob) in &plan.blobs {
-            let blob_relative = self.relative(&self.layout.blob_path(key))?;
-            let prepared_blob = match self
-                .root
-                .open_regular(&blob_relative)
-                .map_err(CacheError::from)?
-            {
-                RootedRegularFile::File { mut reader, size } => {
-                    if size != blob.entry.size() {
-                        return Err(CompatibleCacheError::corrupt());
-                    }
-                    let (actual_size, digest) =
-                        copy_and_validate_content(reader.as_mut(), &mut io::sink(), &blob.entry)?;
-                    PreparedBlob {
-                        entry: blob.entry.clone(),
-                        size: actual_size,
-                        digest,
-                        staging: None,
-                    }
-                }
-                RootedRegularFile::Missing => self.prepare_missing_blob(
-                    blob,
-                    reusable_index.as_ref(),
-                    open_source,
-                    &mut cleanup,
-                )?,
-                RootedRegularFile::Other => return Err(CompatibleCacheError::corrupt()),
+            let prepared_blob = self.prepare_blob(
+                key,
+                blob,
+                reusable_index.as_ref(),
+                open_source,
+                &mut cleanup,
+            );
+            let (prepared_blob, published) = match prepared_blob {
+                Ok(prepared_blob) => prepared_blob,
+                Err(error) if published_any => return Err(error.with_may_have_published()),
+                Err(error) => return Err(error),
             };
+            published_any |= published;
             prepared.insert(key.clone(), prepared_blob);
         }
         Ok((prepared, cleanup))
+    }
+
+    fn prepare_blob<R, F>(
+        &self,
+        key: &HubBlobKey,
+        blob: &PlannedBlob,
+        reusable_index: Option<&HubCacheIndex>,
+        open_source: &mut F,
+        cleanup: &mut StagingCleanup,
+    ) -> Result<(PreparedBlob, bool), CompatibleCacheError>
+    where
+        R: Read,
+        F: FnMut(&RepoPath) -> io::Result<R>,
+    {
+        let destination = self.layout.blob_path(key);
+        let destination_relative = self.relative(&destination)?;
+        let lock = self.layout.blob_lock(key);
+        let _guard = self
+            .root
+            .lock_exclusive(&self.relative(&lock)?)
+            .map_err(CacheError::from)?;
+        let prepared = match self
+            .root
+            .open_regular(&destination_relative)
+            .map_err(CacheError::from)?
+        {
+            RootedRegularFile::File { mut reader, size } => {
+                if size != blob.entry.size() {
+                    return Err(CompatibleCacheError::corrupt());
+                }
+                let (actual_size, digest) =
+                    copy_and_validate_content(reader.as_mut(), &mut io::sink(), &blob.entry)?;
+                PreparedBlob {
+                    entry: blob.entry.clone(),
+                    size: actual_size,
+                    digest,
+                    staging: None,
+                }
+            }
+            RootedRegularFile::Missing => {
+                self.prepare_missing_blob(blob, reusable_index, open_source, cleanup)?
+            }
+            RootedRegularFile::Other => return Err(CompatibleCacheError::corrupt()),
+        };
+        let published = self.publish_blob_locked(&destination_relative, &prepared)?;
+        Ok((prepared, published))
     }
 
     fn prepare_missing_blob<R, F>(
@@ -244,7 +277,6 @@ impl StandardCacheWriter {
         prepared: &BTreeMap<HubBlobKey, PreparedBlob>,
     ) -> Result<CompatibleSnapshot, CompatibleCacheError> {
         self.initialize_python_layout()?;
-        self.publish_blobs(prepared)?;
         let index = self.publish_tree(commit, full_tree)?;
         self.root
             .ensure_dir(&self.relative(&self.layout.snapshot_directory(commit))?)
@@ -311,30 +343,36 @@ impl StandardCacheWriter {
         Ok(())
     }
 
-    fn publish_blobs(
+    fn publish_blob_locked(
         &self,
-        prepared: &BTreeMap<HubBlobKey, PreparedBlob>,
-    ) -> Result<(), CompatibleCacheError> {
-        for (key, blob) in prepared {
-            let destination = self.layout.blob_path(key);
-            let destination_relative = self.relative(&destination)?;
-            let lock = self.layout.blob_lock(key);
-            let _guard = self
+        destination: &Path,
+        blob: &PreparedBlob,
+    ) -> Result<bool, CompatibleCacheError> {
+        let published = if let Some(staging) = &blob.staging {
+            // Make a newly published blob scan-safe before it becomes visible.
+            // Source validation still precedes this scaffold, so invalid bytes
+            // leave no Python-visible repository state.
+            self.initialize_python_layout()?;
+            let outcome = self
                 .root
-                .lock_exclusive(&self.relative(&lock)?)
+                .install_staged_create_once(staging, destination)
                 .map_err(CacheError::from)?;
-            if let Some(staging) = &blob.staging {
-                let outcome = self
-                    .root
-                    .install_staged_create_once(staging, &destination_relative)
-                    .map_err(CacheError::from)?;
-                if outcome == CreateOnceOutcome::Created {
-                    self.sync_parent(&destination_relative)?;
-                }
+            if outcome == CreateOnceOutcome::Created {
+                self.sync_parent(destination)
+                    .map_err(CompatibleCacheError::with_may_have_published)?;
             }
-            self.validate_blob(&destination_relative, blob)?;
-        }
-        Ok(())
+            outcome == CreateOnceOutcome::Created
+        } else {
+            false
+        };
+        self.validate_blob(destination, blob).map_err(|error| {
+            if published {
+                error.with_may_have_published()
+            } else {
+                error
+            }
+        })?;
+        Ok(published)
     }
 
     fn validate_blob(
@@ -658,10 +696,13 @@ fn valid_cachedir_tag(actual: &[u8]) -> bool {
 mod tests {
     use std::collections::BTreeMap;
     use std::error::Error;
+    use std::fmt::{self, Debug, Display, Formatter};
     use std::fs;
-    use std::io::{self, Cursor};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::{self, Cursor, Read};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use serde_json::{Value, json};
     use sha1::{Digest as _, Sha1};
@@ -676,6 +717,10 @@ mod tests {
     use crate::cache::hub_metadata::{HubTree, HubTreeEntry, decode_tree};
     use crate::cache::publication::{
         Effects, NoPublicationFaults, OsFileSystem, RandomOperationIds, SystemClock,
+    };
+    use crate::cache::rooted_fs::{
+        CreateOnceOutcome, RelativeSymlinkOutcome, RootedEntryKind, RootedFileSystem,
+        RootedLockGuard, RootedRead, RootedRegularFile, RootedWrite, StagingName,
     };
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -947,6 +992,138 @@ mod tests {
         )?;
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writers_lock_before_opening_a_shared_source() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("config.json")?;
+        let entry = git_entry(CONFIG_BYTES)?;
+        let key = crate::cache::hub_cache::compatible_blob_key(&entry)?;
+        let tree = HubTree::new([(path.clone(), entry)])?;
+        let revision = Revision::parse(fixture.commit.as_str())?;
+        let mut writer = fixture.writer(SnapshotMaterialization::Copy)?;
+        let lock_path = writer.relative(&fixture.layout()?.blob_lock(&key))?;
+        writer.root = Arc::new(BlobPublicationProbeRoot {
+            inner: Arc::clone(&writer.root),
+            lock_barrier: Some((lock_path, Arc::new(Barrier::new(2)))),
+            failed_install: None,
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(2);
+
+        for _writer_index in 0..2 {
+            let writer = writer.clone();
+            let path = path.clone();
+            let tree = tree.clone();
+            let revision = revision.clone();
+            let commit = fixture.commit.clone();
+            let calls = Arc::clone(&calls);
+            handles.push(thread::spawn(move || {
+                writer
+                    .publish(
+                        &revision,
+                        &commit,
+                        &tree,
+                        std::slice::from_ref(&path),
+                        move |_source_path| {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            Ok(Cursor::new(CONFIG_BYTES.to_vec()))
+                        },
+                    )
+                    .map(|_snapshot| ())
+                    .map_err(|error| error.to_string())
+            }));
+        }
+
+        for handle in handles {
+            let result = handle
+                .join()
+                .map_err(|_panic| io::Error::other("concurrent cache writer panicked"))?;
+            result.map_err(io::Error::other)?;
+        }
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fs::read(fixture.layout()?.blob_path(&key))?, CONFIG_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_safe_scaffold_precedes_a_failing_blob_install() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("config.json")?;
+        let entry = git_entry(CONFIG_BYTES)?;
+        let key = crate::cache::hub_cache::compatible_blob_key(&entry)?;
+        let tree = HubTree::new([(path.clone(), entry)])?;
+        let revision = Revision::parse("refs/pr/7")?;
+        let layout = fixture.layout()?;
+        let mut writer = fixture.writer(SnapshotMaterialization::Copy)?;
+        let observed_scan_safe = Arc::new(AtomicBool::new(false));
+        writer.root = Arc::new(BlobPublicationProbeRoot {
+            inner: Arc::clone(&writer.root),
+            lock_barrier: None,
+            failed_install: Some(FailedBlobInstall {
+                destination: writer.relative(&layout.blob_path(&key))?,
+                cachedir_tag: writer.relative(&layout.cachedir_tag())?,
+                snapshots: writer.relative(&layout.snapshots_directory())?,
+                observed_scan_safe: Arc::clone(&observed_scan_safe),
+            }),
+        });
+        let contents = contents([(path.as_str(), CONFIG_BYTES)]);
+        let calls = AtomicUsize::new(0);
+
+        writer
+            .publish(
+                &revision,
+                &fixture.commit,
+                &tree,
+                std::slice::from_ref(&path),
+                source(&contents, Some(&calls)),
+            )
+            .expect_err("the controlled blob install must fail");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(observed_scan_safe.load(Ordering::Acquire));
+        assert_eq!(fs::read(layout.cachedir_tag())?, CACHEDIR_TAG);
+        assert!(layout.snapshots_directory().is_dir());
+        assert!(!layout.blob_path(&key).try_exists()?);
+        assert!(!layout.tree_path(&fixture.commit).try_exists()?);
+        assert!(!layout.ref_path(&revision)?.try_exists()?);
+        assert!(!layout.sidecar().cache_root().try_exists()?);
+        assert!(fs::read_dir(layout.staging_directory())?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn source_open_and_read_errors_are_redacted_from_the_compatible_error_chain()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("config.json")?;
+        let tree = HubTree::new([(path.clone(), git_entry(CONFIG_BYTES)?)])?;
+        let writer = fixture.writer(SnapshotMaterialization::Copy)?;
+
+        let open_error = writer
+            .publish::<io::Empty, _>(
+                &Revision::parse("main")?,
+                &fixture.commit,
+                &tree,
+                std::slice::from_ref(&path),
+                |_source_path| Err(secret_io_error()),
+            )
+            .expect_err("accepted an injected source-open failure");
+        assert_secret_absent_from_error_chain(&open_error);
+
+        let read_error = writer
+            .publish(
+                &Revision::parse("main")?,
+                &fixture.commit,
+                &tree,
+                std::slice::from_ref(&path),
+                |_source_path| Ok(SecretReader),
+            )
+            .expect_err("accepted an injected source-read failure");
+        assert_secret_absent_from_error_chain(&read_error);
         Ok(())
     }
 
@@ -1246,6 +1423,162 @@ mod tests {
         endpoint: Endpoint,
         spec: RepositorySpec,
         commit: CommitId,
+    }
+
+    const SECRET_ERROR_SENTINEL: &str = "hf_secret_signed_url_sentinel";
+
+    struct SecretError;
+
+    impl Debug for SecretError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            formatter.write_str(SECRET_ERROR_SENTINEL)
+        }
+    }
+
+    impl Display for SecretError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            formatter.write_str(SECRET_ERROR_SENTINEL)
+        }
+    }
+
+    impl Error for SecretError {}
+
+    struct SecretReader;
+
+    impl Read for SecretReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(secret_io_error())
+        }
+    }
+
+    fn secret_io_error() -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, SecretError)
+    }
+
+    fn assert_secret_absent_from_error_chain(error: &(dyn Error + 'static)) {
+        let mut current = Some(error);
+        while let Some(source) = current {
+            assert!(!source.to_string().contains(SECRET_ERROR_SENTINEL));
+            assert!(!format!("{source:?}").contains(SECRET_ERROR_SENTINEL));
+            current = source.source();
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlobPublicationProbeRoot {
+        inner: Arc<dyn RootedFileSystem>,
+        lock_barrier: Option<(PathBuf, Arc<Barrier>)>,
+        failed_install: Option<FailedBlobInstall>,
+    }
+
+    #[derive(Debug)]
+    struct FailedBlobInstall {
+        destination: PathBuf,
+        cachedir_tag: PathBuf,
+        snapshots: PathBuf,
+        observed_scan_safe: Arc<AtomicBool>,
+    }
+
+    impl RootedFileSystem for BlobPublicationProbeRoot {
+        fn ensure_dir(&self, path: &Path) -> io::Result<()> {
+            self.inner.ensure_dir(path)
+        }
+
+        fn entry_kind(&self, path: &Path) -> io::Result<RootedEntryKind> {
+            self.inner.entry_kind(path)
+        }
+
+        fn open_regular(&self, path: &Path) -> io::Result<RootedRegularFile> {
+            self.inner.open_regular(path)
+        }
+
+        fn read_regular_bounded(&self, path: &Path, limit: usize) -> io::Result<RootedRead> {
+            self.inner.read_regular_bounded(path, limit)
+        }
+
+        fn create_new(&self, path: &Path) -> io::Result<Box<dyn RootedWrite>> {
+            self.inner.create_new(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn install_staged_create_once(
+            &self,
+            staging: &Path,
+            destination: &Path,
+        ) -> io::Result<CreateOnceOutcome> {
+            if let Some(probe) = &self.failed_install {
+                if destination == probe.destination {
+                    let tag_is_valid = match self
+                        .inner
+                        .read_regular_bounded(&probe.cachedir_tag, CACHEDIR_TAG.len() * 2)?
+                    {
+                        RootedRead::Bytes(bytes) => super::valid_cachedir_tag(&bytes),
+                        RootedRead::Missing | RootedRead::Other => false,
+                    };
+                    let snapshots_exist =
+                        self.inner.entry_kind(&probe.snapshots)? == RootedEntryKind::Directory;
+                    probe
+                        .observed_scan_safe
+                        .store(tag_is_valid && snapshots_exist, Ordering::Release);
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "controlled blob install failure",
+                    ));
+                }
+            }
+            self.inner.install_staged_create_once(staging, destination)
+        }
+
+        fn create_once(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            staging: &StagingName,
+        ) -> io::Result<CreateOnceOutcome> {
+            self.inner.create_once(path, bytes, staging)
+        }
+
+        fn create_relative_symlink_once(
+            &self,
+            path: &Path,
+            target: &Path,
+        ) -> io::Result<RelativeSymlinkOutcome> {
+            self.inner.create_relative_symlink_once(path, target)
+        }
+
+        fn copy_regular_create_once(
+            &self,
+            source: &Path,
+            destination: &Path,
+            staging: &StagingName,
+        ) -> io::Result<CreateOnceOutcome> {
+            self.inner
+                .copy_regular_create_once(source, destination, staging)
+        }
+
+        fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {
+            self.inner.replace(path, bytes, staging)
+        }
+
+        fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
+            if let Some((lock_path, barrier)) = &self.lock_barrier {
+                if path == lock_path {
+                    barrier.wait();
+                }
+            }
+            self.inner.lock_exclusive(path)
+        }
+
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            self.inner.sync_directory(path)
+        }
+
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            self.inner.read_dir(path)
+        }
     }
 
     impl Fixture {
