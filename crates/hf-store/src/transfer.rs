@@ -6,6 +6,7 @@ use std::time::Duration;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+use crate::CancellationToken;
 use crate::cache::{BlobDigest, HubTreeEntry};
 use crate::error::{CacheFailure, HubOperationError};
 use crate::transport::TransportBody;
@@ -78,7 +79,11 @@ pub(crate) async fn stream_validated_body(
     body: &mut dyn TransportBody,
     sink: &mut dyn PartialSink,
     entry: &HubTreeEntry,
+    cancellation: &CancellationToken,
 ) -> Result<BlobDigest, HubOperationError> {
+    if cancellation.is_cancelled() {
+        return Err(HubOperationError::cancelled());
+    }
     let expected_lfs = match (entry.lfs_sha256(), entry.lfs_size()) {
         (Some(sha256), Some(size)) if is_lower_hex(sha256, 64) && size == entry.size() => {
             Some(sha256)
@@ -117,12 +122,20 @@ pub(crate) async fn stream_validated_body(
         if let Some(hasher) = git_hasher.as_mut() {
             hasher.update(&chunk);
         }
+        if cancellation.is_cancelled() {
+            sink.sync_all()
+                .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+            return Err(HubOperationError::cancelled());
+        }
     }
     if received != entry.size() {
         return Err(HubOperationError::validation(transfer_validation_error()));
     }
     sink.sync_all()
         .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+    if cancellation.is_cancelled() {
+        return Err(HubOperationError::cancelled());
+    }
 
     let digest = BlobDigest::from_bytes(local_hasher.finalize().into());
     if expected_lfs.is_some_and(|expected| digest.to_string() != expected) {
@@ -473,7 +486,12 @@ mod tests {
                 Ok(Box::<[u8]>::from(&bytes[4..])),
             ]));
             let mut sink = MemorySink::default();
-            let digest = run_ready(stream_validated_body(&mut body, &mut sink, &entry))?;
+            let digest = run_ready(stream_validated_body(
+                &mut body,
+                &mut sink,
+                &entry,
+                &CancellationToken::new(),
+            ))?;
             assert_eq!(sink.bytes, bytes);
             assert!(sink.synced.load(Ordering::Acquire));
             assert_eq!(digest, BlobDigest::for_bytes(bytes));
@@ -492,8 +510,13 @@ mod tests {
         ] {
             let mut body = MemoryBody(chunks);
             let mut sink = MemorySink::default();
-            run_ready(stream_validated_body(&mut body, &mut sink, &entry))
-                .expect_err("accepted an invalid stream");
+            run_ready(stream_validated_body(
+                &mut body,
+                &mut sink,
+                &entry,
+                &CancellationToken::new(),
+            ))
+            .expect_err("accepted an invalid stream");
         }
         let mut body = MemoryBody(VecDeque::from([Ok(Box::<[u8]>::from(&b"abcd"[..]))]));
         let mut sink = MemorySink {
@@ -501,9 +524,14 @@ mod tests {
             ..MemorySink::default()
         };
         assert!(
-            run_ready(stream_validated_body(&mut body, &mut sink, &entry))
-                .expect_err("accepted a sink failure")
-                .is_cache()
+            run_ready(stream_validated_body(
+                &mut body,
+                &mut sink,
+                &entry,
+                &CancellationToken::new(),
+            ))
+            .expect_err("accepted a sink failure")
+            .is_cache()
         );
         Ok(())
     }

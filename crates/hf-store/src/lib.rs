@@ -24,6 +24,7 @@ mod auth;
     reason = "the local cache kernel is internal until the HubStore service is introduced"
 )]
 mod cache;
+mod cancellation;
 mod endpoint;
 #[allow(
     dead_code,
@@ -67,6 +68,8 @@ pub use api::{FetchRequest, HubStore, HubStoreBuilder};
 pub use auth::AuthToken;
 #[doc(inline)]
 pub use cache::SelectionId;
+#[doc(inline)]
+pub use cancellation::CancellationToken;
 #[doc(inline)]
 pub use endpoint::Endpoint;
 #[doc(inline)]

@@ -578,6 +578,20 @@ impl CacheKernel {
         Ok(self.layout.partial_data(commit, path)?)
     }
 
+    pub(super) fn partial_data_size(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+    ) -> Result<Option<u64>, CacheError> {
+        let destination = self.layout.partial_data(commit, path)?;
+        let relative = self.relative_path(&destination)?;
+        match self.root.open_regular(relative)? {
+            RootedRegularFile::File { size, .. } => Ok(Some(size)),
+            RootedRegularFile::Missing => Ok(None),
+            RootedRegularFile::Other => Err(CacheError::conflicting_record()),
+        }
+    }
+
     pub(super) fn discard_partial(
         &self,
         commit: &CommitId,
