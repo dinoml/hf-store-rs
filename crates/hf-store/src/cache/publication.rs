@@ -340,6 +340,11 @@ impl Effects {
     pub(super) fn open_cache_authority(&self, path: &Path) -> io::Result<CacheAuthority> {
         self.file_system.open_cache_authority(path)
     }
+
+    pub(super) fn next_staging_name(&self) -> io::Result<StagingName> {
+        let operation_id = self.operation_ids.next()?;
+        StagingName::new(&operation_id.to_string())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -835,8 +840,7 @@ impl CacheKernel {
     }
 
     fn next_staging_name(&self) -> Result<StagingName, CacheError> {
-        let operation_id = self.effects.operation_ids.next()?;
-        Ok(StagingName::new(&operation_id.to_string())?)
+        Ok(self.effects.next_staging_name()?)
     }
 
     fn check_fault(

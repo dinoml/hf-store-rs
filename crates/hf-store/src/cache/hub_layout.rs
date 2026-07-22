@@ -4,9 +4,12 @@ use crate::validation::{ValidationError, ValidationErrorKind};
 use crate::{CommitId, Endpoint, RepoPath, RepositorySpec, Revision};
 
 use super::layout::CacheLayout;
+use super::rooted_fs::StagingName;
 
 #[derive(Clone, Debug)]
 pub(super) struct HubCacheLayout {
+    capability_root: PathBuf,
+    repository_relative: PathBuf,
     repository_directory: PathBuf,
     sidecar: CacheLayout,
     endpoint: Endpoint,
@@ -49,11 +52,21 @@ impl HubCacheLayout {
             CacheLayout::nested(root, repository_relative.join(".hf-store"), endpoint, spec)?;
 
         Ok(Self {
+            capability_root: root.to_path_buf(),
+            repository_relative,
             repository_directory,
             sidecar,
             endpoint: endpoint.clone(),
             repository: spec.clone(),
         })
+    }
+
+    pub(super) fn capability_root(&self) -> &Path {
+        &self.capability_root
+    }
+
+    pub(super) fn repository_relative(&self) -> &Path {
+        &self.repository_relative
     }
 
     pub(super) fn repository_directory(&self) -> &Path {
@@ -72,6 +85,10 @@ impl HubCacheLayout {
         &self.repository
     }
 
+    pub(super) fn cachedir_tag(&self) -> PathBuf {
+        self.capability_root.join("CACHEDIR.TAG")
+    }
+
     pub(super) fn ref_path(&self, revision: &Revision) -> Result<PathBuf, ValidationError> {
         let relative = RepoPath::parse(revision.as_str())?;
         Ok(join_repo_path(
@@ -81,11 +98,16 @@ impl HubCacheLayout {
     }
 
     pub(super) fn snapshot_file(&self, commit: &CommitId, path: &RepoPath) -> PathBuf {
-        let snapshot = self
-            .repository_directory
-            .join("snapshots")
-            .join(commit.as_str());
+        let snapshot = self.snapshot_directory(commit);
         join_repo_path(&snapshot, path)
+    }
+
+    pub(super) fn snapshots_directory(&self) -> PathBuf {
+        self.repository_directory.join("snapshots")
+    }
+
+    pub(super) fn snapshot_directory(&self, commit: &CommitId) -> PathBuf {
+        self.snapshots_directory().join(commit.as_str())
     }
 
     pub(super) fn tree_path(&self, commit: &CommitId) -> PathBuf {
@@ -96,6 +118,24 @@ impl HubCacheLayout {
 
     pub(super) fn blob_path(&self, key: &HubBlobKey) -> PathBuf {
         self.repository_directory.join("blobs").join(key.as_str())
+    }
+
+    pub(super) fn blob_lock(&self, key: &HubBlobKey) -> PathBuf {
+        self.capability_root
+            .join(".locks")
+            .join(&self.repository_relative)
+            .join(format!("{}.lock", key.as_str()))
+    }
+
+    pub(super) fn staging_directory(&self) -> PathBuf {
+        self.capability_root
+            .join(".locks")
+            .join(&self.repository_relative)
+            .join(".hf-store-staging")
+    }
+
+    pub(super) fn staged_blob(&self, staging: &StagingName) -> PathBuf {
+        self.staging_directory().join(format!("{staging}.blob"))
     }
 }
 
@@ -167,6 +207,8 @@ mod tests {
 
         for (spec, directory) in cases {
             let layout = HubCacheLayout::shared(&root, &endpoint, &spec)?;
+            assert_eq!(layout.capability_root(), root);
+            assert_eq!(layout.repository_relative(), Path::new(directory));
             assert_eq!(layout.repository_directory(), root.join(directory));
             assert_eq!(layout.sidecar().capability_root(), root);
             assert_eq!(
@@ -174,6 +216,42 @@ mod tests {
                 PathBuf::from(directory).join(".hf-store/hf-store-v1")
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_writer_paths_match_huggingface_hub_and_hide_unique_staging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PathBuf::from("hub-cache");
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let layout = HubCacheLayout::shared(&root, &endpoint, &spec)?;
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let blob = HubBlobKey::parse("45f2f2d3b0f6f8f9e61a")?;
+        let staging = StagingName::new("operation-17")?;
+
+        assert_eq!(layout.cachedir_tag(), root.join("CACHEDIR.TAG"));
+        assert_eq!(
+            layout.snapshots_directory(),
+            root.join("models--org--repo/snapshots")
+        );
+        assert_eq!(
+            layout.snapshot_directory(&commit),
+            root.join("models--org--repo/snapshots/0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            layout.blob_lock(&blob),
+            root.join(".locks/models--org--repo/45f2f2d3b0f6f8f9e61a.lock")
+        );
+        assert_eq!(
+            layout.staging_directory(),
+            root.join(".locks/models--org--repo/.hf-store-staging")
+        );
+        assert_eq!(
+            layout.staged_blob(&staging),
+            root.join(".locks/models--org--repo/.hf-store-staging/operation-17.blob")
+        );
 
         Ok(())
     }

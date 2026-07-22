@@ -1,7 +1,7 @@
 use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -102,6 +102,18 @@ impl HubCacheReader {
         &self.layout
     }
 
+    pub(super) fn index_from_tree(
+        &self,
+        commit: &CommitId,
+        tree: &HubTree,
+    ) -> Result<HubCacheIndex, HubCacheReadError> {
+        Ok(HubCacheIndex {
+            commit: commit.clone(),
+            tree: tree.clone(),
+            directory: self.open_repository(MissingRecord::Incomplete)?,
+        })
+    }
+
     pub(super) fn read_snapshot_file(
         &self,
         index: &HubCacheIndex,
@@ -170,6 +182,30 @@ impl HubCacheReader {
             form,
             hub_blob_key: blob_key,
         })
+    }
+
+    pub(super) fn copy_regular_snapshot_content<W: Write + ?Sized>(
+        &self,
+        index: &HubCacheIndex,
+        path: &RepoPath,
+        writer: &mut W,
+    ) -> Result<(u64, BlobDigest), HubCacheReadError> {
+        let entry = index
+            .tree
+            .files()
+            .get(path)
+            .ok_or_else(HubCacheReadError::missing)?;
+        let snapshot = self.layout.snapshot_file(&index.commit, path);
+        let snapshot_relative = self.repository_relative_path(&snapshot)?;
+        let (mut reader, size) = match index.directory.open_regular(&snapshot_relative)? {
+            RegularFileOpen::File { reader, size } => (reader, size),
+            RegularFileOpen::Missing => return Err(HubCacheReadError::incomplete()),
+            RegularFileOpen::Other => return Err(HubCacheReadError::corrupt()),
+        };
+        if size != entry.size() {
+            return Err(HubCacheReadError::corrupt());
+        }
+        copy_and_validate_content(reader.as_mut(), writer, entry)
     }
 
     #[cfg(unix)]
@@ -358,13 +394,21 @@ impl HubCacheFile {
     }
 }
 
-fn compatible_blob_key(entry: &HubTreeEntry) -> Result<HubBlobKey, HubCacheReadError> {
+pub(super) fn compatible_blob_key(entry: &HubTreeEntry) -> Result<HubBlobKey, HubCacheReadError> {
     let value = validated_lfs_sha256(entry)?.unwrap_or_else(|| entry.blob_id());
     HubBlobKey::parse(value).map_err(HubCacheReadError::unsafe_path)
 }
 
 fn validate_content(
     reader: &mut dyn Read,
+    entry: &HubTreeEntry,
+) -> Result<(u64, BlobDigest), HubCacheReadError> {
+    copy_and_validate_content(reader, &mut io::sink(), entry)
+}
+
+pub(super) fn copy_and_validate_content<W: Write + ?Sized>(
+    reader: &mut dyn Read,
+    writer: &mut W,
     entry: &HubTreeEntry,
 ) -> Result<(u64, BlobDigest), HubCacheReadError> {
     let expected_lfs = validated_lfs_sha256(entry)?;
@@ -392,6 +436,7 @@ fn validate_content(
         if size > entry.size() {
             return Err(HubCacheReadError::corrupt());
         }
+        writer.write_all(&buffer[..count])?;
         local_hasher.update(&buffer[..count]);
         if let Some(hasher) = git_hasher.as_mut() {
             hasher.update(&buffer[..count]);
@@ -443,7 +488,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 }
 
 #[cfg(unix)]
-fn canonical_relative_link_target(source: &Path, destination: &Path) -> Option<PathBuf> {
+pub(super) fn canonical_relative_link_target(source: &Path, destination: &Path) -> Option<PathBuf> {
     use std::path::Component;
 
     let source_parent = source.parent()?;
@@ -532,7 +577,7 @@ impl HubCacheReadError {
         Self::new(HubCacheReadErrorKind::Incomplete)
     }
 
-    fn corrupt() -> Self {
+    pub(super) fn corrupt() -> Self {
         Self::new(HubCacheReadErrorKind::Corrupt(None))
     }
 
@@ -540,7 +585,7 @@ impl HubCacheReadError {
         Self::new(HubCacheReadErrorKind::Corrupt(Some(source)))
     }
 
-    fn tree_metadata(source: HubMetadataError) -> Self {
+    pub(super) fn tree_metadata(source: HubMetadataError) -> Self {
         if source.is_unknown_version() {
             Self::new(HubCacheReadErrorKind::UnsupportedVersion(source))
         } else {
@@ -1084,6 +1129,28 @@ mod tests {
 
         assert!(error.is_corrupt());
         assert_eq!(reader.consumed, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_validation_copies_exact_bytes_and_rejects_invalid_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let entry = HubTreeEntry::new(7, CONFIG_GIT_BLOB)?;
+        let mut valid_reader = b"config\n".as_slice();
+        let mut valid_copy = Vec::new();
+
+        let (size, digest) = copy_and_validate_content(&mut valid_reader, &mut valid_copy, &entry)?;
+
+        assert_eq!(valid_copy, b"config\n");
+        assert_eq!(size, 7);
+        assert_eq!(digest.to_string(), CONFIG_SHA256);
+
+        let mut invalid_reader = b"changed".as_slice();
+        let mut invalid_copy = Vec::new();
+        let error = copy_and_validate_content(&mut invalid_reader, &mut invalid_copy, &entry)
+            .expect_err("accepted copied content with the wrong Git blob identity");
+
+        assert!(error.is_corrupt());
         Ok(())
     }
 

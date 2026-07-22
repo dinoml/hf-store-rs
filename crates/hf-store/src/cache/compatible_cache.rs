@@ -56,8 +56,13 @@ impl CompatibleSnapshotImporter {
             .iter()
             .map(PreparedFile::record)
             .collect::<Vec<_>>();
-        self.publish_manifest(&prepared.commit, &prepared.selection.id, records)
-            .map_err(CompatibleCacheError::with_may_have_published)?;
+        publish_manifest(
+            &self.sidecar,
+            &prepared.commit,
+            &prepared.selection.id,
+            records,
+        )
+        .map_err(CompatibleCacheError::with_may_have_published)?;
 
         let immutable_revision = Revision::parse(prepared.commit.as_str())
             .map_err(|error| CompatibleCacheError::from(error).with_may_have_published())?;
@@ -66,33 +71,27 @@ impl CompatibleSnapshotImporter {
             .map_err(CompatibleCacheError::with_may_have_published)
     }
 
-    fn publish_manifest(
-        &self,
-        commit: &CommitId,
-        selection: &SelectionId,
-        files: Vec<SnapshotFileRecord>,
-    ) -> Result<(), CompatibleCacheError> {
-        let expected = SnapshotManifestRecord::new(commit, selection, files.clone())?;
-        match self
-            .sidecar
-            .publish_compatible_manifest(commit, selection, files)
-        {
-            Ok(()) => Ok(()),
-            Err(error) if error.may_have_published() => {
-                match self.sidecar.read_snapshot_manifest(commit, selection) {
-                    Ok(actual) if actual == expected => Ok(()),
-                    Ok(_) | Err(_) => Err(error.into()),
-                }
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
     fn offline(&self) -> CompatibleCacheOffline {
-        CompatibleCacheOffline {
-            reader: self.reader.clone(),
-            sidecar: self.sidecar.clone(),
+        CompatibleCacheOffline::from_parts(self.reader.clone(), self.sidecar.clone())
+    }
+}
+
+pub(super) fn publish_manifest(
+    sidecar: &CacheKernel,
+    commit: &CommitId,
+    selection: &SelectionId,
+    files: Vec<SnapshotFileRecord>,
+) -> Result<(), CompatibleCacheError> {
+    let expected = SnapshotManifestRecord::new(commit, selection, files.clone())?;
+    match sidecar.publish_compatible_manifest(commit, selection, files) {
+        Ok(()) => Ok(()),
+        Err(error) if error.may_have_published() => {
+            match sidecar.read_snapshot_manifest(commit, selection) {
+                Ok(actual) if actual == expected => Ok(()),
+                Ok(_) | Err(_) => Err(error.into()),
+            }
         }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -103,6 +102,10 @@ pub(super) struct CompatibleCacheOffline {
 }
 
 impl CompatibleCacheOffline {
+    pub(super) fn from_parts(reader: HubCacheReader, sidecar: CacheKernel) -> Self {
+        Self { reader, sidecar }
+    }
+
     pub(super) fn shared(
         root: impl AsRef<Path>,
         endpoint: &Endpoint,
@@ -160,13 +163,13 @@ impl CompatibleCacheOffline {
 }
 
 #[derive(Clone, Debug)]
-struct ExactSelection {
+pub(super) struct ExactSelection {
     paths: Box<[RepoPath]>,
     id: SelectionId,
 }
 
 impl ExactSelection {
-    fn new(paths: &[RepoPath]) -> Result<Self, ValidationError> {
+    pub(super) fn new(paths: &[RepoPath]) -> Result<Self, ValidationError> {
         let mut paths = paths.to_vec();
         paths.sort_unstable();
         paths.dedup();
@@ -177,8 +180,12 @@ impl ExactSelection {
         })
     }
 
-    fn paths(&self) -> &[RepoPath] {
+    pub(super) fn paths(&self) -> &[RepoPath] {
         &self.paths
+    }
+
+    pub(super) const fn id(&self) -> &SelectionId {
+        &self.id
     }
 }
 
@@ -361,11 +368,15 @@ impl CompatibleCacheError {
         }
     }
 
-    fn corrupt() -> Self {
+    pub(super) fn corrupt() -> Self {
         Self::new(CompatibleCacheErrorKind::Corrupt, false)
     }
 
-    fn with_may_have_published(mut self) -> Self {
+    pub(super) fn incomplete() -> Self {
+        Self::new(CompatibleCacheErrorKind::Incomplete, false)
+    }
+
+    pub(super) fn with_may_have_published(mut self) -> Self {
         self.may_have_published = true;
         self
     }

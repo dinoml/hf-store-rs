@@ -84,6 +84,17 @@ pub(super) enum CreateOnceOutcome {
     Existing,
 }
 
+/// The outcome of attempting to create a relative symbolic link once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RelativeSymlinkOutcome {
+    /// This call created the symbolic link.
+    Created,
+    /// An entry already occupied the destination and was left unchanged.
+    Existing,
+    /// Symbolic-link creation is unavailable on this platform or filesystem.
+    Unsupported,
+}
+
 /// A validated unique name fragment for same-directory staging files.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct StagingName(Box<str>);
@@ -148,6 +159,65 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         bytes: &[u8],
         staging: &StagingName,
     ) -> io::Result<CreateOnceOutcome>;
+    fn create_relative_symlink_once(
+        &self,
+        _path: &Path,
+        _target: &Path,
+    ) -> io::Result<RelativeSymlinkOutcome> {
+        Ok(RelativeSymlinkOutcome::Unsupported)
+    }
+    fn copy_regular_create_once(
+        &self,
+        source: &Path,
+        destination: &Path,
+        staging: &StagingName,
+    ) -> io::Result<CreateOnceOutcome> {
+        match self.entry_kind(destination)? {
+            RootedEntryKind::Missing => {}
+            RootedEntryKind::RegularFile => return Ok(CreateOnceOutcome::Existing),
+            RootedEntryKind::Directory | RootedEntryKind::Other => {
+                return Err(invalid_data("cache copy destination is not a regular file"));
+            }
+        }
+
+        let (mut reader, expected_size) = match self.open_regular(source)? {
+            RootedRegularFile::File { reader, size } => (reader, size),
+            RootedRegularFile::Missing => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cache copy source does not exist",
+                ));
+            }
+            RootedRegularFile::Other => {
+                return Err(invalid_data("cache copy source is not a regular file"));
+            }
+        };
+
+        let staging_path = staging_path(destination, staging)?;
+        let mut writer = self.create_new(&staging_path)?;
+        let staged = io::copy(&mut reader, &mut writer)
+            .and_then(|copied| {
+                if copied == expected_size {
+                    Ok(())
+                } else {
+                    Err(invalid_data("cache copy source changed while being copied"))
+                }
+            })
+            .and_then(|()| writer.sync_all());
+        drop(writer);
+
+        let publication = staged.and_then(|()| {
+            let outcome = self.install_staged_create_once(&staging_path, destination)?;
+            if outcome == CreateOnceOutcome::Existing
+                && self.entry_kind(destination)? != RootedEntryKind::RegularFile
+            {
+                return Err(invalid_data("cache copy destination is not a regular file"));
+            }
+            Ok(outcome)
+        });
+        let cleanup = self.remove_file(&staging_path);
+        finish_staging_cleanup(publication, cleanup)
+    }
     fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()>;
     fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>>;
     fn sync_directory(&self, path: &Path) -> io::Result<()>;
@@ -219,13 +289,6 @@ impl CacheRoot {
             self.open_dir_chain(parent)?
         };
         Ok((directory, PathBuf::from(name)))
-    }
-
-    fn stage_path(path: &Path, staging: &StagingName) -> io::Result<PathBuf> {
-        let Some(parent) = path.parent() else {
-            return Err(invalid_input("cache path has no parent"));
-        };
-        Ok(parent.join(format!(".hf-store-{staging}.tmp")))
     }
 }
 
@@ -384,7 +447,7 @@ impl RootedFileSystem for CacheRoot {
                 ));
             }
         }
-        let staging_path = Self::stage_path(path, staging)?;
+        let staging_path = staging_path(path, staging)?;
         let mut file = self.create_new(&staging_path)?;
         let staged = file.write_all(bytes).and_then(|()| file.sync_all());
         drop(file);
@@ -416,6 +479,39 @@ impl RootedFileSystem for CacheRoot {
         publication
     }
 
+    fn create_relative_symlink_once(
+        &self,
+        path: &Path,
+        target: &Path,
+    ) -> io::Result<RelativeSymlinkOutcome> {
+        validate_relative_symlink_target(path, target)?;
+
+        #[cfg(unix)]
+        {
+            let (parent, name) = self.open_parent_and_name(path, true)?;
+            return match parent.symlink_contents(target, name) {
+                Ok(()) => Ok(RelativeSymlinkOutcome::Created),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    Ok(RelativeSymlinkOutcome::Existing)
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+                    ) =>
+                {
+                    Ok(RelativeSymlinkOutcome::Unsupported)
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(RelativeSymlinkOutcome::Unsupported)
+        }
+    }
+
     fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {
         match self.entry_kind(path)? {
             RootedEntryKind::Missing | RootedEntryKind::RegularFile => {}
@@ -425,7 +521,7 @@ impl RootedFileSystem for CacheRoot {
                 ));
             }
         }
-        let staging_path = Self::stage_path(path, staging)?;
+        let staging_path = staging_path(path, staging)?;
         let mut file = self.create_new(&staging_path)?;
         let staged = file.write_all(bytes).and_then(|()| file.sync_all());
         drop(file);
@@ -541,6 +637,53 @@ fn normal_components(path: &Path) -> io::Result<Vec<&std::ffi::OsStr>> {
         .collect()
 }
 
+fn validate_relative_symlink_target(destination: &Path, target: &Path) -> io::Result<()> {
+    let destination_components = normal_components(destination)?;
+    if destination_components.is_empty() {
+        return Err(invalid_input(
+            "cache symlink destination requires a normal component",
+        ));
+    }
+    if target.as_os_str().is_empty() {
+        return Err(invalid_input("cache symlink target must not be empty"));
+    }
+    let mut depth = destination_components.len().saturating_sub(1);
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::ParentDir => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    invalid_input("cache symlink target escapes the authorized root")
+                })?;
+            }
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {
+                return Err(invalid_input(
+                    "cache symlink target must be relative and contain only normal or parent components",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn staging_path(path: &Path, staging: &StagingName) -> io::Result<PathBuf> {
+    let Some(parent) = path.parent() else {
+        return Err(invalid_input("cache path has no parent"));
+    };
+    Ok(parent.join(format!(".hf-store-{staging}.tmp")))
+}
+
+fn finish_staging_cleanup<T>(result: io::Result<T>, cleanup: io::Result<()>) -> io::Result<T> {
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => match cleanup {
+            Ok(()) => Ok(value),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(value),
+            Err(error) => Err(error),
+        },
+    }
+}
+
 #[cfg(unix)]
 fn sync_open_directory(directory: &Dir) -> io::Result<()> {
     directory.open(".")?.sync_all()
@@ -567,6 +710,8 @@ mod tests {
 
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    use super::RelativeSymlinkOutcome;
     use super::{
         CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedRead, StagingName,
     };
@@ -807,6 +952,117 @@ mod tests {
             let error = StagingName::new(invalid).expect_err("unsafe staging name must fail");
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_symlink_create_once_preserves_the_first_entry() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let path = Path::new("models--org--repo/snapshots/commit/config.json");
+        let target = Path::new("../../blobs/object-id");
+
+        let first = root.create_relative_symlink_once(path, target)?;
+        let second = root.create_relative_symlink_once(path, Path::new("../../blobs/other"))?;
+
+        assert_eq!(first, RelativeSymlinkOutcome::Created);
+        assert_eq!(second, RelativeSymlinkOutcome::Existing);
+        assert_eq!(fs::read_link(fixture.cache.join(path))?, target);
+        Ok(())
+    }
+
+    #[test]
+    fn relative_symlink_rejects_unsafe_targets_before_writing() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let destination = Path::new("snapshots/commit/file");
+
+        for target in [
+            Path::new(""),
+            Path::new("."),
+            Path::new("/absolute"),
+            Path::new("../../../outside"),
+        ] {
+            let error = root
+                .create_relative_symlink_once(destination, target)
+                .expect_err("unsafe relative-link target must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        assert!(!fixture.cache.join(destination).try_exists()?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_symlink_rejects_a_linked_destination_ancestor() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("outside-snapshots");
+        fs::create_dir(&outside)?;
+        std::os::unix::fs::symlink(&outside, fixture.cache.join("snapshots"))?;
+
+        let error = root
+            .create_relative_symlink_once(
+                Path::new("snapshots/commit/file"),
+                Path::new("../../blobs/object-id"),
+            )
+            .expect_err("a linked destination ancestor must fail");
+
+        assert!(super::is_unsafe_cache_path_error(&error));
+        assert!(!outside.join("commit/file").try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn regular_copy_create_once_is_independent_and_cleans_staging() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let source = Path::new("blobs/object-id");
+        let destination = Path::new("snapshots/commit/model.bin");
+        root.replace(source, b"immutable-source", &StagingName::new("source")?)?;
+
+        let outcome = root.copy_regular_create_once(
+            source,
+            destination,
+            &StagingName::new("snapshot-copy")?,
+        )?;
+        fs::write(fixture.cache.join(destination), b"changed-copy")?;
+
+        assert_eq!(outcome, CreateOnceOutcome::Created);
+        assert_eq!(fs::read(fixture.cache.join(source))?, b"immutable-source");
+        assert!(
+            !fixture
+                .cache
+                .join("snapshots/commit/.hf-store-snapshot-copy.tmp")
+                .try_exists()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn regular_copy_rejects_a_link_source_without_publishing() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("outside-blob");
+        fs::write(&outside, b"outside")?;
+        root.ensure_dir(Path::new("blobs"))?;
+        if !create_file_link(&outside, &fixture.cache.join("blobs/redirect"))? {
+            return Ok(());
+        }
+        let destination = Path::new("snapshots/commit/model.bin");
+
+        let error = root
+            .copy_regular_create_once(
+                Path::new("blobs/redirect"),
+                destination,
+                &StagingName::new("link-source")?,
+            )
+            .expect_err("a linked copy source must fail");
+
+        assert!(super::is_unsafe_cache_path_error(&error));
+        assert!(!fixture.cache.join(destination).try_exists()?);
+        Ok(())
     }
 
     struct Fixture {
