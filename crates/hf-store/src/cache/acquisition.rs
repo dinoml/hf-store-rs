@@ -315,6 +315,32 @@ enum OfflineBackend {
 }
 
 impl OfflineCache {
+    pub(crate) fn plan_partial_gc(
+        &self,
+        now_unix_millis: u64,
+        minimum_age_millis: u64,
+    ) -> Result<Vec<super::publication::PartialGcCandidate>, HubOperationError> {
+        match &self.backend {
+            OfflineBackend::Owned(cache) => cache
+                .plan_partial_gc(now_unix_millis, minimum_age_millis)
+                .map_err(map_cache_error),
+            OfflineBackend::Compatible(_) => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) fn execute_partial_gc(
+        &self,
+        candidate: &super::publication::PartialGcCandidate,
+        now_unix_millis: u64,
+        minimum_age_millis: u64,
+    ) -> Result<bool, HubOperationError> {
+        match &self.backend {
+            OfflineBackend::Owned(cache) => cache
+                .execute_partial_gc(candidate, now_unix_millis, minimum_age_millis)
+                .map_err(map_cache_error),
+            OfflineBackend::Compatible(_) => Ok(false),
+        }
+    }
     pub(crate) fn inventory_entries(&self) -> Result<Vec<InventoryRecord>, HubOperationError> {
         let entries = match &self.backend {
             OfflineBackend::Owned(cache) => cache.inventory_entries().map_err(map_cache_error),

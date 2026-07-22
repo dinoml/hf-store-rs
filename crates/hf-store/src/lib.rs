@@ -37,6 +37,7 @@ mod error;
     reason = "private fetch plans precede the public request and snapshot APIs"
 )]
 mod fetch_plan;
+mod gc;
 #[allow(
     dead_code,
     reason = "private Hub protocol implementation precedes the public request API"
@@ -80,6 +81,8 @@ pub use endpoint::Endpoint;
 pub use error::HubOperationError as HubError;
 #[doc(inline)]
 pub use fetch_plan::{FetchPlan, PlannedFile};
+#[doc(inline)]
+pub use gc::{GcCandidate, GcCandidateKind, GcExecutionReport, GcPlan, GcPolicy};
 #[doc(inline)]
 pub use progress::{ProgressEvent, ProgressObserver, ProgressPhase, ReuseDecision};
 #[doc(inline)]

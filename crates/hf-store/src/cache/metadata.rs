@@ -424,6 +424,52 @@ pub(super) struct PartialTransferRecord {
     updated_unix_millis: u64,
 }
 
+/// Complete intent record written before a GC deletion unit enters trash.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PartialGcTombstoneRecord {
+    candidate_id: String,
+    commit: String,
+    path: String,
+    record_sha256: String,
+    logical_bytes: u64,
+    observed_unix_millis: u64,
+}
+
+impl PartialGcTombstoneRecord {
+    pub(super) fn new(
+        candidate_id: &str,
+        commit: &CommitId,
+        path: &RepoPath,
+        record_digest: BlobDigest,
+        logical_bytes: u64,
+        observed_unix_millis: u64,
+    ) -> Result<Self, ValidationError> {
+        let record = Self {
+            candidate_id: candidate_id.to_owned(),
+            commit: commit.as_str().to_owned(),
+            path: path.as_str().to_owned(),
+            record_sha256: record_digest.to_string(),
+            logical_bytes,
+            observed_unix_millis,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+impl CacheRecord for PartialGcTombstoneRecord {
+    const KIND: &'static str = "partial_gc_tombstone";
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_sha256_hex(&self.candidate_id, "GC candidate identifier")?;
+        let _commit = CommitId::parse(&self.commit)?;
+        let _path = RepoPath::parse(&self.path)?;
+        let _digest = BlobDigest::parse(&self.record_sha256)?;
+        Ok(())
+    }
+}
+
 impl PartialTransferRecord {
     #[allow(
         clippy::too_many_arguments,
@@ -457,6 +503,18 @@ impl PartialTransferRecord {
 
     pub(super) const fn updated_unix_millis(&self) -> u64 {
         self.updated_unix_millis
+    }
+
+    pub(super) fn commit(&self) -> Result<CommitId, ValidationError> {
+        CommitId::parse(&self.commit)
+    }
+
+    pub(super) fn path(&self) -> Result<RepoPath, ValidationError> {
+        RepoPath::parse(&self.path)
+    }
+
+    pub(super) const fn received_size(&self) -> u64 {
+        self.received_size
     }
 
     pub(super) fn validator(&self) -> Option<&str> {

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "network")]
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::LocalDirectory;
 #[cfg(feature = "network")]
@@ -16,8 +17,9 @@ use crate::hub_protocol::HubProtocol;
 use crate::progress::ProgressObserver;
 use crate::transport::Transport;
 use crate::{
-    AuthToken, CacheInventoryReport, CancellationToken, Endpoint, FetchPlan, InspectionReport,
-    RepoPath, RepositorySpec, Revision, Snapshot, VerificationReport,
+    AuthToken, CacheInventoryReport, CancellationToken, Endpoint, FetchPlan, GcExecutionReport,
+    GcPlan, GcPolicy, InspectionReport, RepoPath, RepositorySpec, Revision, Snapshot,
+    VerificationReport,
 };
 
 /// A typed request to resolve and plan one repository revision.
@@ -109,7 +111,7 @@ pub struct FetchOptions {
 
 /// Selects which cache layout owns the returned snapshot.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheMode {
     /// Use hf-store's endpoint-namespaced owned cache layout.
@@ -625,6 +627,81 @@ impl OfflineStore {
         ))
     }
 
+    /// Builds an immutable read-only garbage-collection plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified cache or time-conversion error. Planning performs
+    /// no cache mutation and compatible-cache deletion remains blocked.
+    pub fn gc_plan(
+        &self,
+        repository: &RepositorySpec,
+        policy: GcPolicy,
+        now: SystemTime,
+    ) -> Result<GcPlan, HubOperationError> {
+        let now = unix_millis(now)?;
+        let cache = OfflineCache::shared(
+            &self.cache_root,
+            &self.endpoint,
+            repository,
+            self.cache_mode.view(),
+        )?;
+        let candidates = cache.plan_partial_gc(now, policy.partial_minimum_age_millis())?;
+        GcPlan::new(
+            self.cache_mode,
+            &self.endpoint,
+            repository,
+            now,
+            policy,
+            &candidates,
+        )
+    }
+
+    /// Executes only candidates present in an immutable plan after fresh revalidation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error when plan identity, time, coordination, or
+    /// safe quarantine requirements cannot be established.
+    pub fn gc_execute(
+        &self,
+        repository: &RepositorySpec,
+        plan: &GcPlan,
+        now: SystemTime,
+    ) -> Result<GcExecutionReport, HubOperationError> {
+        let now = unix_millis(now)?;
+        if plan.cache_mode() != self.cache_mode
+            || !plan.endpoint_matches(&self.endpoint)
+            || !plan.repository_matches(repository)
+            || now < plan.planned_unix_millis()
+        {
+            return Err(HubOperationError::protocol());
+        }
+        let cache = OfflineCache::shared(
+            &self.cache_root,
+            &self.endpoint,
+            repository,
+            self.cache_mode.view(),
+        )?;
+        let mut removed = Vec::new();
+        let mut skipped = Vec::new();
+        let mut bytes = 0_u64;
+        for public in plan.candidates() {
+            let candidate = public.partial_identity()?;
+            if cache.execute_partial_gc(
+                &candidate,
+                now,
+                plan.policy().partial_minimum_age_millis(),
+            )? {
+                removed.push(public.id().into());
+                bytes = bytes.saturating_add(public.logical_bytes());
+            } else {
+                skipped.push(public.id().into());
+            }
+        }
+        Ok(GcExecutionReport::new(plan, removed, skipped, bytes))
+    }
+
     /// Opens and fully revalidates a completed caller-owned local directory.
     ///
     /// The exact immutable commit and selected path set must match the
@@ -665,6 +742,14 @@ impl OfflineStore {
     pub fn cache_root(&self) -> &Path {
         &self.cache_root
     }
+}
+
+fn unix_millis(time: SystemTime) -> Result<u64, HubOperationError> {
+    let millis = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_before_epoch| HubOperationError::protocol())?
+        .as_millis();
+    u64::try_from(millis).map_err(|_overflow| HubOperationError::protocol())
 }
 
 #[cfg(test)]

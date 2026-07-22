@@ -22,8 +22,8 @@ use super::key::{BlobDigest, OriginKey, RepositoryKey, SelectionId};
 use super::layout::CacheLayout;
 use super::metadata::{
     CacheRecord, FormatRecord, HubBlobBindingRecord, MetadataError, OriginRecord,
-    PartialTransferRecord, RefRecord, RepositoryRecord, SnapshotFileRecord, SnapshotManifestRecord,
-    decode_record, encode_record,
+    PartialGcTombstoneRecord, PartialTransferRecord, RefRecord, RepositoryRecord,
+    SnapshotFileRecord, SnapshotManifestRecord, decode_record, encode_record,
 };
 use super::rooted_fs::{
     CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockGuard,
@@ -418,6 +418,55 @@ pub(super) enum CacheInventoryMetadataState {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PartialGcCandidate {
+    pub(super) key: Box<str>,
+    commit: CommitId,
+    path: RepoPath,
+    record_digest: BlobDigest,
+    received_size: u64,
+    updated_unix_millis: u64,
+}
+
+impl PartialGcCandidate {
+    pub(crate) fn from_observation(
+        key: Box<str>,
+        commit: CommitId,
+        path: RepoPath,
+        record_digest: BlobDigest,
+        received_size: u64,
+        updated_unix_millis: u64,
+    ) -> Self {
+        Self {
+            key,
+            commit,
+            path,
+            record_digest,
+            received_size,
+            updated_unix_millis,
+        }
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+    pub(crate) const fn size(&self) -> u64 {
+        self.received_size
+    }
+    pub(crate) const fn updated_unix_millis(&self) -> u64 {
+        self.updated_unix_millis
+    }
+    pub(crate) const fn commit(&self) -> &CommitId {
+        &self.commit
+    }
+    pub(crate) const fn path(&self) -> &RepoPath {
+        &self.path
+    }
+    pub(crate) const fn record_digest(&self) -> BlobDigest {
+        self.record_digest
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct OwnedSnapshotRead {
     root: PathBuf,
     files: Vec<OwnedSnapshotFile>,
@@ -467,6 +516,154 @@ impl crate::transfer::PartialSink for CachePartialSink {
 }
 
 impl CacheKernel {
+    pub(super) fn plan_partial_gc(
+        &self,
+        now_unix_millis: u64,
+        minimum_age_millis: u64,
+    ) -> Result<Vec<PartialGcCandidate>, CacheError> {
+        let partial_directory_path = self.layout.repository_directory().join("partials");
+        let partial_directory = self.relative_path(&partial_directory_path)?;
+        let entries = match self.root.read_dir(partial_directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut candidates = Vec::new();
+        for record_path in entries {
+            let Some(name) = record_path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                continue;
+            };
+            if !has_json_extension(name) {
+                continue;
+            }
+            let Some(bytes) = self
+                .root
+                .read_regular_bounded(&record_path, MAX_SMALL_RECORD_BYTES)?
+                .bytes()
+            else {
+                continue;
+            };
+            let Ok(record) = decode_record::<PartialTransferRecord>(&bytes) else {
+                continue;
+            };
+            let commit = record.commit()?;
+            let path = record.path()?;
+            let expected_record_path = self.layout.partial_record(&commit, &path)?;
+            let expected_record = self.relative_path(&expected_record_path)?;
+            if expected_record != record_path {
+                continue;
+            }
+            let data_path = self
+                .relative_path(&self.layout.partial_data(&commit, &path)?)?
+                .to_path_buf();
+            let RootedRegularFile::File { size, .. } = self.root.open_regular(&data_path)? else {
+                continue;
+            };
+            if size != record.received_size()
+                || now_unix_millis.saturating_sub(record.updated_unix_millis()) < minimum_age_millis
+            {
+                continue;
+            }
+            candidates.push(PartialGcCandidate::from_observation(
+                name.trim_end_matches(".json").into(),
+                commit,
+                path,
+                BlobDigest::for_bytes(&bytes),
+                size,
+                record.updated_unix_millis(),
+            ));
+        }
+        candidates.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        Ok(candidates)
+    }
+
+    pub(super) fn execute_partial_gc(
+        &self,
+        candidate: &PartialGcCandidate,
+        now_unix_millis: u64,
+        minimum_age_millis: u64,
+    ) -> Result<bool, CacheError> {
+        let maintenance = self.layout.maintenance_lock();
+        self.ensure_parent(&maintenance)?;
+        let _maintenance_guard = self
+            .root
+            .lock_exclusive(self.relative_path(&maintenance)?)?;
+        let partial_lock = self
+            .layout
+            .partial_lock(&candidate.commit, &candidate.path)?;
+        self.ensure_parent(&partial_lock)?;
+        let _partial_guard = self
+            .root
+            .lock_exclusive(self.relative_path(&partial_lock)?)?;
+        let record_path = self
+            .relative_path(
+                &self
+                    .layout
+                    .partial_record(&candidate.commit, &candidate.path)?,
+            )?
+            .to_path_buf();
+        let data_path = self
+            .relative_path(
+                &self
+                    .layout
+                    .partial_data(&candidate.commit, &candidate.path)?,
+            )?
+            .to_path_buf();
+        let Some(bytes) = self
+            .root
+            .read_regular_bounded(&record_path, MAX_SMALL_RECORD_BYTES)?
+            .bytes()
+        else {
+            return Ok(false);
+        };
+        let Ok(record) = decode_record::<PartialTransferRecord>(&bytes) else {
+            return Ok(false);
+        };
+        let RootedRegularFile::File { size, .. } = self.root.open_regular(&data_path)? else {
+            return Ok(false);
+        };
+        if BlobDigest::for_bytes(&bytes) != candidate.record_digest
+            || size != candidate.received_size
+            || record.updated_unix_millis() != candidate.updated_unix_millis
+            || now_unix_millis.saturating_sub(record.updated_unix_millis()) < minimum_age_millis
+        {
+            return Ok(false);
+        }
+        let trash = self.layout.trash_directory();
+        self.root.ensure_dir(self.relative_path(&trash)?)?;
+        let operation = self.effects.operation_ids.next()?;
+        let tombstone = PartialGcTombstoneRecord::new(
+            candidate.key(),
+            &candidate.commit,
+            &candidate.path,
+            candidate.record_digest,
+            candidate.received_size,
+            candidate.updated_unix_millis,
+        )?;
+        let tombstone_path = trash.join(format!("partial-{operation}.tombstone.json"));
+        let tombstone_path = self.relative_path(&tombstone_path)?;
+        let mut tombstone_writer = self.root.create_new(tombstone_path)?;
+        tombstone_writer.write_all(&encode_record(&tombstone)?)?;
+        tombstone_writer.sync_all()?;
+        let record_trash = trash.join(format!(
+            "partial-{operation}-{}.record.json",
+            candidate.record_digest
+        ));
+        let data_trash = trash.join(format!(
+            "partial-{operation}-{}.data",
+            candidate.record_digest
+        ));
+        let record_trash = self.relative_path(&record_trash)?;
+        let data_trash = self.relative_path(&data_trash)?;
+        self.root.rename_entry(&record_path, record_trash)?;
+        if let Err(error) = self.root.rename_entry(&data_path, data_trash) {
+            return Err(error.into());
+        }
+        self.root.remove_file(record_trash)?;
+        self.root.remove_file(data_trash)?;
+        self.root.remove_file(tombstone_path)?;
+        Ok(true)
+    }
     pub(super) fn inventory_entries(&self) -> Result<Vec<CacheInventoryEntry>, CacheError> {
         let repository_path = self.layout.repository_directory();
         let repository = self.relative_path(&repository_path)?;
@@ -543,6 +740,12 @@ impl CacheKernel {
             }
             ("partials", Some(name)) if has_json_extension(name) => {
                 Self::decode_inventory::<PartialTransferRecord>(
+                    self.root
+                        .read_regular_bounded(path, MAX_SMALL_RECORD_BYTES)?,
+                )
+            }
+            ("trash", Some(name)) if name.ends_with(".tombstone.json") => {
+                Self::decode_inventory::<PartialGcTombstoneRecord>(
                     self.root
                         .read_regular_bounded(path, MAX_SMALL_RECORD_BYTES)?,
                 )
@@ -2840,6 +3043,33 @@ mod tests {
         assert_eq!(partial.updated_unix_millis(), 1_721_596_800_000);
         assert_eq!(fixture.ids.issued(), 3);
 
+        Ok(())
+    }
+
+    #[test]
+    fn partial_gc_revalidates_and_removes_only_the_planned_expired_pair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("weights/model.bin")?;
+        let commit = CommitId::parse(FIRST_COMMIT)?;
+        let bytes = b"prefix";
+        let mut sink = fixture.kernel.create_fresh_partial_sink(&commit, &path)?;
+        crate::transfer::PartialSink::write_all(&mut sink, bytes)?;
+        crate::transfer::PartialSink::sync_all(&sink)?;
+        fixture.kernel.persist_partial_record(
+            &commit,
+            &path,
+            20,
+            u64::try_from(bytes.len())?,
+            Some("etag".to_owned()),
+            None,
+        )?;
+        let now = 1_721_596_800_100;
+        let planned = fixture.kernel.plan_partial_gc(now, 50)?;
+        assert_eq!(planned.len(), 1);
+        assert!(fixture.kernel.execute_partial_gc(&planned[0], now, 50)?);
+        assert!(!fixture.kernel.partial_data_path(&commit, &path)?.exists());
+        assert!(fixture.kernel.plan_partial_gc(now, 50)?.is_empty());
         Ok(())
     }
 

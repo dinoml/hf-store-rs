@@ -179,6 +179,12 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         ))
     }
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn rename_entry(&self, _source: &Path, _destination: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "entry quarantine is unsupported by this filesystem adapter",
+        ))
+    }
     fn install_staged_create_once(
         &self,
         staging: &Path,
@@ -625,6 +631,19 @@ impl RootedFileSystem for CacheRoot {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let (parent, name) = self.open_parent_and_name(path, false)?;
         parent.remove_file(name)
+    }
+
+    fn rename_entry(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        if self.entry_kind(destination)? != RootedEntryKind::Missing {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "cache quarantine destination already exists",
+            ));
+        }
+        let (source_parent, source_name) = self.open_parent_and_name(source, false)?;
+        let (destination_parent, destination_name) =
+            self.open_parent_and_name(destination, true)?;
+        source_parent.rename(source_name, &destination_parent, destination_name)
     }
 
     fn stage_regular_hard_link(&self, source: &Path, staging: &Path) -> io::Result<()> {

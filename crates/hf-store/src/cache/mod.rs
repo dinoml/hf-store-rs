@@ -6,6 +6,7 @@ pub(crate) use acquisition::AcquisitionCache;
 pub(crate) use acquisition::{AcquiredSnapshot, AcquiredSnapshotFile, OfflineCache};
 pub(crate) use acquisition::{InventoryRecord, InventoryRecordKind, InventoryRecordMetadata};
 pub(crate) use acquisition::{MaterializedLocalDir, MaterializedLocalDirFile};
+pub(crate) use publication::PartialGcCandidate;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CacheView {
     Owned,

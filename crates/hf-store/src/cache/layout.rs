@@ -147,6 +147,16 @@ impl CacheLayout {
         self.repository_directory().join("staging")
     }
 
+    pub(super) fn maintenance_lock(&self) -> PathBuf {
+        self.repository_directory()
+            .join("locks")
+            .join("maintenance.lock")
+    }
+
+    pub(super) fn trash_directory(&self) -> PathBuf {
+        self.repository_directory().join("trash")
+    }
+
     pub(super) fn staged_blob(&self, operation_id: &str) -> PathBuf {
         self.staging_directory()
             .join(format!("{operation_id}.blob"))
