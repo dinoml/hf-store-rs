@@ -77,6 +77,20 @@ pub(crate) trait RetryClock: Debug + Send + Sync {
     fn sleep(&self, duration: Duration) -> RetryFuture<'_, Result<(), HubOperationError>>;
 }
 
+#[cfg(feature = "network")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TokioRetryClock;
+
+#[cfg(feature = "network")]
+impl RetryClock for TokioRetryClock {
+    fn sleep(&self, duration: Duration) -> RetryFuture<'_, Result<(), HubOperationError>> {
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+            Ok(())
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RetryPolicy {
     max_attempts: u32,

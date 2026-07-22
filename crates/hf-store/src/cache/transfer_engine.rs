@@ -1,8 +1,12 @@
 use crate::error::{CacheFailure, HubOperationError};
 use crate::progress::ProgressObserver;
 use crate::transfer::{BodyDisposition, append_bounded_body, validate_file_response};
+#[cfg(feature = "network")]
+use crate::transfer::{RetryClock, RetryPolicy, run_with_retry};
 use crate::transport::TransportBody;
 use crate::validation::{ValidationError, ValidationErrorKind};
+#[cfg(feature = "network")]
+use crate::{AuthToken, RepositorySpec};
 use crate::{CancellationToken, CommitId, RepoPath};
 
 use super::hub_cache::copy_and_validate_content;
@@ -11,6 +15,73 @@ use super::key::BlobDigest;
 use super::publication::CacheKernel;
 
 impl CacheKernel {
+    #[cfg(feature = "network")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the acquisition boundary keeps all request and operation policy explicit"
+    )]
+    pub(super) async fn download_file(
+        self: &std::sync::Arc<Self>,
+        protocol: std::sync::Arc<crate::hub_protocol::HubProtocol>,
+        repository: RepositorySpec,
+        commit: CommitId,
+        path: RepoPath,
+        entry: HubTreeEntry,
+        authorization: Option<AuthToken>,
+        retry_policy: RetryPolicy,
+        retry_clock: &dyn RetryClock,
+        cancellation: CancellationToken,
+        progress: std::sync::Arc<dyn ProgressObserver>,
+    ) -> Result<BlobDigest, HubOperationError> {
+        let cache = std::sync::Arc::clone(self);
+        run_with_retry(retry_policy, retry_clock, move |_attempt| {
+            let cache = std::sync::Arc::clone(&cache);
+            let protocol = std::sync::Arc::clone(&protocol);
+            let repository = repository.clone();
+            let commit = commit.clone();
+            let path = path.clone();
+            let entry = entry.clone();
+            let authorization = authorization.clone();
+            let cancellation = cancellation.clone();
+            let progress = std::sync::Arc::clone(&progress);
+            Box::pin(async move {
+                if cancellation.is_cancelled() {
+                    return Err(HubOperationError::cancelled());
+                }
+                let target_digest = entry
+                    .lfs_sha256()
+                    .and_then(|value| BlobDigest::parse(value).ok());
+                let resume = cache
+                    .partial_resume_candidate(&commit, &path, entry.size(), target_digest.as_ref())
+                    .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+                let request_resume = resume
+                    .as_ref()
+                    .map(|(offset, validator)| (*offset, validator.as_deref()));
+                let mut response = protocol
+                    .request_file(
+                        &repository,
+                        &commit,
+                        &path,
+                        request_resume,
+                        authorization.as_ref(),
+                    )
+                    .await?;
+                cache
+                    .consume_file_response(
+                        &mut response,
+                        &commit,
+                        &path,
+                        &entry,
+                        request_resume,
+                        &cancellation,
+                        progress.as_ref(),
+                    )
+                    .await
+            })
+        })
+        .await
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the response boundary keeps remote identity, cancellation, and progress explicit"
@@ -310,8 +381,10 @@ mod tests {
 
     use tempfile::TempDir;
 
+    #[cfg(not(feature = "network"))]
+    use crate::RepositorySpec;
     use crate::transport::{TransportError, TransportFuture};
-    use crate::{Endpoint, RepositoryId, RepositorySpec};
+    use crate::{Endpoint, RepositoryId};
 
     use super::super::publication::{
         Effects, NoPublicationFaults, OsFileSystem, RandomOperationIds, SystemClock,
@@ -371,6 +444,20 @@ mod tests {
             } else {
                 Box::pin(std::future::ready(Err(TransportError::body())))
             }
+        }
+    }
+
+    #[cfg(feature = "network")]
+    #[derive(Debug)]
+    struct NoDelayClock;
+
+    #[cfg(feature = "network")]
+    impl crate::transfer::RetryClock for NoDelayClock {
+        fn sleep(
+            &self,
+            _duration: std::time::Duration,
+        ) -> crate::transfer::RetryFuture<'_, Result<(), HubOperationError>> {
+            Box::pin(std::future::ready(Ok(())))
         }
     }
 
@@ -680,6 +767,67 @@ mod tests {
         assert_eq!(std::fs::read(kernel.blob_path(&digest))?, bytes);
         assert!(!kernel.partial_data_path(&commit, &path)?.try_exists()?);
         assert_eq!(observed?.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn automatic_download_retries_fixture_status_and_publishes_once() -> Result<(), Box<dyn Error>>
+    {
+        use crate::hub_protocol::HubProtocol;
+        use crate::reqwest_transport::ReqwestTransport;
+        use crate::test_http_fixture::{Exchange, ExpectedRequest, ScriptedHub, ScriptedResponse};
+
+        let bytes = b"retry succeeded";
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let path = RepoPath::parse("model.bin")?;
+        let request_path = format!("/org/repo/resolve/{}/model.bin", commit.as_str());
+        let fixture = ScriptedHub::start([
+            Exchange::new(
+                ExpectedRequest::get(&request_path),
+                ScriptedResponse::new(503, b"retry".as_slice()).header("retry-after", "1"),
+            ),
+            Exchange::new(
+                ExpectedRequest::get(&request_path),
+                ScriptedResponse::new(200, bytes.as_slice()).header("etag", "stable-etag"),
+            ),
+        ])?;
+        let protocol = Arc::new(HubProtocol::new(
+            Endpoint::parse(fixture.endpoint())?,
+            Arc::new(ReqwestTransport::build()?),
+        )?);
+        let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let digest = BlobDigest::for_bytes(bytes);
+        let entry = HubTreeEntry::new(bytes.len() as u64, "pointer")?
+            .with_lfs(digest.to_string(), bytes.len() as u64)?;
+        let (_directory, kernel) = kernel()?;
+        let kernel = Arc::new(kernel);
+        let policy = RetryPolicy::new(
+            2,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(2),
+        )
+        .ok_or("invalid retry policy")?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(kernel.download_file(
+            protocol,
+            repository,
+            commit,
+            path,
+            entry,
+            None,
+            policy,
+            &NoDelayClock,
+            CancellationToken::new(),
+            Arc::new(crate::progress::NoopProgress),
+        ));
+        let observed = fixture.finish();
+        let published = result.map_err(|error| format!("{error}; fixture: {observed:?}"))?;
+        assert_eq!(published, digest);
+        assert_eq!(std::fs::read(kernel.blob_path(&digest))?, bytes);
+        assert_eq!(observed?.len(), 2);
         Ok(())
     }
 

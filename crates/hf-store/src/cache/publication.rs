@@ -874,6 +874,37 @@ impl CacheKernel {
         ))
     }
 
+    pub(super) fn partial_resume_candidate(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+        expected_size: u64,
+        target_digest: Option<&BlobDigest>,
+    ) -> Result<Option<(u64, Option<String>)>, CacheError> {
+        let Some(actual_size) = self.partial_data_size(commit, path)? else {
+            return Ok(None);
+        };
+        let destination = self.layout.partial_record(commit, path)?;
+        let record: PartialTransferRecord =
+            match self.read_record(&destination, MAX_SMALL_RECORD_BYTES) {
+                Ok(record) => record,
+                Err(error) if error.is_not_found() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        let validator = record.validator().map(str::to_owned);
+        let eligible = record.resume_offset_if_eligible(
+            self.layout.origin_key(),
+            self.layout.repository_key(),
+            commit,
+            path,
+            expected_size,
+            actual_size,
+            validator.as_deref(),
+            target_digest,
+        );
+        Ok(eligible.map(|offset| (offset, validator)))
+    }
+
     fn replace_record<T: CacheRecord>(
         &self,
         destination: &Path,

@@ -459,6 +459,10 @@ impl PartialTransferRecord {
         self.updated_unix_millis
     }
 
+    pub(super) fn validator(&self) -> Option<&str> {
+        self.validator.as_deref()
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "resume eligibility deliberately compares every immutable transfer identity field"
