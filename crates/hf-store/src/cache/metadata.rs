@@ -616,6 +616,10 @@ impl LocalDirFileRecord {
         self.size
     }
 
+    pub(super) fn repo_path(&self) -> Result<RepoPath, ValidationError> {
+        RepoPath::parse(&self.path)
+    }
+
     fn validate(&self) -> Result<RepoPath, ValidationError> {
         let path = RepoPath::parse(&self.path)?;
         let _digest = self.digest()?;
@@ -714,6 +718,14 @@ impl LocalDirStateRecord {
 
     pub(super) fn selection_id(&self) -> &str {
         &self.selection_id
+    }
+
+    pub(super) fn origin_key(&self) -> &str {
+        &self.origin_key
+    }
+
+    pub(super) fn repository_key(&self) -> &str {
+        &self.repository_key
     }
 }
 
