@@ -235,6 +235,7 @@ fn handle_connection(
     exchange: &Exchange,
     requests: &Mutex<Vec<RecordedRequest>>,
 ) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let request = read_request(&mut stream)?;
     if !exchange.request.matches(&request) {

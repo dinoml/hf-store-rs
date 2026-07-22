@@ -1,6 +1,6 @@
 use crate::error::{CacheFailure, HubOperationError};
 use crate::progress::ProgressObserver;
-use crate::transfer::append_bounded_body;
+use crate::transfer::{BodyDisposition, append_bounded_body, validate_file_response};
 use crate::transport::TransportBody;
 use crate::validation::{ValidationError, ValidationErrorKind};
 use crate::{CancellationToken, CommitId, RepoPath};
@@ -11,6 +11,75 @@ use super::key::BlobDigest;
 use super::publication::CacheKernel;
 
 impl CacheKernel {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the response boundary keeps remote identity, cancellation, and progress explicit"
+    )]
+    pub(super) async fn consume_file_response(
+        &self,
+        response: &mut crate::transport::TransportResponse,
+        commit: &CommitId,
+        path: &RepoPath,
+        entry: &HubTreeEntry,
+        requested_resume: Option<(u64, Option<&str>)>,
+        cancellation: &CancellationToken,
+        progress: &dyn ProgressObserver,
+    ) -> Result<BlobDigest, HubOperationError> {
+        let disposition = validate_file_response(
+            response.status(),
+            response.headers().get("content-length"),
+            response.headers().get("content-range"),
+            requested_resume.map(|(offset, _validator)| offset),
+            entry.size(),
+        )?;
+        let response_validator = response
+            .headers()
+            .get("etag")
+            .or_else(|| response.headers().get("last-modified"))
+            .map(str::to_owned);
+        match disposition {
+            BodyDisposition::Fresh { .. } | BodyDisposition::Restart { .. } => {
+                self.stream_fresh_file_to_blob(
+                    response.body_mut(),
+                    commit,
+                    path,
+                    entry,
+                    response_validator.as_deref(),
+                    cancellation,
+                    progress,
+                )
+                .await
+            }
+            BodyDisposition::Resume { offset, .. } => {
+                let requested_validator = requested_resume
+                    .and_then(|(_offset, validator)| validator)
+                    .map(str::to_owned);
+                let has_target_digest = entry.lfs_sha256().is_some();
+                if !has_target_digest
+                    && (requested_validator.is_none()
+                        || requested_validator.as_deref() != response_validator.as_deref())
+                {
+                    self.discard_partial_coordinated(commit, path)?;
+                    return Err(HubOperationError::validation(ValidationError::new(
+                        "resumed Hub file validator",
+                        ValidationErrorKind::Malformed,
+                    )));
+                }
+                self.resume_file_to_blob(
+                    response.body_mut(),
+                    commit,
+                    path,
+                    entry,
+                    offset,
+                    requested_validator.as_deref(),
+                    cancellation,
+                    progress,
+                )
+                .await
+            }
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the transfer boundary keeps remote identity, cancellation, and progress explicit"
@@ -215,6 +284,18 @@ impl CacheKernel {
             return;
         }
         let _cleanup = self.discard_partial(commit, path);
+    }
+
+    fn discard_partial_coordinated(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+    ) -> Result<(), HubOperationError> {
+        let _partial_guard = self
+            .lock_partial(commit, path)
+            .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+        self.discard_partial(commit, path)
+            .map_err(|_source| HubOperationError::cache(CacheFailure::Io))
     }
 }
 
@@ -432,6 +513,173 @@ mod tests {
         assert_eq!(resumed, digest);
         assert_eq!(std::fs::read(kernel.blob_path(&digest))?, bytes);
         assert!(!kernel.partial_data_path(&commit, &path)?.try_exists()?);
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn reqwest_fixture_range_resumes_into_one_validated_blob() -> Result<(), Box<dyn Error>> {
+        use crate::hub_protocol::HubProtocol;
+        use crate::reqwest_transport::ReqwestTransport;
+        use crate::test_http_fixture::{Exchange, ExpectedRequest, ScriptedHub, ScriptedResponse};
+
+        let bytes = b"fixture-backed resumable content";
+        let split = 11_usize;
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let path = RepoPath::parse("weights/model.bin")?;
+        let request_path = format!("/org/repo/resolve/{}/{}", commit.as_str(), path.as_str());
+        let fixture = ScriptedHub::start([Exchange::new(
+            ExpectedRequest::get(&request_path)
+                .header("range", &format!("bytes={split}-"))
+                .header("if-range", "stable-etag"),
+            ScriptedResponse::new(206, &bytes[split..])
+                .header(
+                    "content-range",
+                    &format!("bytes {split}-{}/{}", bytes.len() - 1, bytes.len()),
+                )
+                .header("etag", "stable-etag"),
+        )])?;
+        let endpoint = Endpoint::parse(fixture.endpoint())?;
+        let protocol = HubProtocol::new(endpoint, Arc::new(ReqwestTransport::build()?))?;
+        let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let digest = BlobDigest::for_bytes(bytes);
+        let entry = HubTreeEntry::new(bytes.len() as u64, "pointer")?
+            .with_lfs(digest.to_string(), bytes.len() as u64)?;
+        let (_directory, kernel) = kernel()?;
+        let mut disconnected = DisconnectingBody {
+            chunk: Some(Box::<[u8]>::from(&bytes[..split])),
+        };
+        let first = run_ready(kernel.stream_fresh_file_to_blob(
+            &mut disconnected,
+            &commit,
+            &path,
+            &entry,
+            Some("stable-etag"),
+            &CancellationToken::new(),
+            &crate::progress::NoopProgress,
+        ));
+        assert!(
+            first
+                .expect_err("published a disconnected response")
+                .is_retryable()
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        assert_eq!(
+            kernel.partial_resume_offset(
+                &commit,
+                &path,
+                bytes.len() as u64,
+                split as u64,
+                Some("stable-etag"),
+                Some(&digest),
+            )?,
+            Some(split as u64)
+        );
+
+        let resumed = runtime.block_on(async {
+            let mut response = protocol
+                .request_file(
+                    &repository,
+                    &commit,
+                    &path,
+                    Some((split as u64, Some("stable-etag"))),
+                    None,
+                )
+                .await?;
+            kernel
+                .consume_file_response(
+                    &mut response,
+                    &commit,
+                    &path,
+                    &entry,
+                    Some((split as u64, Some("stable-etag"))),
+                    &CancellationToken::new(),
+                    &crate::progress::NoopProgress,
+                )
+                .await
+        });
+        let observed = fixture.finish();
+        let resumed = resumed.map_err(|error| format!("{error}; fixture: {observed:?}"))?;
+        assert_eq!(resumed, digest);
+        assert_eq!(std::fs::read(kernel.blob_path(&digest))?, bytes);
+        assert_eq!(observed?.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn reqwest_fixture_ignored_range_restarts_from_zero() -> Result<(), Box<dyn Error>> {
+        use crate::hub_protocol::HubProtocol;
+        use crate::reqwest_transport::ReqwestTransport;
+        use crate::test_http_fixture::{Exchange, ExpectedRequest, ScriptedHub, ScriptedResponse};
+
+        let bytes = b"server returned the whole file";
+        let split = 7_usize;
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let path = RepoPath::parse("model.bin")?;
+        let digest = BlobDigest::for_bytes(bytes);
+        let entry = HubTreeEntry::new(bytes.len() as u64, "pointer")?
+            .with_lfs(digest.to_string(), bytes.len() as u64)?;
+        let (_directory, kernel) = kernel()?;
+        let mut disconnected = DisconnectingBody {
+            chunk: Some(Box::<[u8]>::from(&bytes[..split])),
+        };
+        run_ready(kernel.stream_fresh_file_to_blob(
+            &mut disconnected,
+            &commit,
+            &path,
+            &entry,
+            Some("old-etag"),
+            &CancellationToken::new(),
+            &crate::progress::NoopProgress,
+        ))
+        .expect_err("published a disconnected prefix");
+
+        let request_path = format!("/org/repo/resolve/{}/model.bin", commit.as_str());
+        let fixture = ScriptedHub::start([Exchange::new(
+            ExpectedRequest::get(&request_path)
+                .header("range", &format!("bytes={split}-"))
+                .header("if-range", "old-etag"),
+            ScriptedResponse::new(200, bytes.as_slice()).header("etag", "new-etag"),
+        )])?;
+        let protocol = HubProtocol::new(
+            Endpoint::parse(fixture.endpoint())?,
+            Arc::new(ReqwestTransport::build()?),
+        )?;
+        let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let published = runtime.block_on(async {
+            let mut response = protocol
+                .request_file(
+                    &repository,
+                    &commit,
+                    &path,
+                    Some((split as u64, Some("old-etag"))),
+                    None,
+                )
+                .await?;
+            kernel
+                .consume_file_response(
+                    &mut response,
+                    &commit,
+                    &path,
+                    &entry,
+                    Some((split as u64, Some("old-etag"))),
+                    &CancellationToken::new(),
+                    &crate::progress::NoopProgress,
+                )
+                .await
+        });
+        let observed = fixture.finish();
+        let published = published.map_err(|error| format!("{error}; fixture: {observed:?}"))?;
+        assert_eq!(published, digest);
+        assert_eq!(std::fs::read(kernel.blob_path(&digest))?, bytes);
+        assert!(!kernel.partial_data_path(&commit, &path)?.try_exists()?);
+        assert_eq!(observed?.len(), 1);
         Ok(())
     }
 
