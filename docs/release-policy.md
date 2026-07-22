@@ -20,10 +20,14 @@ redaction.
 3. Run pinned Python conformance and cache/locking/replacement tests on Linux,
    macOS, and Windows.
 4. Run generated parser/state properties and the credential/signed-URL audit.
-5. Run `cargo package` and `cargo publish --dry-run` for each published package.
-6. Publish `hf-store` before `hf-store-cli`, create the signed or annotated
-   `vX.Y.Z` tag, and create a GitHub release from the matching changelog entry.
+5. Run `cargo package` for packages intended to remain publishable.
+6. Create the signed or annotated `vX.Y.Z` tag and a GitHub source release from
+   the matching changelog entry.
 
 Releases are built only from a green `main` commit. Package contents must not
 include credentials, generated caches, local plans, or build output.
 
+Publishing to a Cargo registry is an optional distribution step and is not a
+requirement for a supported release. If registry publication is requested in
+the future, validate it separately with `cargo publish --dry-run` and publish
+`hf-store` before `hf-store-cli`.
