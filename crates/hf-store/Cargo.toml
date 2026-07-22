@@ -36,5 +36,13 @@ tokio = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 
+[[example]]
+name = "download"
+required-features = ["network"]
+
+[[example]]
+name = "local_dir"
+required-features = ["network"]
+
 [lints]
 workspace = true
