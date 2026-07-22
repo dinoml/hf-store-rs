@@ -496,7 +496,26 @@ mod tests {
         write!(stream, "Connection: close\r\n\r\n")?;
         stream.flush()?;
         let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes)?;
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+                Err(source)
+                    if !bytes.is_empty()
+                        && matches!(
+                            source.kind(),
+                            io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::UnexpectedEof
+                        ) =>
+                {
+                    break;
+                }
+                Err(source) => return Err(source),
+            }
+        }
         let separator = bytes
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
