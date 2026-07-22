@@ -371,6 +371,34 @@ def run_writer(config: RaceConfig) -> dict[str, Any]:
     if not tree.is_file():
         raise RaceHarnessError("real tree writer did not publish its record")
 
+    cached = huggingface_hub.try_to_load_from_cache(
+        repo_id=config.repo_id,
+        filename=config.filename,
+        cache_dir=config.cache_root,
+        revision=config.revision,
+        repo_type=config.repo_type,
+    )
+    if not isinstance(cached, str) or Path(cached).read_bytes() != content:
+        raise RaceHarnessError("pinned cache lookup did not reuse the published pointer")
+    offline_snapshot = Path(
+        huggingface_hub.snapshot_download(
+            repo_id=config.repo_id,
+            repo_type=config.repo_type,
+            revision=config.revision,
+            cache_dir=config.cache_root,
+            local_files_only=True,
+            allow_patterns=[config.filename],
+            max_workers=1,
+        )
+    )
+    offline_file = offline_snapshot.joinpath(*PurePosixPath(config.filename).parts)
+    if offline_file.read_bytes() != content:
+        raise RaceHarnessError("pinned local-only snapshot lookup returned different bytes")
+    scan = huggingface_hub.scan_cache_dir(config.cache_root)
+    scan_warnings = [str(warning) for warning in scan.warnings]
+    if scan_warnings:
+        raise RaceHarnessError("pinned cache scan reported corruption")
+
     result: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
         "producer": "huggingface_hub",
@@ -390,6 +418,11 @@ def run_writer(config: RaceConfig) -> dict[str, Any]:
         "lock_backend": observed_lock_backend,
         "lock_path": _relative_result_path(observed_lock_path, config.cache_root, "lock path"),
         "snapshot_path": _relative_result_path(pointer, config.cache_root, "snapshot path"),
+        "offline_snapshot_path": _relative_result_path(
+            offline_snapshot,
+            config.cache_root,
+            "offline snapshot path",
+        ),
         "pointer_form": _pointer_form(pointer),
         "blob_path": _relative_result_path(blob, config.cache_root, "blob path"),
         "blob_exists": blob.is_file(),
@@ -397,6 +430,7 @@ def run_writer(config: RaceConfig) -> dict[str, Any]:
         "tree_exists": tree.is_file(),
         "ref_path": _relative_result_path(reference, config.cache_root, "ref path"),
         "ref_value": reference.read_text(encoding="utf-8") if reference.is_file() else None,
+        "scan_warnings": scan_warnings,
         "force_copy": config.force_copy,
     }
     _write_result(config.result_path, result)

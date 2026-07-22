@@ -92,6 +92,7 @@ class CompatibleWriterRaceTests(unittest.TestCase):
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["body_calls"], 1)
             self.assertEqual(result["pointer_form"], "regular")
+            self.assertEqual(result["scan_warnings"], [])
             self.assertFalse(result["blob_exists"])
             self.assertEqual(snapshot.read_bytes(), CONTENT)
             self.assertEqual((storage / "refs" / REVISION).read_text(), COMMIT)
@@ -115,6 +116,7 @@ class CompatibleWriterRaceTests(unittest.TestCase):
             snapshot = storage / "snapshots" / COMMIT / FILENAME
             self.assertEqual(result["body_calls"], 0)
             self.assertEqual(result["pointer_form"], "regular")
+            self.assertEqual(result["scan_warnings"], [])
             self.assertTrue(result["blob_exists"])
             self.assertEqual(blob.read_bytes(), CONTENT)
             self.assertEqual(snapshot.read_bytes(), CONTENT)
