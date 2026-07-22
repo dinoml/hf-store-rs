@@ -1,5 +1,7 @@
 use std::fmt::Debug;
 use std::io;
+use std::pin::Pin;
+use std::time::Duration;
 
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -7,6 +9,65 @@ use sha2::{Digest, Sha256};
 use crate::cache::{BlobDigest, HubTreeEntry};
 use crate::error::{CacheFailure, HubOperationError};
 use crate::transport::TransportBody;
+
+pub(crate) type RetryFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub(crate) trait RetryClock: Debug + Send + Sync {
+    fn sleep(&self, duration: Duration) -> RetryFuture<'_, Result<(), HubOperationError>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetryPolicy {
+    max_attempts: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+impl RetryPolicy {
+    pub(crate) const fn new(
+        max_attempts: u32,
+        base_delay: Duration,
+        max_delay: Duration,
+    ) -> Option<Self> {
+        if max_attempts == 0 || base_delay.is_zero() || max_delay.is_zero() {
+            return None;
+        }
+        Some(Self {
+            max_attempts,
+            base_delay,
+            max_delay,
+        })
+    }
+
+    fn delay(self, failed_attempt: u32, retry_after: Option<Duration>) -> Duration {
+        if let Some(server) = retry_after {
+            return server.min(self.max_delay);
+        }
+        let exponent = failed_attempt.saturating_sub(1).min(31);
+        self.base_delay
+            .saturating_mul(1_u32 << exponent)
+            .min(self.max_delay)
+    }
+}
+
+pub(crate) async fn run_with_retry<T: 'static>(
+    policy: RetryPolicy,
+    clock: &dyn RetryClock,
+    mut operation: impl FnMut(u32) -> RetryFuture<'static, Result<T, HubOperationError>>,
+) -> Result<T, HubOperationError> {
+    for attempt in 1..=policy.max_attempts {
+        match operation(attempt).await {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is_retryable() && attempt < policy.max_attempts => {
+                clock
+                    .sleep(policy.delay(attempt, error.retry_after()))
+                    .await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(HubOperationError::protocol())
+}
 
 pub(crate) trait PartialSink: Debug + Send {
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()>;
@@ -212,6 +273,7 @@ fn require_matching_length(actual: Option<u64>, expected: u64) -> Result<(), Hub
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
 
     use crate::transport::{TransportError, TransportFuture};
@@ -235,6 +297,20 @@ mod tests {
         bytes: Vec<u8>,
         fail_write: bool,
         synced: AtomicBool,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingClock(Mutex<Vec<Duration>>);
+
+    impl RetryClock for RecordingClock {
+        fn sleep(&self, duration: Duration) -> RetryFuture<'_, Result<(), HubOperationError>> {
+            let result = self
+                .0
+                .lock()
+                .map_err(|_poisoned| HubOperationError::cancelled())
+                .map(|mut sleeps| sleeps.push(duration));
+            Box::pin(std::future::ready(result))
+        }
     }
 
     impl PartialSink for MemorySink {
@@ -315,6 +391,67 @@ mod tests {
         }
         validate_file_response(200, Some("18446744073709551616"), None, None, 9)
             .expect_err("accepted an overflowing decimal header");
+    }
+
+    #[test]
+    fn retry_policy_uses_deterministic_backoff_and_server_delay() -> Result<(), HubOperationError> {
+        let policy = RetryPolicy::new(4, Duration::from_millis(100), Duration::from_secs(2))
+            .ok_or_else(HubOperationError::protocol)?;
+        let clock = RecordingClock::default();
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let result = run_ready(run_with_retry(policy, &clock, {
+            let attempts = Arc::clone(&attempts);
+            move |_attempt| {
+                let current = attempts.fetch_add(1, Ordering::AcqRel);
+                Box::pin(std::future::ready(match current {
+                    0 => Err(HubOperationError::transport(TransportError::connection())),
+                    1 => Err(HubOperationError::rate_limited(Some(Duration::from_secs(
+                        7,
+                    )))),
+                    _ => Ok("complete"),
+                }))
+            }
+        }))?;
+        assert_eq!(result, "complete");
+        assert_eq!(attempts.load(Ordering::Acquire), 3);
+        assert_eq!(
+            *clock
+                .0
+                .lock()
+                .map_err(|_poisoned| HubOperationError::cancelled())?,
+            [Duration::from_millis(100), Duration::from_secs(2)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nonretryable_failures_stop_immediately_and_retry_exhaustion_returns_last_error()
+    -> Result<(), HubOperationError> {
+        let policy = RetryPolicy::new(2, Duration::from_millis(1), Duration::from_secs(1))
+            .ok_or_else(HubOperationError::protocol)?;
+        let clock = RecordingClock::default();
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let error = run_ready(run_with_retry(policy, &clock, {
+            let attempts = Arc::clone(&attempts);
+            move |_attempt| {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                Box::pin(std::future::ready(Err::<(), _>(
+                    HubOperationError::authentication(),
+                )))
+            }
+        }))
+        .expect_err("retried authentication failure");
+        assert!(error.is_authentication());
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+
+        let exhausted = run_ready(run_with_retry(policy, &clock, |_attempt| {
+            Box::pin(std::future::ready(Err::<(), _>(
+                HubOperationError::transport(TransportError::body()),
+            )))
+        }))
+        .expect_err("retry exhaustion succeeded");
+        assert!(exhausted.is_transport());
+        Ok(())
     }
 
     #[test]

@@ -31,6 +31,7 @@ enum HubOperationErrorKind {
     Missing,
     RateLimited { retry_after: Option<Duration> },
     Transport(TransportError),
+    TransportStatus(u16),
     Protocol,
     Validation(ValidationError),
     Cancelled,
@@ -94,6 +95,7 @@ impl HubOperationError {
             403 => Some(Self::gated()),
             404 => Some(Self::missing()),
             429 => Some(Self::rate_limited(retry_after)),
+            408 | 500..=599 => Some(Self::new(HubOperationErrorKind::TransportStatus(status))),
             _ => Some(Self::protocol()),
         }
     }
@@ -137,7 +139,10 @@ impl HubOperationError {
     /// Returns whether an HTTP transport operation failed.
     #[must_use]
     pub fn is_transport(&self) -> bool {
-        matches!(self.kind.as_ref(), HubOperationErrorKind::Transport(_))
+        matches!(
+            self.kind.as_ref(),
+            HubOperationErrorKind::Transport(_) | HubOperationErrorKind::TransportStatus(_)
+        )
     }
 
     /// Returns whether a response violated the supported Hub protocol.
@@ -180,6 +185,23 @@ impl HubOperationError {
         )
     }
 
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self.kind.as_ref() {
+            HubOperationErrorKind::RateLimited { .. } => true,
+            HubOperationErrorKind::Transport(source) => source.is_connection() || source.is_body(),
+            HubOperationErrorKind::TransportStatus(status) => {
+                matches!(*status, 408 | 500 | 502 | 503 | 504)
+            }
+            HubOperationErrorKind::Authentication
+            | HubOperationErrorKind::Gated
+            | HubOperationErrorKind::Missing
+            | HubOperationErrorKind::Protocol
+            | HubOperationErrorKind::Validation(_)
+            | HubOperationErrorKind::Cancelled
+            | HubOperationErrorKind::Cache(_) => false,
+        }
+    }
+
     /// Returns the captured operation backtrace.
     pub const fn backtrace(&self) -> &Backtrace {
         &self.backtrace
@@ -193,7 +215,9 @@ impl Debug for HubOperationError {
             HubOperationErrorKind::Gated => "Gated",
             HubOperationErrorKind::Missing => "Missing",
             HubOperationErrorKind::RateLimited { .. } => "RateLimited",
-            HubOperationErrorKind::Transport(_) => "Transport",
+            HubOperationErrorKind::Transport(_) | HubOperationErrorKind::TransportStatus(_) => {
+                "Transport"
+            }
             HubOperationErrorKind::Protocol => "Protocol",
             HubOperationErrorKind::Validation(_) => "Validation",
             HubOperationErrorKind::Cancelled => "Cancelled",
@@ -213,7 +237,9 @@ impl Display for HubOperationError {
             HubOperationErrorKind::Gated => "Hub repository access is gated",
             HubOperationErrorKind::Missing => "Hub object was not found",
             HubOperationErrorKind::RateLimited { .. } => "Hub request was rate limited",
-            HubOperationErrorKind::Transport(_) => "Hub transport failed",
+            HubOperationErrorKind::Transport(_) | HubOperationErrorKind::TransportStatus(_) => {
+                "Hub transport failed"
+            }
             HubOperationErrorKind::Protocol => "Hub response violated the protocol",
             HubOperationErrorKind::Validation(_) => "Hub data failed validation",
             HubOperationErrorKind::Cancelled => "Hub operation was cancelled",
@@ -232,6 +258,7 @@ impl Error for HubOperationError {
             | HubOperationErrorKind::Missing
             | HubOperationErrorKind::RateLimited { .. }
             | HubOperationErrorKind::Protocol
+            | HubOperationErrorKind::TransportStatus(_)
             | HubOperationErrorKind::Validation(_)
             | HubOperationErrorKind::Cancelled
             | HubOperationErrorKind::Cache(_) => None,
