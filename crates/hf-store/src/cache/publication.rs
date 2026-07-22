@@ -396,13 +396,14 @@ pub(super) struct SnapshotLease {
 
 #[derive(Clone, Debug)]
 pub(super) struct OwnedSnapshotRead {
+    root: PathBuf,
     files: Vec<OwnedSnapshotFile>,
     lease: Arc<SnapshotLease>,
 }
 
 impl OwnedSnapshotRead {
-    pub(super) fn into_parts(self) -> (Vec<OwnedSnapshotFile>, Arc<SnapshotLease>) {
-        (self.files, self.lease)
+    pub(super) fn into_parts(self) -> (PathBuf, Vec<OwnedSnapshotFile>, Arc<SnapshotLease>) {
+        (self.root, self.files, self.lease)
     }
 }
 
@@ -987,7 +988,11 @@ impl CacheKernel {
                 size,
             });
         }
-        Ok(OwnedSnapshotRead { files, lease })
+        Ok(OwnedSnapshotRead {
+            root: self.layout.snapshot_directory(&commit, &selection),
+            files,
+            lease,
+        })
     }
 
     pub(super) fn acquire_snapshot_lease(

@@ -169,6 +169,7 @@ impl CompatibleCacheOffline {
         }
 
         Ok(CompatibleSnapshot {
+            root: self.reader.layout().snapshot_directory(index.commit()),
             commit: index.commit().clone(),
             selection: selection.id,
             files: files.into_boxed_slice(),
@@ -332,6 +333,7 @@ fn open_shared_cache(
 
 #[derive(Clone, Debug)]
 pub(super) struct CompatibleSnapshot {
+    root: PathBuf,
     commit: CommitId,
     selection: SelectionId,
     files: Box<[CompatibleSnapshotFile]>,
@@ -349,6 +351,9 @@ impl PartialEq for CompatibleSnapshot {
 impl Eq for CompatibleSnapshot {}
 
 impl CompatibleSnapshot {
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
     pub(super) const fn commit(&self) -> &CommitId {
         &self.commit
     }

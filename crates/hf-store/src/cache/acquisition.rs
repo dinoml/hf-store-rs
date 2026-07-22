@@ -403,6 +403,7 @@ impl OfflineCache {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AcquiredSnapshot {
+    root: PathBuf,
     commit: CommitId,
     selection: SelectionId,
     files: Box<[AcquiredSnapshotFile]>,
@@ -411,8 +412,9 @@ pub(crate) struct AcquiredSnapshot {
 
 impl AcquiredSnapshot {
     fn from_owned(commit: CommitId, selection: SelectionId, snapshot: OwnedSnapshotRead) -> Self {
-        let (files, lease) = snapshot.into_parts();
+        let (root, files, lease) = snapshot.into_parts();
         Self {
+            root,
             commit,
             selection,
             files: files
@@ -426,6 +428,10 @@ impl AcquiredSnapshot {
 
     pub(crate) const fn commit(&self) -> &CommitId {
         &self.commit
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) const fn selection(&self) -> &SelectionId {
@@ -451,6 +457,7 @@ impl From<CompatibleSnapshot> for AcquiredSnapshot {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
+            root: snapshot.root().to_path_buf(),
             commit: snapshot.commit().clone(),
             selection: *snapshot.selection(),
             files,

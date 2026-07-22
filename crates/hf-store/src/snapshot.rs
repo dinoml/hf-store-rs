@@ -11,6 +11,7 @@ use crate::{CommitId, Endpoint, RepoPath, RepositorySpec, Revision, SelectionId}
 /// the file-oriented API.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
+    root: PathBuf,
     endpoint: Endpoint,
     repository: RepositorySpec,
     requested_revision: Revision,
@@ -36,6 +37,7 @@ impl Snapshot {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
+            root: acquired.root().to_path_buf(),
             endpoint,
             repository,
             requested_revision,
@@ -51,6 +53,15 @@ impl Snapshot {
     #[must_use]
     pub const fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Returns the validated snapshot directory.
+    ///
+    /// Retain this handle while downstream code uses the path so its shared
+    /// reader lease remains active.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.root
     }
 
     /// Returns the repository identity.

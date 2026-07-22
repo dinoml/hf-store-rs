@@ -777,6 +777,7 @@ mod tests {
         assert!(!first.was_reused());
         let path = RepoPath::parse("model.bin")?;
         let file = first.file(&path).ok_or("downloaded file missing")?;
+        assert!(file.local_path().starts_with(first.directory()));
         assert_eq!(std::fs::read(file.local_path())?, bytes);
         assert_eq!(file.sha256(), digest);
 
