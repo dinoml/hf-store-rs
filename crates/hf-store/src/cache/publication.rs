@@ -6,7 +6,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -385,7 +385,56 @@ pub(super) struct CacheKernel {
     origin_record: OriginRecord,
     repository_record: RepositoryRecord,
     effects: Effects,
+    partial_thread_locks: Arc<Mutex<std::collections::BTreeMap<PathBuf, Weak<PartialThreadLock>>>>,
 }
+
+#[derive(Debug, Default)]
+struct PartialThreadLock {
+    held: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl PartialThreadLock {
+    fn acquire(self: &Arc<Self>) -> io::Result<PartialThreadGuard> {
+        let mut held = self
+            .held
+            .lock()
+            .map_err(|_poisoned| io::Error::other("partial thread lock was poisoned"))?;
+        while *held {
+            held = self
+                .wake
+                .wait(held)
+                .map_err(|_poisoned| io::Error::other("partial thread lock was poisoned"))?;
+        }
+        *held = true;
+        drop(held);
+        Ok(PartialThreadGuard {
+            lock: Arc::clone(self),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PartialThreadGuard {
+    lock: Arc<PartialThreadLock>,
+}
+
+impl Drop for PartialThreadGuard {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.lock.held.lock() {
+            *held = false;
+            self.lock.wake.notify_one();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CoordinatedPartialGuard {
+    _thread: PartialThreadGuard,
+    _process: Box<dyn RootedLockGuard>,
+}
+
+impl RootedLockGuard for CoordinatedPartialGuard {}
 
 pub(super) struct CachePartialSink {
     writer: Box<dyn RootedWrite>,
@@ -1651,6 +1700,7 @@ impl CacheKernel {
             origin_record: OriginRecord::new(endpoint),
             repository_record: RepositoryRecord::new(&origin_key, &repository_key, spec),
             effects,
+            partial_thread_locks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         })
     }
 
@@ -1830,7 +1880,26 @@ impl CacheKernel {
         let lock = self.layout.partial_lock(commit, path)?;
         self.ensure_parent(&lock)?;
         let relative = self.relative_path(&lock)?;
-        Ok(self.root.lock_exclusive(relative)?)
+        let thread_lock = {
+            let mut locks = self
+                .partial_thread_locks
+                .lock()
+                .map_err(|_poisoned| io::Error::other("partial lock registry was poisoned"))?;
+            locks.retain(|_path, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(relative).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(PartialThreadLock::default());
+                locks.insert(relative.to_path_buf(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let thread = thread_lock.acquire()?;
+        let process = self.root.lock_exclusive(relative)?;
+        Ok(Box::new(CoordinatedPartialGuard {
+            _thread: thread,
+            _process: process,
+        }))
     }
 
     pub(super) fn partial_data_size(
@@ -2999,8 +3068,8 @@ impl Clock for FixedClock {
 mod tests {
     use std::io::Cursor;
     use std::process::{Child, Command, Output, Stdio};
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Barrier, Mutex};
     use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
