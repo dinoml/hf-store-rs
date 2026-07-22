@@ -62,6 +62,18 @@ impl HubLocalDirLayout {
     pub(super) const fn completion_sidecar(&self) -> &CacheLayout {
         &self.completion_sidecar
     }
+
+    pub(super) fn capability_relative<'a>(
+        &self,
+        path: &'a Path,
+    ) -> Result<&'a Path, ValidationError> {
+        path.strip_prefix(&self.root).map_err(|_outside| {
+            ValidationError::new(
+                "local directory capability path",
+                ValidationErrorKind::UnsafePath,
+            )
+        })
+    }
 }
 
 fn ensure_not_reserved(path: &RepoPath) -> Result<(), ValidationError> {

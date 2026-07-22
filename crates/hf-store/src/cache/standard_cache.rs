@@ -247,7 +247,9 @@ impl StandardCacheWriter {
             .open_regular(&destination_relative)
             .map_err(CacheError::from)?
         {
-            RootedRegularFile::File { mut reader, size } => {
+            RootedRegularFile::File {
+                mut reader, size, ..
+            } => {
                 if size != blob.entry.size() {
                     return Err(CompatibleCacheError::corrupt());
                 }
@@ -456,7 +458,7 @@ impl StandardCacheWriter {
         expected: &PreparedBlob,
     ) -> Result<(), CompatibleCacheError> {
         let (mut reader, size) = match self.root.open_regular(path).map_err(CacheError::from)? {
-            RootedRegularFile::File { reader, size } => (reader, size),
+            RootedRegularFile::File { reader, size, .. } => (reader, size),
             RootedRegularFile::Missing | RootedRegularFile::Other => {
                 return Err(CompatibleCacheError::corrupt());
             }

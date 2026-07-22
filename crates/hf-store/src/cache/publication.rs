@@ -716,7 +716,9 @@ impl CacheKernel {
     ) -> Result<T, CacheError> {
         let relative = self.relative_path(destination)?;
         let bytes = match self.root.open_regular(relative)? {
-            RootedRegularFile::File { mut reader, size } => {
+            RootedRegularFile::File {
+                mut reader, size, ..
+            } => {
                 let max_size = u64::try_from(max_bytes).map_err(io::Error::other)?;
                 if size > max_size {
                     return Err(CacheError::record_too_large());

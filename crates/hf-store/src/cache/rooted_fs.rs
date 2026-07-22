@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsSyncExt;
@@ -140,6 +141,7 @@ pub(super) enum RootedRegularFile {
     File {
         reader: Box<dyn Read + Send>,
         size: u64,
+        modified: SystemTime,
     },
     Missing,
     Other,
@@ -244,7 +246,7 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         }
 
         let (mut reader, expected_size) = match self.open_regular(source)? {
-            RootedRegularFile::File { reader, size } => (reader, size),
+            RootedRegularFile::File { reader, size, .. } => (reader, size),
             RootedRegularFile::Missing => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -429,12 +431,13 @@ impl RootedFileSystem for CacheRoot {
         Ok(RootedRegularFile::File {
             reader: Box::new(file),
             size: metadata.len(),
+            modified: metadata.modified()?.into_std(),
         })
     }
 
     fn read_regular_bounded(&self, path: &Path, limit: usize) -> io::Result<RootedRead> {
         let (mut reader, size) = match self.open_regular(path)? {
-            RootedRegularFile::File { reader, size } => (reader, size),
+            RootedRegularFile::File { reader, size, .. } => (reader, size),
             RootedRegularFile::Missing => return Ok(RootedRead::Missing),
             RootedRegularFile::Other => return Ok(RootedRead::Other),
         };
