@@ -7,7 +7,7 @@ use crate::cache::{HubTree, HubTreeEntry, RepositoryFilter};
 use crate::error::HubOperationError;
 use crate::fetch_plan::FetchPlan;
 use crate::transport::{RedirectFollower, Transport, TransportMethod, TransportRequest};
-use crate::{AuthToken, CommitId, Endpoint, RepositoryKind, RepositorySpec, Revision};
+use crate::{AuthToken, CommitId, Endpoint, RepoPath, RepositoryKind, RepositorySpec, Revision};
 
 const MAX_INFO_BODY_BYTES: usize = 1024 * 1024;
 const MAX_TREE_PAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -146,6 +146,44 @@ impl HubProtocol {
             }
         }
         Err(HubOperationError::protocol())
+    }
+
+    pub(crate) async fn request_file(
+        &self,
+        repository: &RepositorySpec,
+        commit: &CommitId,
+        path: &RepoPath,
+        resume: Option<(u64, Option<&str>)>,
+        authorization: Option<&AuthToken>,
+    ) -> Result<crate::transport::TransportResponse, HubOperationError> {
+        let target = repository_file_url(&self.endpoint, repository, commit, path)?;
+        let mut request = TransportRequest::new(TransportMethod::Get, target)
+            .map_err(HubOperationError::transport)?;
+        if let Some((offset, validator)) = resume {
+            if offset == 0 {
+                return Err(HubOperationError::protocol());
+            }
+            request = request
+                .with_range(format!("bytes={offset}-"), validator)
+                .map_err(HubOperationError::transport)?;
+        }
+        if let Some(token) = authorization {
+            request = request.with_authorization(token.clone());
+        }
+        let response = self
+            .redirects
+            .send(request)
+            .await
+            .map_err(HubOperationError::transport)?;
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+        if let Some(error) = HubOperationError::from_status(response.status(), retry_after) {
+            return Err(error);
+        }
+        Ok(response)
     }
 }
 
@@ -292,6 +330,39 @@ fn repository_api_url(
     Ok(target)
 }
 
+fn repository_file_url(
+    endpoint: &Endpoint,
+    repository: &RepositorySpec,
+    commit: &CommitId,
+    path: &RepoPath,
+) -> Result<Url, HubOperationError> {
+    let mut target =
+        Url::parse(endpoint.as_str()).map_err(|_source| HubOperationError::protocol())?;
+    {
+        let mut segments = target
+            .path_segments_mut()
+            .map_err(|()| HubOperationError::protocol())?;
+        segments.pop_if_empty();
+        match repository.kind() {
+            RepositoryKind::Model => {}
+            RepositoryKind::Dataset => {
+                segments.push("datasets");
+            }
+            RepositoryKind::Space => {
+                segments.push("spaces");
+            }
+        }
+        for component in repository.id().as_str().split('/') {
+            segments.push(component);
+        }
+        segments.push("resolve").push(commit.as_str());
+        for component in path.as_str().split('/') {
+            segments.push(component);
+        }
+    }
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -307,6 +378,7 @@ mod tests {
     use super::*;
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    type ObservedRequest = (String, bool, Option<String>, Option<String>);
 
     #[derive(Debug)]
     struct MemoryBody(VecDeque<Box<[u8]>>);
@@ -320,7 +392,7 @@ mod tests {
     #[derive(Debug)]
     struct ScriptedTransport {
         responses: Mutex<VecDeque<TransportResponse>>,
-        requests: Arc<Mutex<Vec<(String, bool)>>>,
+        requests: Arc<Mutex<Vec<ObservedRequest>>>,
     }
 
     impl Transport for ScriptedTransport {
@@ -336,6 +408,8 @@ mod tests {
                     requests.push((
                         request.target().as_str().to_owned(),
                         request.authorization().is_some(),
+                        request.range().map(str::to_owned),
+                        request.if_range().map(str::to_owned),
                     ));
                     self.responses
                         .lock()
@@ -560,13 +634,56 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn file_requests_use_commit_bound_kind_paths_and_explicit_resume_headers()
+    -> Result<(), Box<dyn Error>> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let responses = (0..3)
+            .map(|_index| response(206, [b"tail".as_slice()]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let protocol = protocol_with_responses(responses, Arc::clone(&requests))?;
+        let commit = CommitId::parse(COMMIT)?;
+        let path = RepoPath::parse("nested/name with space.bin")?;
+        let token = AuthToken::new("hf_secret_file_request")?;
+        for kind in [
+            RepositoryKind::Model,
+            RepositoryKind::Dataset,
+            RepositoryKind::Space,
+        ] {
+            let repository = RepositorySpec::new(kind, RepositoryId::parse("owner/repo")?);
+            let response = run_ready(protocol.request_file(
+                &repository,
+                &commit,
+                &path,
+                Some((4, Some("stable-etag"))),
+                Some(&token),
+            ))?;
+            assert_eq!(response.status(), 206);
+        }
+        let requests = requests
+            .lock()
+            .map_err(|_poisoned| "request lock poisoned")?;
+        for (request, prefix) in requests.iter().zip(["", "/datasets", "/spaces"]) {
+            assert_eq!(
+                request.0,
+                format!(
+                    "https://hub.example{prefix}/owner/repo/resolve/{COMMIT}/nested/name%20with%20space.bin"
+                )
+            );
+            assert!(request.1);
+            assert_eq!(request.2.as_deref(), Some("bytes=4-"));
+            assert_eq!(request.3.as_deref(), Some("stable-etag"));
+        }
+        Ok(())
+    }
+
     fn repository() -> Result<RepositorySpec, crate::ValidationError> {
         Ok(RepositorySpec::model(RepositoryId::parse("owner/repo")?))
     }
 
     fn protocol(
         body: &str,
-        requests: Arc<Mutex<Vec<(String, bool)>>>,
+        requests: Arc<Mutex<Vec<ObservedRequest>>>,
     ) -> Result<HubProtocol, HubOperationError> {
         HubProtocol::new(
             Endpoint::parse("https://hub.example/base").map_err(HubOperationError::validation)?,
@@ -587,7 +704,7 @@ mod tests {
 
     fn protocol_with_responses(
         responses: impl IntoIterator<Item = TransportResponse>,
-        requests: Arc<Mutex<Vec<(String, bool)>>>,
+        requests: Arc<Mutex<Vec<ObservedRequest>>>,
     ) -> Result<HubProtocol, HubOperationError> {
         HubProtocol::new(
             Endpoint::parse("https://hub.example").map_err(HubOperationError::validation)?,
