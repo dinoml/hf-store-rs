@@ -24,6 +24,9 @@ mod repo_path;
 mod revision;
 mod validation;
 
+#[cfg(test)]
+mod test_http_fixture;
+
 #[doc(inline)]
 pub use auth::AuthToken;
 #[doc(inline)]
