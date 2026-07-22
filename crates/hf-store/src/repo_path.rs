@@ -143,7 +143,9 @@ mod tests {
                 state ^= state >> 7;
                 state ^= state << 17;
                 let generated = state.to_le_bytes()[0];
-                value.push(char::from(alphabet[usize::from(generated) % alphabet.len()]));
+                value.push(char::from(
+                    alphabet[usize::from(generated) % alphabet.len()],
+                ));
             }
             match RepoPath::parse(&value) {
                 Ok(path) => {
