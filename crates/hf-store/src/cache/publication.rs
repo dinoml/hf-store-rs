@@ -571,6 +571,19 @@ impl CacheKernel {
         })
     }
 
+    pub(super) fn create_resume_partial_sink(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+        expected_offset: u64,
+    ) -> Result<CachePartialSink, CacheError> {
+        let destination = self.layout.partial_data(commit, path)?;
+        let relative = self.relative_path(&destination)?;
+        Ok(CachePartialSink {
+            writer: self.root.open_append_regular(relative, expected_offset)?,
+        })
+    }
+
     pub(super) fn partial_data_path(
         &self,
         commit: &CommitId,
@@ -601,6 +614,22 @@ impl CacheKernel {
             RootedRegularFile::File { size, .. } => Ok(Some(size)),
             RootedRegularFile::Missing => Ok(None),
             RootedRegularFile::Other => Err(CacheError::conflicting_record()),
+        }
+    }
+
+    pub(super) fn open_partial_reader(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+        expected_size: u64,
+    ) -> Result<Box<dyn Read + Send>, CacheError> {
+        let destination = self.layout.partial_data(commit, path)?;
+        let relative = self.relative_path(&destination)?;
+        match self.root.open_regular(relative)? {
+            RootedRegularFile::File { reader, size, .. } if size == expected_size => Ok(reader),
+            RootedRegularFile::Missing
+            | RootedRegularFile::Other
+            | RootedRegularFile::File { .. } => Err(CacheError::conflicting_record()),
         }
     }
 

@@ -159,6 +159,16 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
     fn open_regular(&self, path: &Path) -> io::Result<RootedRegularFile>;
     fn read_regular_bounded(&self, path: &Path, limit: usize) -> io::Result<RootedRead>;
     fn create_new(&self, path: &Path) -> io::Result<Box<dyn RootedWrite>>;
+    fn open_append_regular(
+        &self,
+        _path: &Path,
+        _expected_size: u64,
+    ) -> io::Result<Box<dyn RootedWrite>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "append is unsupported by this filesystem adapter",
+        ))
+    }
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn install_staged_create_once(
         &self,
@@ -520,6 +530,36 @@ impl RootedFileSystem for CacheRoot {
         }
         if !metadata.file_type().is_file() {
             return Err(invalid_data("created cache entry is not a regular file"));
+        }
+        Ok(Box::new(file))
+    }
+
+    fn open_append_regular(
+        &self,
+        path: &Path,
+        expected_size: u64,
+    ) -> io::Result<Box<dyn RootedWrite>> {
+        let (parent, name) = self.open_parent_and_name(path, false)?;
+        let metadata = parent.symlink_metadata(&name)?;
+        if is_redirect(&metadata) {
+            return Err(unsafe_cache_path(
+                "cache append target is a link or reparse point",
+            ));
+        }
+        if !metadata.file_type().is_file() || metadata.len() != expected_size {
+            return Err(invalid_data("cache append target identity changed"));
+        }
+        let mut options = OpenOptions::new();
+        options.append(true).follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        options.nonblock(true);
+        let file = parent.open_with(name, &options)?;
+        let opened = file.metadata()?;
+        if is_reparse_point(&opened)
+            || !opened.file_type().is_file()
+            || opened.len() != expected_size
+        {
+            return Err(invalid_data("opened cache append target identity changed"));
         }
         Ok(Box::new(file))
     }

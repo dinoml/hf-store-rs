@@ -165,11 +165,16 @@ pub(crate) async fn stream_validated_body(
     let mut local_hasher = Sha256::new();
     let mut received = 0_u64;
 
-    while let Some(chunk) = body
-        .next_chunk()
-        .await
-        .map_err(HubOperationError::transport)?
-    {
+    loop {
+        let chunk = match body.next_chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(source) => {
+                sink.sync_all()
+                    .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+                return Err(HubOperationError::transport(source));
+            }
+        };
         let chunk_size = u64::try_from(chunk.len())
             .map_err(|_overflow| HubOperationError::validation(transfer_validation_error()))?;
         received = received
@@ -215,6 +220,58 @@ pub(crate) async fn stream_validated_body(
     }
     progress.observe(&ProgressEvent::validated(path.clone(), received));
     Ok(digest)
+}
+
+pub(crate) async fn append_bounded_body(
+    body: &mut dyn TransportBody,
+    sink: &mut dyn PartialSink,
+    path: &RepoPath,
+    initial_size: u64,
+    expected_size: u64,
+    cancellation: &CancellationToken,
+    progress: &dyn ProgressObserver,
+) -> Result<u64, HubOperationError> {
+    let mut received = initial_size;
+    loop {
+        if cancellation.is_cancelled() {
+            sink.sync_all()
+                .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+            return Err(HubOperationError::cancelled());
+        }
+        let chunk = match body.next_chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(source) => {
+                sink.sync_all()
+                    .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+                return Err(HubOperationError::transport(source));
+            }
+        };
+        let count = u64::try_from(chunk.len())
+            .map_err(|_overflow| HubOperationError::validation(transfer_validation_error()))?;
+        received = received
+            .checked_add(count)
+            .ok_or_else(|| HubOperationError::validation(transfer_validation_error()))?;
+        if received > expected_size {
+            return Err(HubOperationError::validation(transfer_validation_error()));
+        }
+        sink.write_all(&chunk)
+            .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+        progress.observe(&ProgressEvent::transfer(
+            path.clone(),
+            received,
+            expected_size,
+        ));
+    }
+    sink.sync_all()
+        .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+    if cancellation.is_cancelled() {
+        return Err(HubOperationError::cancelled());
+    }
+    if received != expected_size {
+        return Err(HubOperationError::validation(transfer_validation_error()));
+    }
+    Ok(received)
 }
 
 fn transfer_validation_error() -> crate::ValidationError {
