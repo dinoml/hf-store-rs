@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
+use clap::error::ErrorKind;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use hf_store::{
     CacheMode, CommitId, Endpoint, FetchOptions, FetchRequest, GcPlan, GcPolicy, HubError,
@@ -150,8 +151,16 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
+            let exit = if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            };
             let _printed = error.print();
-            return ExitCode::from(2);
+            return exit;
         }
     };
     let format = match cli.format {

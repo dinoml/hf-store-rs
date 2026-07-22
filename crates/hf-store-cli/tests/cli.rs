@@ -12,6 +12,17 @@ fn run(arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
 }
 
 #[test]
+fn help_and_version_are_successful_non_mutating_queries() -> Result<(), Box<dyn Error>> {
+    for argument in ["--help", "--version"] {
+        let output = run(&[argument])?;
+        assert!(output.status.success(), "{argument}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hf-store"));
+        assert!(output.stderr.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn json_inspection_and_verification_emit_one_stable_envelope() -> Result<(), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let cache = directory.path().to_string_lossy();
