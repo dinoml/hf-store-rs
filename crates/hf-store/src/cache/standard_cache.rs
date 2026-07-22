@@ -727,9 +727,11 @@ mod tests {
     use std::fs;
     use std::io::{self, Cursor, Read};
     use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Output, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
     use sha1::{Digest as _, Sha1};
@@ -751,8 +753,21 @@ mod tests {
     };
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const RACE_FIRST_COMMIT: &str = "4444444444444444444444444444444444444444";
+    const RACE_SECOND_COMMIT: &str = "5555555555555555555555555555555555555555";
     const CONFIG_BYTES: &[u8] = b"{\"model_type\":\"fixture\"}\n";
     const WEIGHTS_BYTES: &[u8] = b"fixture-weights\n";
+    const CROSS_PROCESS_WRITER_CHILD_TEST: &str =
+        "cache::standard_cache::tests::cross_process_standard_cache_writer_child";
+    const CROSS_PROCESS_WRITER_CHILD_ENV: &str = "HF_STORE_STANDARD_WRITER_CHILD";
+    const CROSS_PROCESS_ROOT_ENV: &str = "HF_STORE_STANDARD_WRITER_ROOT";
+    const CROSS_PROCESS_COMMIT_ENV: &str = "HF_STORE_STANDARD_WRITER_COMMIT";
+    const CROSS_PROCESS_READY_ENV: &str = "HF_STORE_STANDARD_WRITER_READY";
+    const CROSS_PROCESS_GO_ENV: &str = "HF_STORE_STANDARD_WRITER_GO";
+    const CROSS_PROCESS_SOURCE_ENV: &str = "HF_STORE_STANDARD_WRITER_SOURCE";
+    const CROSS_PROCESS_RESULT_ENV: &str = "HF_STORE_STANDARD_WRITER_RESULT";
+    const CROSS_PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
+    const CROSS_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
     const MODEL_COMMIT: &str = "1111111111111111111111111111111111111111";
     const DATASET_COMMIT: &str = "2222222222222222222222222222222222222222";
     const SPACE_COMMIT: &str = "3333333333333333333333333333333333333333";
@@ -1074,6 +1089,141 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(fs::read(fixture.layout()?.blob_path(&key))?, CONFIG_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn competing_processes_publish_complete_shared_cache_snapshots() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let executable = std::env::current_exe()?;
+        let coordination = fixture
+            .directory
+            .path()
+            .join("standard-writer-coordination");
+        fs::create_dir(&coordination)?;
+        let go = coordination.join("go");
+        let commits = [RACE_FIRST_COMMIT, RACE_SECOND_COMMIT];
+        let mut children = Vec::with_capacity(commits.len());
+        let mut ready = Vec::with_capacity(commits.len());
+        let mut sources = Vec::with_capacity(commits.len());
+        let mut results = Vec::with_capacity(commits.len());
+
+        for (index, commit) in commits.iter().enumerate() {
+            let ready_path = coordination.join(format!("writer-{index}.ready"));
+            let source_path = coordination.join(format!("writer-{index}.source"));
+            let result_path = coordination.join(format!("writer-{index}.result"));
+            let child = Command::new(&executable)
+                .arg("--exact")
+                .arg(CROSS_PROCESS_WRITER_CHILD_TEST)
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CROSS_PROCESS_WRITER_CHILD_ENV, "1")
+                .env(CROSS_PROCESS_ROOT_ENV, &fixture.root)
+                .env(CROSS_PROCESS_COMMIT_ENV, commit)
+                .env(CROSS_PROCESS_READY_ENV, &ready_path)
+                .env(CROSS_PROCESS_GO_ENV, &go)
+                .env(CROSS_PROCESS_SOURCE_ENV, &source_path)
+                .env(CROSS_PROCESS_RESULT_ENV, &result_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            children.push(StandardWriterChild::new(child));
+            ready.push(ready_path);
+            sources.push(source_path);
+            results.push(result_path);
+        }
+
+        let ready_deadline = Instant::now() + CROSS_PROCESS_TIMEOUT;
+        wait_for_standard_writer_children_ready(&mut children, &ready, ready_deadline)?;
+        fs::write(&go, b"go")?;
+        let exit_deadline = Instant::now() + CROSS_PROCESS_TIMEOUT;
+        wait_for_standard_writer_children_success(&mut children, exit_deadline)?;
+
+        let source_opens = sources
+            .iter()
+            .map(PathBuf::as_path)
+            .map(Path::try_exists)
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|opened| *opened)
+            .count();
+        assert_eq!(source_opens, 1);
+
+        let mut published_commits = results
+            .iter()
+            .map(fs::read_to_string)
+            .collect::<io::Result<Vec<_>>>()?;
+        published_commits.sort_unstable();
+        assert_eq!(
+            published_commits,
+            commits.map(str::to_owned).into_iter().collect::<Vec<_>>()
+        );
+
+        let path = RepoPath::parse("config.json")?;
+        let revision = Revision::parse("refs/pr/7")?;
+        let layout = fixture.layout()?;
+        let offline = CompatibleCacheOffline::shared(
+            &fixture.root,
+            &fixture.endpoint,
+            &fixture.spec,
+            Fixture::effects(),
+        )?;
+        for commit in commits {
+            let immutable = Revision::parse(commit)?;
+            let snapshot = offline.open(&immutable, std::slice::from_ref(&path))?;
+            assert_eq!(snapshot.commit().as_str(), commit);
+            assert_eq!(snapshot.files().len(), 1);
+            assert_eq!(fs::read(snapshot.files()[0].content_path())?, CONFIG_BYTES);
+        }
+
+        let final_commit = fs::read_to_string(layout.ref_path(&revision)?)?;
+        assert!(commits.contains(&final_commit.as_str()));
+        let active = offline.open(&revision, std::slice::from_ref(&path))?;
+        assert_eq!(active.commit().as_str(), final_commit);
+        assert_eq!(fs::read(active.files()[0].content_path())?, CONFIG_BYTES);
+        assert!(fs::read_dir(layout.staging_directory())?.next().is_none());
+        assert_no_standard_writer_temporary_files(&fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cross_process_standard_cache_writer_child() -> Result<(), Box<dyn Error>> {
+        if std::env::var_os(CROSS_PROCESS_WRITER_CHILD_ENV).is_none() {
+            return Ok(());
+        }
+
+        let root = required_standard_writer_child_path(CROSS_PROCESS_ROOT_ENV)?;
+        let commit = CommitId::parse(std::env::var(CROSS_PROCESS_COMMIT_ENV)?)?;
+        let ready = required_standard_writer_child_path(CROSS_PROCESS_READY_ENV)?;
+        let go = required_standard_writer_child_path(CROSS_PROCESS_GO_ENV)?;
+        let source_marker = required_standard_writer_child_path(CROSS_PROCESS_SOURCE_ENV)?;
+        let result = required_standard_writer_child_path(CROSS_PROCESS_RESULT_ENV)?;
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let path = RepoPath::parse("config.json")?;
+        let tree = HubTree::new([(path.clone(), git_entry(CONFIG_BYTES)?)])?;
+        let writer = StandardCacheWriter::shared_with_materialization(
+            &root,
+            &endpoint,
+            &spec,
+            Fixture::effects(),
+            SnapshotMaterialization::Copy,
+        )?;
+
+        fs::write(&ready, b"ready")?;
+        wait_for_standard_writer_path(&go, Instant::now() + CROSS_PROCESS_TIMEOUT)?;
+        let snapshot = writer.publish(
+            &Revision::parse("refs/pr/7")?,
+            &commit,
+            &tree,
+            std::slice::from_ref(&path),
+            |_source_path| {
+                fs::write(&source_marker, b"opened")?;
+                Ok(Cursor::new(CONFIG_BYTES.to_vec()))
+            },
+        )?;
+        fs::write(result, snapshot.commit().as_str().as_bytes())?;
         Ok(())
     }
 
@@ -1487,7 +1637,7 @@ mod tests {
     }
 
     struct Fixture {
-        _directory: TempDir,
+        directory: TempDir,
         root: std::path::PathBuf,
         endpoint: Endpoint,
         spec: RepositorySpec,
@@ -1716,13 +1866,171 @@ mod tests {
         }
     }
 
+    fn required_standard_writer_child_path(name: &str) -> io::Result<PathBuf> {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::other(format!("child process is missing {name}")))
+    }
+
+    fn wait_for_standard_writer_path(path: &Path, deadline: Instant) -> io::Result<()> {
+        loop {
+            if path.try_exists()? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out waiting for {}", path.display()),
+                ));
+            }
+            thread::sleep(CROSS_PROCESS_POLL_INTERVAL);
+        }
+    }
+
+    fn wait_for_standard_writer_children_ready(
+        children: &mut [StandardWriterChild],
+        ready_paths: &[PathBuf],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        loop {
+            let all_ready = ready_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .map(Path::try_exists)
+                .collect::<io::Result<Vec<_>>>()?
+                .into_iter()
+                .all(|ready| ready);
+            if all_ready {
+                return Ok(());
+            }
+
+            for child in &mut *children {
+                if let Some(status) = child.try_wait()? {
+                    let output = child.finish()?;
+                    return Err(standard_writer_child_failure(
+                        "writer exited before announcing readiness",
+                        status,
+                        &output,
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for cross-process standard-cache writers",
+                ));
+            }
+            thread::sleep(CROSS_PROCESS_POLL_INTERVAL);
+        }
+    }
+
+    fn wait_for_standard_writer_children_success(
+        children: &mut [StandardWriterChild],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        for child in children {
+            let output = child.wait_until(deadline)?;
+            if !output.status.success() {
+                return Err(standard_writer_child_failure(
+                    "cross-process standard-cache writer failed",
+                    output.status,
+                    &output,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn standard_writer_child_failure(
+        context: &str,
+        status: std::process::ExitStatus,
+        output: &Output,
+    ) -> io::Error {
+        io::Error::other(format!(
+            "{context} with {status}; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    fn assert_no_standard_writer_temporary_files(root: &Path) -> io::Result<()> {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(".hf-store-") && name.ends_with(".tmp") {
+                    return Err(io::Error::other(format!(
+                        "standard-cache writer left temporary file {}",
+                        entry.path().display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    struct StandardWriterChild {
+        child: Option<Child>,
+    }
+
+    impl StandardWriterChild {
+        const fn new(child: Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+            self.child
+                .as_mut()
+                .ok_or_else(|| io::Error::other("standard-cache writer was already reaped"))?
+                .try_wait()
+        }
+
+        fn finish(&mut self) -> io::Result<Output> {
+            self.child
+                .take()
+                .ok_or_else(|| io::Error::other("standard-cache writer was already reaped"))?
+                .wait_with_output()
+        }
+
+        fn wait_until(&mut self, deadline: Instant) -> io::Result<Output> {
+            loop {
+                if self.try_wait()?.is_some() {
+                    return self.finish();
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for a standard-cache writer to exit",
+                    ));
+                }
+                thread::sleep(CROSS_PROCESS_POLL_INTERVAL);
+            }
+        }
+    }
+
+    impl Drop for StandardWriterChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _kill_result = child.kill();
+                let _wait_result = child.wait();
+            }
+        }
+    }
+
     impl Fixture {
         fn new() -> Result<Self, Box<dyn Error>> {
             let directory = TempDir::new()?;
             let root = directory.path().join("hub");
             fs::create_dir(&root)?;
             Ok(Self {
-                _directory: directory,
+                directory,
                 root,
                 endpoint: Endpoint::hugging_face(),
                 spec: RepositorySpec::model(RepositoryId::parse("org/repo")?),
