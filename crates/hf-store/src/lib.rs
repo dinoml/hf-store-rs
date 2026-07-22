@@ -19,6 +19,11 @@ mod auth;
 )]
 mod cache;
 mod endpoint;
+#[allow(
+    dead_code,
+    reason = "private operation errors precede the first public HubStore request API"
+)]
+mod error;
 mod repo;
 mod repo_path;
 mod revision;
