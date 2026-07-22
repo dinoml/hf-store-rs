@@ -14,12 +14,13 @@ publish = false
 
 [features]
 default = ["network"]
-network = ["dep:reqwest", "dep:tokio"]
+network = ["dep:futures-util", "dep:reqwest", "dep:tokio"]
 
 [dependencies]
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 fs4.workspace = true
+futures-util = { workspace = true, optional = true }
 getrandom.workspace = true
 reqwest = { workspace = true, optional = true }
 serde.workspace = true

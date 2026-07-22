@@ -12,6 +12,65 @@ use crate::progress::{ProgressEvent, ProgressObserver};
 use crate::transport::TransportBody;
 use crate::{CancellationToken, RepoPath};
 
+#[cfg(feature = "network")]
+pub(crate) type ScheduledFuture<T> =
+    Pin<Box<dyn Future<Output = Result<T, HubOperationError>> + Send + 'static>>;
+#[cfg(feature = "network")]
+type IndexedScheduledFuture<T> =
+    Pin<Box<dyn Future<Output = (usize, Result<T, HubOperationError>)> + Send>>;
+
+#[cfg(feature = "network")]
+pub(crate) async fn run_bounded<T: Send + 'static>(
+    concurrency: usize,
+    jobs: impl IntoIterator<Item = ScheduledFuture<T>>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<T>, HubOperationError> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    if concurrency == 0 {
+        return Err(HubOperationError::protocol());
+    }
+    let mut waiting = jobs.into_iter().enumerate();
+    let mut active: FuturesUnordered<IndexedScheduledFuture<T>> = FuturesUnordered::new();
+    let mut results = Vec::new();
+    let mut first_error = None;
+
+    while active.len() < concurrency && !cancellation.is_cancelled() {
+        let Some((index, job)) = waiting.next() else {
+            break;
+        };
+        active.push(Box::pin(async move { (index, job.await) }));
+    }
+    if cancellation.is_cancelled() {
+        return Err(HubOperationError::cancelled());
+    }
+
+    while let Some((index, result)) = active.next().await {
+        match result {
+            Ok(value) if first_error.is_none() => results.push((index, value)),
+            Ok(_value) => {}
+            Err(error) if first_error.is_none() => {
+                cancellation.cancel();
+                first_error = Some(error);
+            }
+            Err(_error) => {}
+        }
+        if first_error.is_none() && !cancellation.is_cancelled() {
+            if let Some((next_index, job)) = waiting.next() {
+                active.push(Box::pin(async move { (next_index, job.await) }));
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if cancellation.is_cancelled() {
+        return Err(HubOperationError::cancelled());
+    }
+    results.sort_unstable_by_key(|(index, _value)| *index);
+    Ok(results.into_iter().map(|(_index, value)| value).collect())
+}
+
 pub(crate) type RetryFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub(crate) trait RetryClock: Debug + Send + Sync {
@@ -487,6 +546,79 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "network")]
+    #[test]
+    fn bounded_scheduler_limits_overlap_preserves_order_and_joins_every_job()
+    -> Result<(), HubOperationError> {
+        use std::sync::atomic::AtomicUsize;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let jobs = (0..6)
+            .map(|value| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                let completed = Arc::clone(&completed);
+                Box::pin(async move {
+                    let mut first_poll = true;
+                    std::future::poll_fn(move |context| {
+                        if first_poll {
+                            first_poll = false;
+                            let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                            maximum.fetch_max(now, Ordering::AcqRel);
+                            context.waker().wake_by_ref();
+                            Poll::Pending
+                        } else {
+                            active.fetch_sub(1, Ordering::AcqRel);
+                            completed.fetch_add(1, Ordering::AcqRel);
+                            Poll::Ready(Ok(value))
+                        }
+                    })
+                    .await
+                }) as ScheduledFuture<_>
+            })
+            .collect::<Vec<_>>();
+        let result = run_polled(run_bounded(2, jobs, &CancellationToken::new()))?;
+        assert_eq!(result, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(maximum.load(Ordering::Acquire), 2);
+        assert_eq!(completed.load(Ordering::Acquire), 6);
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn scheduler_cancels_and_drains_active_work_after_the_first_failure() {
+        use std::sync::atomic::AtomicUsize;
+
+        let cancellation = CancellationToken::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+        let jobs = (0..3)
+            .map(|index| {
+                let drained = Arc::clone(&drained);
+                Box::pin(async move {
+                    std::future::poll_fn(move |context| {
+                        if index == 0 {
+                            Poll::Ready(Err(HubOperationError::transport(
+                                TransportError::connection(),
+                            )))
+                        } else {
+                            drained.fetch_add(1, Ordering::AcqRel);
+                            context.waker().wake_by_ref();
+                            Poll::Ready(Ok(index))
+                        }
+                    })
+                    .await
+                }) as ScheduledFuture<_>
+            })
+            .collect::<Vec<_>>();
+        let error = run_polled(run_bounded(3, jobs, &cancellation))
+            .expect_err("scheduler ignored a job failure");
+        assert!(error.is_transport());
+        assert!(cancellation.is_cancelled());
+        assert_eq!(drained.load(Ordering::Acquire), 2);
+    }
+
     #[test]
     fn streamed_git_and_lfs_content_is_bounded_hashed_and_synced()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -583,5 +715,18 @@ mod tests {
             Poll::Ready(value) => value,
             Poll::Pending => panic!("future unexpectedly remained pending"),
         }
+    }
+
+    #[cfg(feature = "network")]
+    fn run_polled<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        for _poll in 0..100 {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+        panic!("test future did not complete")
     }
 }
