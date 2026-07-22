@@ -353,14 +353,26 @@ impl CacheRecord for HubBlobBindingRecord {
 pub(super) struct RemoteFileRecord {
     path: String,
     size: u64,
+    blob_id: String,
+    lfs_sha256: Option<String>,
+    lfs_size: Option<u64>,
+    xet_hash: Option<String>,
     hub_blob_key: Option<String>,
 }
 
 impl RemoteFileRecord {
-    pub(super) fn new(path: &RepoPath, size: u64, hub_blob_key: Option<HubBlobKey>) -> Self {
+    pub(super) fn new(
+        path: &RepoPath,
+        entry: &crate::cache::HubTreeEntry,
+        hub_blob_key: Option<HubBlobKey>,
+    ) -> Self {
         Self {
             path: path.as_str().to_owned(),
-            size,
+            size: entry.size(),
+            blob_id: entry.blob_id().to_owned(),
+            lfs_sha256: entry.lfs_sha256().map(str::to_owned),
+            lfs_size: entry.lfs_size(),
+            xet_hash: entry.xet_hash().map(str::to_owned),
             hub_blob_key: hub_blob_key.map(|key| key.as_str().to_owned()),
         }
     }
@@ -369,8 +381,28 @@ impl RemoteFileRecord {
         &self.path
     }
 
+    pub(super) fn entry(&self) -> Result<crate::cache::HubTreeEntry, ValidationError> {
+        let mut entry = crate::cache::HubTreeEntry::new(self.size, &self.blob_id)
+            .map_err(|_error| record_malformed("remote tree file"))?;
+        if let (Some(digest), Some(size)) = (&self.lfs_sha256, self.lfs_size) {
+            entry = entry
+                .with_lfs(digest, size)
+                .map_err(|_error| record_malformed("remote tree file"))?;
+        }
+        if let Some(hash) = &self.xet_hash {
+            entry = entry
+                .with_xet(hash)
+                .map_err(|_error| record_malformed("remote tree file"))?;
+        }
+        Ok(entry)
+    }
+
     fn validate(&self) -> Result<RepoPath, ValidationError> {
         let path = RepoPath::parse(&self.path)?;
+        let _entry = self.entry()?;
+        if self.lfs_sha256.is_some() != self.lfs_size.is_some() {
+            return Err(record_malformed("remote tree file"));
+        }
         validate_optional_hub_blob_key(self.hub_blob_key.as_deref())?;
         Ok(path)
     }
@@ -398,6 +430,36 @@ impl RemoteTreeRecord {
 
     pub(super) fn files(&self) -> &[RemoteFileRecord] {
         &self.files
+    }
+
+    pub(super) fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub(super) fn from_tree(
+        commit: &CommitId,
+        tree: &crate::cache::HubTree,
+    ) -> Result<Self, ValidationError> {
+        let files = tree
+            .files()
+            .iter()
+            .map(|(path, entry)| {
+                let key = super::hub_cache::compatible_blob_key(entry)
+                    .map_err(|_error| record_malformed("remote tree file"))?;
+                Ok(RemoteFileRecord::new(path, entry, Some(key)))
+            })
+            .collect::<Result<Vec<_>, ValidationError>>()?;
+        Self::new(commit, files)
+    }
+
+    pub(super) fn tree(&self) -> Result<crate::cache::HubTree, ValidationError> {
+        crate::cache::HubTree::new(
+            self.files
+                .iter()
+                .map(|file| Ok((RepoPath::parse(file.path())?, file.entry()?)))
+                .collect::<Result<Vec<_>, ValidationError>>()?,
+        )
+        .map_err(|_error| record_malformed("remote tree"))
     }
 }
 
@@ -1022,9 +1084,14 @@ mod tests {
         assert_round_trip(&RefRecord::new(&revision, &commit))?;
         assert_round_trip(&BlobRecord::new(&digest, 7, Some(&hub_blob)))?;
         assert_round_trip(&HubBlobBindingRecord::new(&hub_blob, digest, 7))?;
+        let tree_entry = crate::cache::HubTreeEntry::new(7, "tree-blob-id")?;
         assert_round_trip(&RemoteTreeRecord::new(
             &commit,
-            vec![RemoteFileRecord::new(&path, 7, Some(hub_blob.clone()))],
+            vec![RemoteFileRecord::new(
+                &path,
+                &tree_entry,
+                Some(hub_blob.clone()),
+            )],
         )?)?;
         assert_round_trip(&PartialTransferRecord::new(
             &origin_key,
@@ -1210,12 +1277,14 @@ mod tests {
         let second = RepoPath::parse("z.bin")?;
         let digest = BlobDigest::for_bytes(b"payload");
         let selection = SelectionId::derive(&[second.clone(), first.clone()])?;
+        let first_entry = crate::cache::HubTreeEntry::new(1, "first-blob-id")?;
+        let second_entry = crate::cache::HubTreeEntry::new(2, "second-blob-id")?;
 
         let tree = RemoteTreeRecord::new(
             &commit,
             vec![
-                RemoteFileRecord::new(&second, 2, None),
-                RemoteFileRecord::new(&first, 1, None),
+                RemoteFileRecord::new(&second, &second_entry, None),
+                RemoteFileRecord::new(&first, &first_entry, None),
             ],
         )?;
         let manifest = SnapshotManifestRecord::new(

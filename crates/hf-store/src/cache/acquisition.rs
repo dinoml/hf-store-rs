@@ -12,7 +12,6 @@ use crate::progress::ProgressObserver;
 use crate::transfer::{RetryPolicy, TokioRetryClock};
 use crate::{CancellationToken, CommitId, Endpoint, FetchPlan, RepoPath, RepositorySpec, Revision};
 
-use super::CacheView;
 use super::compatible_cache::{CompatibleCacheError, CompatibleCacheOffline, CompatibleSnapshot};
 use super::hub_cache::HubSnapshotFileForm;
 use super::key::{BlobDigest, SelectionId};
@@ -20,14 +19,16 @@ use super::local_dir_completion::{LocalDirOfflineError, LocalDirOfflineReader};
 use super::local_dir_layout::HubLocalDirLayout;
 use super::local_dir_materialization::{ExistingFilePolicy, LocalDirFileTarget};
 use super::local_dir_reconciliation::{
-    LocalDirReconciler, LocalDirReconciliationOutcome, LocalDirReconciliationPlan,
-    OwnedBlobCandidates, ThreadYieldWait,
+    LocalDirCandidateSet, LocalDirReconciler, LocalDirReconciliationOutcome,
+    LocalDirReconciliationPlan, LocalDirSourceError, OwnedBlobCandidates, PreparedLocalDirSource,
+    ThreadYieldWait,
 };
 use super::publication::{
     CacheError, CacheKernel, Effects, OwnedSnapshotFile, OwnedSnapshotRead, SnapshotLease,
 };
-use super::rooted_fs::{CacheRoot, RootedFileSystem};
+use super::rooted_fs::{CacheRoot, RootedFileSystem, RootedRegularFile};
 use super::standard_cache::StandardCacheWriter;
+use super::{CacheView, RepositoryFilter};
 
 #[derive(Clone, Debug)]
 pub(crate) struct AcquisitionCache {
@@ -229,6 +230,9 @@ impl AcquisitionCache {
         plan: &FetchPlan,
         digests: &BTreeMap<RepoPath, BlobDigest>,
     ) -> Result<AcquiredSnapshot, HubOperationError> {
+        self.transfer
+            .publish_remote_tree(plan.commit(), plan.tree())
+            .map_err(map_cache_error)?;
         let files = plan
             .files()
             .iter()
@@ -315,6 +319,37 @@ enum OfflineBackend {
 }
 
 impl OfflineCache {
+    pub(crate) fn plan(
+        &self,
+        endpoint: &Endpoint,
+        repository: &RepositorySpec,
+        revision: &Revision,
+        filter: &RepositoryFilter,
+    ) -> Result<FetchPlan, HubOperationError> {
+        let (commit, tree) = match &self.backend {
+            OfflineBackend::Owned(cache) => {
+                let commit = match CommitId::parse(revision.as_str()) {
+                    Ok(commit) => commit,
+                    Err(_symbolic) => cache.read_ref(revision).map_err(map_cache_error)?,
+                };
+                let tree = cache.read_remote_tree(&commit).map_err(map_cache_error)?;
+                (commit, tree)
+            }
+            OfflineBackend::Compatible(cache) => {
+                cache.cached_tree(revision).map_err(map_compatible_error)?
+            }
+        };
+        FetchPlan::build(
+            endpoint.clone(),
+            repository.clone(),
+            revision.clone(),
+            commit,
+            &tree,
+            filter,
+        )
+        .map_err(HubOperationError::validation)
+    }
+
     pub(crate) fn plan_partial_gc(
         &self,
         now_unix_millis: u64,
@@ -513,6 +548,75 @@ impl OfflineCache {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "offline local-dir reconciliation keeps every identity and policy explicit"
+    )]
+    pub(crate) fn materialize_local_dir(
+        cache_root: &Path,
+        endpoint: &Endpoint,
+        repository: &RepositorySpec,
+        plan: &FetchPlan,
+        snapshot: &AcquiredSnapshot,
+        destination: &Path,
+        replace_existing: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<MaterializedLocalDir, HubOperationError> {
+        std::fs::create_dir_all(destination)
+            .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+        let layout = HubLocalDirLayout::new(destination, endpoint, repository)
+            .map_err(HubOperationError::validation)?;
+        let destination_root: Arc<dyn RootedFileSystem> = Arc::new(
+            CacheRoot::open(destination)
+                .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?,
+        );
+        let targets = plan
+            .files()
+            .iter()
+            .map(|file| {
+                let digest = snapshot
+                    .files()
+                    .iter()
+                    .find(|cached| cached.path() == file.path())
+                    .map(AcquiredSnapshotFile::digest)
+                    .ok_or_else(|| HubOperationError::cache(CacheFailure::Incomplete))?;
+                Ok(LocalDirFileTarget::new(
+                    file.path().clone(),
+                    file.entry().clone(),
+                    digest,
+                ))
+            })
+            .collect::<Result<Vec<_>, HubOperationError>>()?;
+        let reconciliation = LocalDirReconciliationPlan::new(
+            layout.clone(),
+            plan.commit().clone(),
+            plan.selection(),
+            targets,
+        )
+        .map_err(map_local_dir_error)?;
+        let reconciler = LocalDirReconciler::new(
+            destination_root,
+            Effects::production(),
+            Arc::new(ThreadYieldWait),
+        );
+        let mut candidates = SnapshotCandidates::new(cache_root, snapshot)?;
+        let policy = if replace_existing {
+            ExistingFilePolicy::ReplaceRegularFile
+        } else {
+            ExistingFilePolicy::Reject
+        };
+        let report = match reconciler
+            .reconcile(&reconciliation, &mut candidates, policy, cancellation)
+            .map_err(map_local_dir_error)?
+        {
+            LocalDirReconciliationOutcome::Reconciled(report) => report,
+            LocalDirReconciliationOutcome::NeedsTransport(_demand) => {
+                return Err(HubOperationError::cache(CacheFailure::Incomplete));
+            }
+        };
+        materialized_report(destination, &layout, &report)
+    }
+
     pub(crate) fn open_local_dir(
         root: &Path,
         endpoint: &Endpoint,
@@ -641,6 +745,10 @@ impl From<CompatibleSnapshot> for AcquiredSnapshot {
             .map(|file| AcquiredSnapshotFile {
                 path: file.path().clone(),
                 content_path: file.content_path().to_path_buf(),
+                materialization_path: file
+                    .blob_path()
+                    .unwrap_or_else(|| file.content_path())
+                    .to_path_buf(),
                 digest: file.digest(),
                 size: file.size(),
                 form: match file.form() {
@@ -668,6 +776,7 @@ impl From<CompatibleSnapshot> for AcquiredSnapshot {
 pub(crate) struct AcquiredSnapshotFile {
     path: RepoPath,
     content_path: PathBuf,
+    materialization_path: PathBuf,
     digest: BlobDigest,
     size: u64,
     form: AcquiredSnapshotFileForm,
@@ -702,11 +811,114 @@ impl From<OwnedSnapshotFile> for AcquiredSnapshotFile {
         Self {
             path: file.path().clone(),
             content_path: file.content_path().to_path_buf(),
+            materialization_path: file.content_path().to_path_buf(),
             digest: file.digest(),
             size: file.size(),
             form: AcquiredSnapshotFileForm::Owned,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct SnapshotCandidates {
+    root: Arc<dyn RootedFileSystem>,
+    mode: crate::CacheMode,
+    files: BTreeMap<RepoPath, (PathBuf, BlobDigest, u64)>,
+    _lease: Arc<SnapshotLease>,
+}
+
+impl SnapshotCandidates {
+    fn new(cache_root: &Path, snapshot: &AcquiredSnapshot) -> Result<Self, HubOperationError> {
+        let root: Arc<dyn RootedFileSystem> = Arc::new(
+            CacheRoot::open(cache_root)
+                .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?,
+        );
+        let files = snapshot
+            .files()
+            .iter()
+            .map(|file| {
+                Ok((
+                    file.path().clone(),
+                    (
+                        file.materialization_path
+                            .strip_prefix(cache_root)
+                            .map_err(|_outside| HubOperationError::cache(CacheFailure::Corrupt))?
+                            .to_path_buf(),
+                        file.digest(),
+                        file.size(),
+                    ),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, HubOperationError>>()?;
+        Ok(Self {
+            root,
+            mode: snapshot.mode(),
+            files,
+            _lease: Arc::clone(&snapshot.lease),
+        })
+    }
+}
+
+impl LocalDirCandidateSet for SnapshotCandidates {
+    fn prepare_local(
+        &mut self,
+        target: &LocalDirFileTarget,
+        _cancellation: &dyn super::local_dir_materialization::Cancellation,
+    ) -> Result<Option<PreparedLocalDirSource>, LocalDirSourceError> {
+        let Some((path, digest, size)) = self.files.get(target.path()) else {
+            return Ok(None);
+        };
+        if *digest != target.digest() || *size != target.entry().size() {
+            return Ok(None);
+        }
+        let RootedRegularFile::File {
+            reader,
+            size: actual_size,
+            ..
+        } = self
+            .root
+            .open_regular(path)
+            .map_err(|error| LocalDirSourceError::io(&error))?
+        else {
+            return Ok(None);
+        };
+        if actual_size != *size {
+            return Ok(None);
+        }
+        let prepared = if self.mode == crate::CacheMode::Compatible {
+            PreparedLocalDirSource::compatible_cache(reader)
+        } else {
+            PreparedLocalDirSource::owned_cache(reader)
+        };
+        Ok(Some(prepared))
+    }
+}
+
+fn materialized_report(
+    root: &Path,
+    layout: &HubLocalDirLayout,
+    report: &super::local_dir_reconciliation::LocalDirReconciliationReport,
+) -> Result<MaterializedLocalDir, HubOperationError> {
+    let files = report
+        .files()
+        .iter()
+        .map(|file| {
+            Ok(MaterializedLocalDirFile {
+                path: file.path().clone(),
+                local_path: layout
+                    .file_path(file.path())
+                    .map_err(HubOperationError::validation)?,
+                digest: file.digest(),
+                size: file.size(),
+            })
+        })
+        .collect::<Result<Vec<_>, HubOperationError>>()?;
+    Ok(MaterializedLocalDir {
+        root: root.to_path_buf(),
+        commit: report.commit().clone(),
+        selection: *report.selection_id(),
+        files: files.into_boxed_slice(),
+    })
 }
 
 impl AcquiredSnapshotFile {

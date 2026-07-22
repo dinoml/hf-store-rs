@@ -107,6 +107,14 @@ pub(super) struct CompatibleCacheOffline {
 }
 
 impl CompatibleCacheOffline {
+    pub(super) fn cached_tree(
+        &self,
+        revision: &Revision,
+    ) -> Result<(CommitId, crate::cache::HubTree), CompatibleCacheError> {
+        let index = self.reader.read_index(revision)?;
+        Ok((index.commit().clone(), index.tree().clone()))
+    }
+
     pub(super) fn inventory_entries(
         &self,
     ) -> Result<Vec<super::publication::CacheInventoryEntry>, CompatibleCacheError> {

@@ -206,30 +206,36 @@ fn execute_fetch(
         ));
     }
     if args.offline {
-        if args.paths.is_empty() {
+        if !args.paths.is_empty()
+            && (!args.allow_patterns.is_empty() || !args.ignore_patterns.is_empty())
+        {
             return Err(CommandFailure::usage(
-                "strict offline fetch requires one or more exact --path values",
+                "exact offline --path values cannot be combined with filters",
             ));
         }
-        if !args.allow_patterns.is_empty() || !args.ignore_patterns.is_empty() {
-            return Err(CommandFailure::usage(
-                "offline fetch uses exact --path values, not remote tree filters",
-            ));
-        }
-        let paths = parse_paths(&args.paths)?;
         let store = OfflineStore::new(&cache.directory)
             .endpoint(endpoint)
             .cache_mode(cache.mode);
+        let mut request =
+            FetchRequest::new(repository, revision).ignore_patterns(args.ignore_patterns);
+        if !args.paths.is_empty() {
+            request = request.allow_patterns(args.paths);
+        } else if !args.allow_patterns.is_empty() {
+            request = request.allow_patterns(args.allow_patterns);
+        }
         if let Some(local_dir) = args.local_dir {
-            let commit = CommitId::parse(revision.as_str())
-                .map_err(|_error| CommandFailure::usage("offline local-dir requires a commit"))?;
             let local = store
-                .open_local_dir(&local_dir, &repository, &commit, &paths)
+                .materialize_request_to_local_dir(
+                    &request,
+                    &local_dir,
+                    args.force,
+                    &hf_store::CancellationToken::new(),
+                )
                 .map_err(|error| CommandFailure::operation("fetch", error))?;
             return Ok(local_directory_outcome(&local));
         }
         let snapshot = store
-            .open(&repository, &revision, &paths)
+            .open_request(&request)
             .map_err(|error| CommandFailure::operation("fetch", error))?;
         return Ok(snapshot_outcome(&snapshot));
     }

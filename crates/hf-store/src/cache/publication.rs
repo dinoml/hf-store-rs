@@ -24,7 +24,8 @@ use super::layout::CacheLayout;
 use super::metadata::{
     CacheRecord, FormatRecord, GcTombstoneKind, GcTombstoneRecord, HubBlobBindingRecord,
     MetadataError, OriginRecord, PartialGcTombstoneRecord, PartialTransferRecord, RefRecord,
-    RepositoryRecord, SnapshotFileRecord, SnapshotManifestRecord, decode_record, encode_record,
+    RemoteTreeRecord, RepositoryRecord, SnapshotFileRecord, SnapshotManifestRecord, decode_record,
+    encode_record,
 };
 #[cfg(test)]
 use super::rooted_fs::RootedRead;
@@ -1952,6 +1953,32 @@ impl CacheKernel {
             return Err(CacheError::conflicting_record());
         }
         self.replace_record(&destination, &RefRecord::new(revision, commit))
+    }
+
+    pub(super) fn publish_remote_tree(
+        &self,
+        commit: &CommitId,
+        tree: &crate::cache::HubTree,
+    ) -> Result<(), CacheError> {
+        let record = RemoteTreeRecord::from_tree(commit, tree)?;
+        self.publish_immutable_record(
+            &self.layout.tree_record(commit),
+            &self.layout.tree_lock(commit),
+            &record,
+            MAX_MANIFEST_RECORD_BYTES,
+        )
+    }
+
+    pub(super) fn read_remote_tree(
+        &self,
+        commit: &CommitId,
+    ) -> Result<crate::cache::HubTree, CacheError> {
+        let record: RemoteTreeRecord =
+            self.read_record(&self.layout.tree_record(commit), MAX_MANIFEST_RECORD_BYTES)?;
+        if record.commit() != commit.as_str() {
+            return Err(CacheError::conflicting_record());
+        }
+        record.tree().map_err(Into::into)
     }
 
     pub(super) fn read_ref(&self, revision: &Revision) -> Result<CommitId, CacheError> {

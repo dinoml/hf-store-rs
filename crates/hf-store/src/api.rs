@@ -580,6 +580,108 @@ impl OfflineStore {
         ))
     }
 
+    /// Resolves filters from a cached commit-bound tree and reopens the exact selection.
+    ///
+    /// This is the transport-free counterpart to [`HubStore::fetch`]. Mutable
+    /// revisions, repository trees, and selected content must already be
+    /// complete in the chosen cache view. Request authentication is neither
+    /// inspected nor used.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified offline miss or validation failure without
+    /// constructing a transport, TLS configuration, or async runtime.
+    pub fn open_request(&self, request: &FetchRequest) -> Result<Snapshot, HubOperationError> {
+        let cache = OfflineCache::shared(
+            &self.cache_root,
+            &self.endpoint,
+            request.repository(),
+            self.cache_mode.view(),
+        )?;
+        let plan = cache.plan(
+            &self.endpoint,
+            request.repository(),
+            request.revision(),
+            &request.filter(),
+        )?;
+        let paths = plan
+            .files()
+            .iter()
+            .map(|file| file.path().clone())
+            .collect::<Vec<_>>();
+        let immutable =
+            Revision::parse(plan.commit().as_str()).map_err(HubOperationError::validation)?;
+        let acquired = cache.open(&immutable, &paths)?;
+        if acquired.commit() != plan.commit() {
+            return Err(HubOperationError::cache(
+                crate::error::CacheFailure::Corrupt,
+            ));
+        }
+        Ok(Snapshot::from_acquired(
+            self.endpoint.clone(),
+            request.repository().clone(),
+            request.revision().clone(),
+            &acquired,
+            true,
+        ))
+    }
+
+    /// Materializes a cached request into an explicit caller-owned local directory.
+    ///
+    /// Cached tree metadata determines the exact filtered selection. Validated
+    /// snapshot bytes are independently copied under the local-directory
+    /// completion contract; no transport capability is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified offline miss, validation, conflict, cancellation,
+    /// or local I/O error. `replace_existing` applies only to conflicting
+    /// selected regular files.
+    pub fn materialize_request_to_local_dir(
+        &self,
+        request: &FetchRequest,
+        destination: impl AsRef<Path>,
+        replace_existing: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<LocalDirectory, HubOperationError> {
+        let cache = OfflineCache::shared(
+            &self.cache_root,
+            &self.endpoint,
+            request.repository(),
+            self.cache_mode.view(),
+        )?;
+        let plan = cache.plan(
+            &self.endpoint,
+            request.repository(),
+            request.revision(),
+            &request.filter(),
+        )?;
+        let immutable =
+            Revision::parse(plan.commit().as_str()).map_err(HubOperationError::validation)?;
+        let paths = plan
+            .files()
+            .iter()
+            .map(|file| file.path().clone())
+            .collect::<Vec<_>>();
+        let acquired = cache.open(&immutable, &paths)?;
+        let materialized = OfflineCache::materialize_local_dir(
+            &self.cache_root,
+            &self.endpoint,
+            request.repository(),
+            &plan,
+            &acquired,
+            destination.as_ref(),
+            replace_existing,
+            cancellation,
+        )?;
+        Ok(LocalDirectory::from_materialized(
+            self.endpoint.clone(),
+            request.repository().clone(),
+            request.revision().clone(),
+            materialized,
+        ))
+    }
+
     /// Inspects one exact selection without networking or cache mutation.
     #[must_use]
     pub fn inspect(
@@ -934,6 +1036,27 @@ mod tests {
         )?;
         assert!(offline_snapshot.was_reused());
         assert_eq!(offline_snapshot.commit(), first.commit());
+        let offline_request =
+            FetchRequest::new(first.repository().clone(), Revision::parse("main")?)
+                .allow_patterns(["*.bin"]);
+        let selected_from_cached_tree = offline.open_request(&offline_request)?;
+        assert_eq!(selected_from_cached_tree.files().len(), 1);
+        assert_eq!(selected_from_cached_tree.files()[0].path(), &path);
+        let offline_local_root = directory.path().join("offline-local-dir");
+        let offline_local = offline.materialize_request_to_local_dir(
+            &offline_request,
+            &offline_local_root,
+            false,
+            &CancellationToken::new(),
+        )?;
+        assert_eq!(offline_local.root(), offline_local_root);
+        assert_eq!(offline_local.commit(), first.commit());
+        assert_eq!(offline_local.files().len(), 1);
+        assert_eq!(std::fs::read(offline_local.files()[0].local_path())?, bytes);
+        assert_ne!(
+            offline_local.files()[0].local_path(),
+            selected_from_cached_tree.files()[0].local_path()
+        );
         let inspection = offline.inspect(
             first.repository(),
             &Revision::parse("main")?,

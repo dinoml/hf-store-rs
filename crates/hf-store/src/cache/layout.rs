@@ -117,6 +117,19 @@ impl CacheLayout {
             .join(format!("{key}.json")))
     }
 
+    pub(super) fn tree_record(&self, commit: &CommitId) -> PathBuf {
+        self.repository_directory()
+            .join("trees")
+            .join(format!("{commit}.json"))
+    }
+
+    pub(super) fn tree_lock(&self, commit: &CommitId) -> PathBuf {
+        self.repository_directory()
+            .join("locks")
+            .join("trees")
+            .join(format!("{commit}.lock"))
+    }
+
     pub(super) fn blob_path(&self, digest: &BlobDigest) -> PathBuf {
         let digest = digest.to_string();
         let (prefix, suffix) = digest.split_at(2);
