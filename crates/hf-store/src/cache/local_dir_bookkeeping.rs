@@ -328,8 +328,8 @@ mod tests {
     use crate::cache::local_dir_layout::HubLocalDirLayout;
     use crate::cache::publication::{CacheAuthority, FileSystem, OsFileSystem};
     use crate::cache::rooted_fs::{
-        CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockGuard,
-        RootedRead, RootedRegularFile, RootedWrite, StagingName,
+        CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockAttempt,
+        RootedLockGuard, RootedRead, RootedRegularFile, RootedWrite, StagingName,
     };
     use crate::{CommitId, Endpoint, RepoPath, RepositoryId, RepositorySpec};
 
@@ -1019,6 +1019,29 @@ mod tests {
             }))
         }
 
+        fn try_lock_exclusive(&self, path: &Path) -> io::Result<RootedLockAttempt> {
+            if path != self.expected_lock {
+                return Err(io::Error::other(
+                    "reader used the wrong local-dir lock path",
+                ));
+            }
+            match self.inner.try_lock_exclusive(path)? {
+                RootedLockAttempt::Acquired(guard) => {
+                    *self
+                        .lock_path
+                        .lock()
+                        .map_err(|_poisoned| io::Error::other("lock probe mutex poisoned"))? =
+                        Some(path.to_path_buf());
+                    self.lock_active.store(true, Ordering::Release);
+                    Ok(RootedLockAttempt::Acquired(Box::new(LockProbeGuard {
+                        _inner: guard,
+                        active: Arc::clone(&self.lock_active),
+                    })))
+                }
+                RootedLockAttempt::Contended => Ok(RootedLockAttempt::Contended),
+            }
+        }
+
         fn sync_directory(&self, path: &Path) -> io::Result<()> {
             self.inner.sync_directory(path)
         }
@@ -1115,6 +1138,10 @@ mod tests {
 
         fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
             self.inner.lock_exclusive(path)
+        }
+
+        fn try_lock_exclusive(&self, path: &Path) -> io::Result<RootedLockAttempt> {
+            self.inner.try_lock_exclusive(path)
         }
 
         fn sync_directory(&self, path: &Path) -> io::Result<()> {

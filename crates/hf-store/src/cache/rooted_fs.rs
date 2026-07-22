@@ -137,6 +137,12 @@ impl RootedWrite for cap_std::fs::File {
 
 pub(super) trait RootedLockGuard: fmt::Debug + Send {}
 
+#[derive(Debug)]
+pub(super) enum RootedLockAttempt {
+    Acquired(Box<dyn RootedLockGuard>),
+    Contended,
+}
+
 pub(super) enum RootedRegularFile {
     File {
         reader: Box<dyn Read + Send>,
@@ -291,6 +297,12 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         staging_path: &Path,
     ) -> io::Result<()>;
     fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>>;
+    fn try_lock_exclusive(&self, _path: &Path) -> io::Result<RootedLockAttempt> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "nonblocking rooted locks are unsupported by this filesystem adapter",
+        ))
+    }
     fn sync_directory(&self, path: &Path) -> io::Result<()>;
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
 }
@@ -360,6 +372,39 @@ impl CacheRoot {
             self.open_dir_chain(parent)?
         };
         Ok((directory, PathBuf::from(name)))
+    }
+
+    fn open_lock_file(&self, path: &Path) -> io::Result<File> {
+        let (parent, name) = self.open_parent_and_name(path, true)?;
+        match parent.symlink_metadata(&name) {
+            Ok(metadata) if is_redirect(&metadata) => {
+                return Err(unsafe_cache_path("cache lock is a link or reparse point"));
+            }
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(invalid_data("cache lock entry is not a regular file"));
+            }
+            Ok(_metadata) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut options = OpenOptions::new();
+        options
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .follow(FollowSymlinks::No);
+        #[cfg(windows)]
+        options.share_mode(WINDOWS_LOCK_SHARE_READ_WRITE);
+        let file = parent.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        if is_reparse_point(&metadata) {
+            return Err(unsafe_cache_path("opened cache lock is a reparse point"));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(invalid_data("cache lock entry is not a regular file"));
+        }
+        Ok(file.into_std())
     }
 }
 
@@ -607,38 +652,20 @@ impl RootedFileSystem for CacheRoot {
     }
 
     fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
-        let (parent, name) = self.open_parent_and_name(path, true)?;
-        match parent.symlink_metadata(&name) {
-            Ok(metadata) if is_redirect(&metadata) => {
-                return Err(unsafe_cache_path("cache lock is a link or reparse point"));
-            }
-            Ok(metadata) if !metadata.file_type().is_file() => {
-                return Err(invalid_data("cache lock entry is not a regular file"));
-            }
-            Ok(_metadata) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let mut options = OpenOptions::new();
-        options
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .follow(FollowSymlinks::No);
-        #[cfg(windows)]
-        options.share_mode(WINDOWS_LOCK_SHARE_READ_WRITE);
-        let file = parent.open_with(name, &options)?;
-        let metadata = file.metadata()?;
-        if is_reparse_point(&metadata) {
-            return Err(unsafe_cache_path("opened cache lock is a reparse point"));
-        }
-        if !metadata.file_type().is_file() {
-            return Err(invalid_data("cache lock entry is not a regular file"));
-        }
-        let file = file.into_std();
+        let file = self.open_lock_file(path)?;
         fs4::FileExt::lock(&file)?;
         Ok(Box::new(OsRootedLockGuard { _file: file }))
+    }
+
+    fn try_lock_exclusive(&self, path: &Path) -> io::Result<RootedLockAttempt> {
+        let file = self.open_lock_file(path)?;
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(RootedLockAttempt::Acquired(Box::new(OsRootedLockGuard {
+                _file: file,
+            }))),
+            Err(fs4::TryLockError::WouldBlock) => Ok(RootedLockAttempt::Contended),
+            Err(fs4::TryLockError::Error(error)) => Err(error),
+        }
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
@@ -786,7 +813,8 @@ mod tests {
     #[cfg(unix)]
     use super::RelativeSymlinkOutcome;
     use super::{
-        CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedRead, StagingName,
+        CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockAttempt,
+        RootedRead, StagingName,
     };
 
     #[test]
@@ -1177,9 +1205,14 @@ mod tests {
                 &StagingName::new("link-escape")?,
             )
             .expect_err("a link ancestor must be rejected");
+        let lock_error = root
+            .try_lock_exclusive(Path::new("escape/item.lock"))
+            .expect_err("nonblocking locking followed a link ancestor");
 
         assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        assert!(super::is_unsafe_cache_path_error(&lock_error));
         assert!(!outside.join("record").try_exists()?);
+        assert!(!outside.join("item.lock").try_exists()?);
         Ok(())
     }
 
@@ -1208,9 +1241,14 @@ mod tests {
                 &StagingName::new("junction-escape")?,
             )
             .expect_err("a junction ancestor must be rejected");
+        let lock_error = root
+            .try_lock_exclusive(Path::new("escape-junction/item.lock"))
+            .expect_err("nonblocking locking followed a junction ancestor");
 
         assert!(super::is_unsafe_cache_path_error(&error));
+        assert!(super::is_unsafe_cache_path_error(&lock_error));
         assert!(!outside.join("record").try_exists()?);
+        assert!(!outside.join("item.lock").try_exists()?);
         fs::remove_dir(junction)?;
         Ok(())
     }
@@ -1260,6 +1298,8 @@ mod tests {
             .expect_err("create-once followed a final file link");
         root.lock_exclusive(relative)
             .expect_err("locking followed a final file link");
+        root.try_lock_exclusive(relative)
+            .expect_err("nonblocking locking followed a final file link");
 
         assert_eq!(fs::read(outside)?, b"outside");
         Ok(())
@@ -1278,6 +1318,81 @@ mod tests {
             root.entry_kind(Path::new("locks/item.lock"))?,
             RootedEntryKind::RegularFile
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nonblocking_exclusive_lock_reports_contention_and_reacquires_after_release() -> io::Result<()>
+    {
+        let fixture = Fixture::new()?;
+        let first_root = fixture.root()?;
+        let second_root = fixture.root()?;
+        let relative = Path::new("locks/local-dir.lock");
+
+        let first_guard = match first_root.try_lock_exclusive(relative)? {
+            RootedLockAttempt::Acquired(guard) => guard,
+            RootedLockAttempt::Contended => {
+                return Err(io::Error::other(
+                    "first lock attempt unexpectedly contended",
+                ));
+            }
+        };
+        assert!(matches!(
+            second_root.try_lock_exclusive(relative)?,
+            RootedLockAttempt::Contended
+        ));
+
+        drop(first_guard);
+        let second_guard = match second_root.try_lock_exclusive(relative)? {
+            RootedLockAttempt::Acquired(guard) => guard,
+            RootedLockAttempt::Contended => {
+                return Err(io::Error::other(
+                    "released lock remained unexpectedly contended",
+                ));
+            }
+        };
+        drop(second_guard);
+
+        assert_eq!(
+            first_root.entry_kind(relative)?,
+            RootedEntryKind::RegularFile
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nonblocking_exclusive_lock_contends_with_blocking_exclusive_lock() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let blocking_root = fixture.root()?;
+        let nonblocking_root = fixture.root()?;
+        let relative = Path::new("locks/shared.lock");
+
+        let blocking_guard = blocking_root.lock_exclusive(relative)?;
+        assert!(matches!(
+            nonblocking_root.try_lock_exclusive(relative)?,
+            RootedLockAttempt::Contended
+        ));
+
+        drop(blocking_guard);
+        assert!(matches!(
+            nonblocking_root.try_lock_exclusive(relative)?,
+            RootedLockAttempt::Acquired(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn nonblocking_exclusive_lock_rejects_parent_traversal() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("escaped.lock");
+
+        let error = root
+            .try_lock_exclusive(Path::new("../escaped.lock"))
+            .expect_err("nonblocking locking accepted parent traversal");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!outside.try_exists()?);
         Ok(())
     }
 

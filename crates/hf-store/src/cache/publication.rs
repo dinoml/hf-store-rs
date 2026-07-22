@@ -30,7 +30,7 @@ use super::rooted_fs::{
     StagingName, is_reparse_point, is_unsafe_cache_path_error, unsafe_cache_path,
 };
 #[cfg(test)]
-use super::rooted_fs::{RootedLockGuard, RootedRead, RootedWrite};
+use super::rooted_fs::{RootedLockAttempt, RootedLockGuard, RootedRead, RootedWrite};
 use super::sanitized_io::SanitizedIo;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -2451,6 +2451,10 @@ mod tests {
 
         fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
             self.inner.lock_exclusive(path)
+        }
+
+        fn try_lock_exclusive(&self, path: &Path) -> io::Result<RootedLockAttempt> {
+            self.inner.try_lock_exclusive(path)
         }
 
         fn sync_directory(&self, path: &Path) -> io::Result<()> {

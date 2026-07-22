@@ -823,7 +823,8 @@ mod tests {
     };
     use crate::cache::rooted_fs::{
         CreateOnceOutcome, RelativeSymlinkOutcome, RootedEntryKind, RootedFileSystem,
-        RootedLockGuard, RootedRead, RootedRegularFile, RootedWrite, StagingName,
+        RootedLockAttempt, RootedLockGuard, RootedRead, RootedRegularFile, RootedWrite,
+        StagingName,
     };
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -2120,6 +2121,24 @@ mod tests {
                 }
             }
             Ok(guard)
+        }
+
+        fn try_lock_exclusive(&self, path: &Path) -> io::Result<RootedLockAttempt> {
+            match self.inner.try_lock_exclusive(path)? {
+                RootedLockAttempt::Acquired(guard) => {
+                    if let Some(probe) = &self.lock_lifetime {
+                        if path == probe.lock {
+                            probe.active.store(true, Ordering::Release);
+                            return Ok(RootedLockAttempt::Acquired(Box::new(ProbedLockGuard {
+                                _inner: guard,
+                                active: Arc::clone(&probe.active),
+                            })));
+                        }
+                    }
+                    Ok(RootedLockAttempt::Acquired(guard))
+                }
+                RootedLockAttempt::Contended => Ok(RootedLockAttempt::Contended),
+            }
         }
 
         fn sync_directory(&self, path: &Path) -> io::Result<()> {

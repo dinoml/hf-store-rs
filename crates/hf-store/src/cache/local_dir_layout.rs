@@ -63,6 +63,29 @@ impl HubLocalDirLayout {
         &self.completion_sidecar
     }
 
+    pub(super) fn coordination_lock_path(&self) -> PathBuf {
+        self.completion_sidecar
+            .cache_root()
+            .join("locks")
+            .join("local-dir.lock")
+    }
+
+    pub(super) fn coordination_state_path(&self) -> PathBuf {
+        self.completion_sidecar
+            .cache_root()
+            .join("local-dir-state.json")
+    }
+
+    pub(super) fn coordination_lock_relative(&self) -> Result<PathBuf, ValidationError> {
+        self.capability_relative(&self.coordination_lock_path())
+            .map(Path::to_path_buf)
+    }
+
+    pub(super) fn coordination_state_relative(&self) -> Result<PathBuf, ValidationError> {
+        self.capability_relative(&self.coordination_state_path())
+            .map(Path::to_path_buf)
+    }
+
     pub(super) fn capability_relative<'a>(
         &self,
         path: &'a Path,
@@ -237,6 +260,47 @@ mod tests {
                 .completion_sidecar()
                 .cache_root()
                 .starts_with(root.join(".cache/huggingface"))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_dir_coordination_paths_are_global_to_the_physical_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PathBuf::from("local-dir");
+        let first = HubLocalDirLayout::new(
+            &root,
+            &Endpoint::hugging_face(),
+            &RepositorySpec::model(RepositoryId::parse("org/model")?),
+        )?;
+        let second = HubLocalDirLayout::new(
+            &root,
+            &Endpoint::parse("https://hub.example.test/prefix")?,
+            &RepositorySpec::dataset(RepositoryId::parse("other/data")?),
+        )?;
+
+        let expected_lock = root.join(".cache/hf-store/hf-store-v1/locks/local-dir.lock");
+        let expected_state = root.join(".cache/hf-store/hf-store-v1/local-dir-state.json");
+        assert_eq!(first.coordination_lock_path(), expected_lock);
+        assert_eq!(second.coordination_lock_path(), expected_lock);
+        assert_eq!(first.coordination_state_path(), expected_state);
+        assert_eq!(second.coordination_state_path(), expected_state);
+        assert_eq!(
+            first.coordination_lock_relative()?,
+            Path::new(".cache/hf-store/hf-store-v1/locks/local-dir.lock")
+        );
+        assert_eq!(
+            first.coordination_state_relative()?,
+            Path::new(".cache/hf-store/hf-store-v1/local-dir-state.json")
+        );
+
+        // The fixed active-state location serializes every repository using this
+        // physical directory. Repository identity belongs in the future state
+        // payload, whose repository-scoped location remains distinct here.
+        assert_ne!(
+            first.completion_sidecar().repository_directory(),
+            second.completion_sidecar().repository_directory()
         );
 
         Ok(())
