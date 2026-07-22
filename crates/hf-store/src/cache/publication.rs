@@ -48,6 +48,10 @@ pub(super) enum PublicationPoint {
     AfterAtomicReplace,
     BeforeCompletionReplace,
     AfterCompletionReplace,
+    BeforeSnapshotEntryPublish,
+    AfterSnapshotEntryPublish,
+    BeforeSnapshotManifestPublish,
+    AfterSnapshotManifestPublish,
 }
 
 pub(super) trait PublicationFaults: Debug + Send + Sync {
@@ -898,16 +902,19 @@ impl CacheKernel {
             self.ensure_parent(&destination_path)?;
             let destination = self.relative_path(&destination_path)?;
             let staging = self.relative_path(staging_path)?;
+            self.check_fault(PublicationPoint::BeforeSnapshotEntryPublish, false)?;
             let outcome = self.root.install_staged_create_once(staging, destination)?;
             let _cleanup_result = self.root.remove_file(staging);
             validate_existing_blob(self.root.as_ref(), destination, *size, *digest)?;
             if outcome == CreateOnceOutcome::Created {
                 self.sync_parent(&destination_path)?;
             }
+            self.check_fault(PublicationPoint::AfterSnapshotEntryPublish, true)?;
         }
         let destination = self.layout.snapshot_manifest(commit, selection);
         match self.root.entry_kind(self.relative_path(&destination)?)? {
             RootedEntryKind::Missing => {
+                self.check_fault(PublicationPoint::BeforeSnapshotManifestPublish, false)?;
                 let outcome = self.root.install_staged_create_once(
                     manifest_staging,
                     self.relative_path(&destination)?,
@@ -915,6 +922,7 @@ impl CacheKernel {
                 if outcome == CreateOnceOutcome::Created {
                     self.sync_parent(&destination)?;
                 }
+                self.check_fault(PublicationPoint::AfterSnapshotManifestPublish, true)?;
             }
             RootedEntryKind::RegularFile => {
                 let _cleanup_result = self.root.remove_file(manifest_staging);
@@ -2075,6 +2083,51 @@ mod tests {
                 .exists()
         );
         assert!(fixture.kernel.staging_entries()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_snapshot_fault_boundaries_expose_only_incomplete_or_complete_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for point in [
+            PublicationPoint::BeforeSnapshotEntryPublish,
+            PublicationPoint::AfterSnapshotEntryPublish,
+            PublicationPoint::BeforeSnapshotManifestPublish,
+            PublicationPoint::AfterSnapshotManifestPublish,
+        ] {
+            let fixture = Fixture::new()?;
+            let payload = b"snapshot boundary";
+            let digest = BlobDigest::for_bytes(payload);
+            fixture.kernel.publish_blob(
+                Cursor::new(payload),
+                u64::try_from(payload.len())?,
+                digest,
+            )?;
+            let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+            let path = RepoPath::parse("model.bin")?;
+            let selection = SelectionId::derive(std::slice::from_ref(&path))?;
+            fixture.faults.fail_once(point);
+
+            fixture
+                .kernel
+                .publish_owned_snapshot(
+                    &commit,
+                    &selection,
+                    &[(path.clone(), digest, u64::try_from(payload.len())?)],
+                )
+                .expect_err("injected snapshot boundary unexpectedly returned success");
+
+            let opened = fixture.kernel.open_owned_snapshot(
+                &Revision::parse(commit.as_str())?,
+                std::slice::from_ref(&path),
+            );
+            if point == PublicationPoint::AfterSnapshotManifestPublish {
+                let complete = opened?;
+                assert_eq!(complete.files.len(), 1);
+            } else {
+                opened.expect_err("an incomplete snapshot became readable");
+            }
+        }
         Ok(())
     }
 
