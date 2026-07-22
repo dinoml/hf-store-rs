@@ -8,10 +8,14 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsSyncExt;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+#[cfg(windows)]
+use cap_std::fs::OpenOptionsExt as _;
 use cap_std::fs::{Dir, OpenOptions};
 
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(windows)]
+const WINDOWS_LOCK_SHARE_READ_WRITE: u32 = 0x0000_0001 | 0x0000_0002;
 
 #[derive(Debug)]
 struct UnsafeCachePathError(&'static str);
@@ -602,6 +606,8 @@ impl RootedFileSystem for CacheRoot {
             .write(true)
             .truncate(false)
             .follow(FollowSymlinks::No);
+        #[cfg(windows)]
+        options.share_mode(WINDOWS_LOCK_SHARE_READ_WRITE);
         let file = parent.open_with(name, &options)?;
         let metadata = file.metadata()?;
         if is_reparse_point(&metadata) {
@@ -966,6 +972,24 @@ mod tests {
             root.entry_kind(Path::new("locks/item.lock"))?,
             RootedEntryKind::RegularFile
         );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_handles_prevent_lock_path_replacement_until_release() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let relative = Path::new("locks/shared.lock");
+        root.ensure_dir(Path::new("locks"))?;
+
+        let guard = root.lock_exclusive(relative)?;
+        let _removal = fs::remove_file(fixture.cache.join(relative))
+            .expect_err("an active lock handle allowed its named path to be removed");
+        assert!(fixture.cache.join(relative).is_file());
+
+        drop(guard);
+        fs::remove_file(fixture.cache.join(relative))?;
         Ok(())
     }
 
