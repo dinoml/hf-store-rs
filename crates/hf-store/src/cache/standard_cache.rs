@@ -43,6 +43,22 @@ pub(super) struct StandardCacheWriter {
     root: Arc<dyn RootedFileSystem>,
     effects: Effects,
     materialization: SnapshotMaterialization,
+    #[cfg(test)]
+    blob_lock_observer: Option<BlobLockObserver>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct BlobLockObserver {
+    attempted: Arc<dyn Fn() + Send + Sync>,
+    acquired: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for BlobLockObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BlobLockObserver")
+    }
 }
 
 impl StandardCacheWriter {
@@ -83,7 +99,32 @@ impl StandardCacheWriter {
             root,
             effects,
             materialization,
+            #[cfg(test)]
+            blob_lock_observer: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn shared_for_test(
+        root: impl AsRef<Path>,
+        endpoint: &Endpoint,
+        spec: &RepositorySpec,
+        effects: Effects,
+        materialization: SnapshotMaterialization,
+    ) -> Result<Self, CompatibleCacheError> {
+        Self::shared_with_materialization(root, endpoint, spec, effects, materialization)
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_blob_lock_for_test(
+        &mut self,
+        attempted: Arc<dyn Fn() + Send + Sync>,
+        acquired: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.blob_lock_observer = Some(BlobLockObserver {
+            attempted,
+            acquired,
+        });
     }
 
     pub(super) fn publish<R, F>(
@@ -134,8 +175,10 @@ impl StandardCacheWriter {
             Err(error) => return Err(error.into()),
         };
         let mut published_any = false;
+        let tree_context = TreeContext { commit, full_tree };
         for (key, blob) in &plan.blobs {
             let prepared_blob = self.prepare_blob(
+                tree_context,
                 key,
                 blob,
                 reusable_index.as_ref(),
@@ -160,6 +203,7 @@ impl StandardCacheWriter {
 
     fn prepare_blob<R, F>(
         &self,
+        tree_context: TreeContext<'_>,
         key: &HubBlobKey,
         blob: &PlannedBlob,
         reusable_index: Option<&HubCacheIndex>,
@@ -173,10 +217,31 @@ impl StandardCacheWriter {
         let destination = self.layout.blob_path(key);
         let destination_relative = self.relative(&destination)?;
         let lock = self.layout.blob_lock(key);
+        #[cfg(test)]
+        if let Some(observer) = &self.blob_lock_observer {
+            (observer.attempted)();
+        }
         let guard = self
             .root
             .lock_exclusive(&self.relative(&lock)?)
             .map_err(CacheError::from)?;
+        #[cfg(test)]
+        if let Some(observer) = &self.blob_lock_observer {
+            (observer.acquired)();
+        }
+        let refreshed_index = if reusable_index.is_none() {
+            match self
+                .reader
+                .index_from_tree(tree_context.commit, tree_context.full_tree)
+            {
+                Ok(index) => Some(index),
+                Err(error) if error.is_incomplete() => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        let reusable_index = reusable_index.or(refreshed_index.as_ref());
         let prepared = match self
             .root
             .open_regular(&destination_relative)
@@ -577,6 +642,12 @@ impl StandardCacheWriter {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TreeContext<'a> {
+    commit: &'a CommitId,
+    full_tree: &'a HubTree,
+}
+
 #[derive(Debug)]
 struct WritePlan {
     selection: ExactSelection,
@@ -725,7 +796,7 @@ mod tests {
     use std::error::Error;
     use std::fmt::{self, Debug, Display, Formatter};
     use std::fs;
-    use std::io::{self, Cursor, Read};
+    use std::io::{self, Cursor, Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -744,8 +815,9 @@ mod tests {
     use crate::cache::compatible_cache::CompatibleCacheOffline;
     use crate::cache::hub_layout::HubCacheLayout;
     use crate::cache::hub_metadata::{HubTree, HubTreeEntry, decode_tree};
+    use crate::cache::key::SelectionId;
     use crate::cache::publication::{
-        Effects, NoPublicationFaults, OsFileSystem, RandomOperationIds, SystemClock,
+        CacheKernel, Effects, NoPublicationFaults, OsFileSystem, RandomOperationIds, SystemClock,
     };
     use crate::cache::rooted_fs::{
         CreateOnceOutcome, RelativeSymlinkOutcome, RootedEntryKind, RootedFileSystem,
@@ -755,7 +827,9 @@ mod tests {
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const RACE_FIRST_COMMIT: &str = "4444444444444444444444444444444444444444";
     const RACE_SECOND_COMMIT: &str = "5555555555555555555555555555555555555555";
+    const CRASH_NEW_COMMIT: &str = "6666666666666666666666666666666666666666";
     const CONFIG_BYTES: &[u8] = b"{\"model_type\":\"fixture\"}\n";
+    const CRASH_NEW_BYTES: &[u8] = b"{\"model_type\":\"crash-boundary\"}\n";
     const WEIGHTS_BYTES: &[u8] = b"fixture-weights\n";
     const CROSS_PROCESS_WRITER_CHILD_TEST: &str =
         "cache::standard_cache::tests::cross_process_standard_cache_writer_child";
@@ -766,6 +840,13 @@ mod tests {
     const CROSS_PROCESS_GO_ENV: &str = "HF_STORE_STANDARD_WRITER_GO";
     const CROSS_PROCESS_SOURCE_ENV: &str = "HF_STORE_STANDARD_WRITER_SOURCE";
     const CROSS_PROCESS_RESULT_ENV: &str = "HF_STORE_STANDARD_WRITER_RESULT";
+    const CRASH_CHILD_TEST: &str =
+        "cache::standard_cache::tests::standard_cache_process_exit_child";
+    const CRASH_CHILD_ENV: &str = "HF_STORE_STANDARD_WRITER_CRASH_CHILD";
+    const CRASH_TARGET_ENV: &str = "HF_STORE_STANDARD_WRITER_CRASH_TARGET";
+    const CRASH_PHASE_ENV: &str = "HF_STORE_STANDARD_WRITER_CRASH_PHASE";
+    const CRASH_MARKER_ENV: &str = "HF_STORE_STANDARD_WRITER_CRASH_MARKER";
+    const CRASH_EXIT_CODE: i32 = 86;
     const CROSS_PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
     const CROSS_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
     const MODEL_COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -781,6 +862,53 @@ mod tests {
     const SPACE_CONFORMANCE_BYTES: &[u8] = include_bytes!(
         "../../tests/fixtures/huggingface_hub-v1.24.0/cache/spaces--fixture-org--fixture-space/blobs/8d7bedcfa905ca2dc23b3a5c5f048cd8d4eacd05"
     );
+
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    enum CrashBoundary {
+        Blob,
+        Tree,
+        Snapshot,
+        Manifest,
+        Ref,
+    }
+
+    impl CrashBoundary {
+        const ALL: [Self; 5] = [
+            Self::Blob,
+            Self::Tree,
+            Self::Snapshot,
+            Self::Manifest,
+            Self::Ref,
+        ];
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CrashPhase {
+        Before,
+        After,
+    }
+
+    impl CrashPhase {
+        const ALL: [Self; 2] = [Self::Before, Self::After];
+
+        const fn as_str(self) -> &'static str {
+            match self {
+                Self::Before => "before",
+                Self::After => "after",
+            }
+        }
+
+        fn parse(value: &str) -> io::Result<Self> {
+            match value {
+                "before" => Ok(Self::Before),
+                "after" => Ok(Self::After),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid standard-cache crash phase",
+                )),
+            }
+        }
+    }
 
     #[test]
     fn writes_a_complete_python_layout_and_opens_it_offline() -> Result<(), Box<dyn Error>> {
@@ -1046,12 +1174,24 @@ mod tests {
         let tree = HubTree::new([(path.clone(), entry)])?;
         let revision = Revision::parse(fixture.commit.as_str())?;
         let mut writer = fixture.writer(SnapshotMaterialization::Copy)?;
-        let lock_path = writer.relative(&fixture.layout()?.blob_lock(&key))?;
+        let lock = fixture.layout()?.blob_lock(&key);
+        fs::create_dir_all(
+            lock.parent()
+                .ok_or_else(|| io::Error::other("blob lock has no parent directory"))?,
+        )?;
+        let _lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)?;
+        let lock_path = writer.relative(&lock)?;
         writer.root = Arc::new(BlobPublicationProbeRoot {
             inner: Arc::clone(&writer.root),
             lock_barrier: Some((lock_path, Arc::new(Barrier::new(2)))),
             failed_install: None,
             lock_lifetime: None,
+            crash_probe: None,
         });
         let calls = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::with_capacity(2);
@@ -1228,6 +1368,64 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_boundaries_preserve_a_complete_active_snapshot() -> Result<(), Box<dyn Error>> {
+        for boundary in CrashBoundary::ALL {
+            for phase in CrashPhase::ALL {
+                run_standard_cache_crash_case(boundary, phase)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn standard_cache_process_exit_child() -> Result<(), Box<dyn Error>> {
+        if std::env::var_os(CRASH_CHILD_ENV).is_none() {
+            return Ok(());
+        }
+
+        let root = required_standard_writer_child_path(CROSS_PROCESS_ROOT_ENV)?;
+        let target = required_standard_writer_child_path(CRASH_TARGET_ENV)?;
+        let marker = required_standard_writer_child_path(CRASH_MARKER_ENV)?;
+        let phase = CrashPhase::parse(&std::env::var(CRASH_PHASE_ENV)?)?;
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let path = RepoPath::parse("config.json")?;
+        let commit = CommitId::parse(CRASH_NEW_COMMIT)?;
+        let tree = HubTree::new([(path.clone(), git_entry(CRASH_NEW_BYTES)?)])?;
+        let effects = Fixture::effects();
+        let mut writer = StandardCacheWriter::shared_with_materialization(
+            &root,
+            &endpoint,
+            &spec,
+            effects.clone(),
+            SnapshotMaterialization::Copy,
+        )?;
+        let probe_root: Arc<dyn RootedFileSystem> = Arc::new(BlobPublicationProbeRoot {
+            inner: Arc::clone(&writer.root),
+            lock_barrier: None,
+            failed_install: None,
+            lock_lifetime: None,
+            crash_probe: Some(CrashProbe {
+                target,
+                phase,
+                marker,
+            }),
+        });
+        writer.sidecar =
+            CacheKernel::for_compatible_cache(&writer.layout, Arc::clone(&probe_root), effects)?;
+        writer.root = probe_root;
+
+        writer.publish(
+            &Revision::parse("refs/pr/7")?,
+            &commit,
+            &tree,
+            std::slice::from_ref(&path),
+            |_source_path| Ok(Cursor::new(CRASH_NEW_BYTES.to_vec())),
+        )?;
+        Err(io::Error::other("standard-cache crash probe was not reached").into())
+    }
+
+    #[test]
     fn blob_lock_is_held_until_the_snapshot_entry_is_complete() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new()?;
         let path = RepoPath::parse("config.json")?;
@@ -1249,6 +1447,7 @@ mod tests {
                 active: Arc::clone(&active),
                 observed_during_snapshot: Arc::clone(&observed_during_snapshot),
             }),
+            crash_probe: None,
         });
         let contents = contents([(path.as_str(), CONFIG_BYTES)]);
         let calls = AtomicUsize::new(0);
@@ -1288,6 +1487,7 @@ mod tests {
                 observed_scan_safe: Arc::clone(&observed_scan_safe),
             }),
             lock_lifetime: None,
+            crash_probe: None,
         });
         let contents = contents([(path.as_str(), CONFIG_BYTES)]);
         let calls = AtomicUsize::new(0);
@@ -1689,6 +1889,7 @@ mod tests {
         lock_barrier: Option<(PathBuf, Arc<Barrier>)>,
         failed_install: Option<FailedBlobInstall>,
         lock_lifetime: Option<LockLifetimeProbe>,
+        crash_probe: Option<CrashProbe>,
     }
 
     #[derive(Debug)]
@@ -1705,6 +1906,42 @@ mod tests {
         snapshot: PathBuf,
         active: Arc<AtomicBool>,
         observed_during_snapshot: Arc<AtomicBool>,
+    }
+
+    #[derive(Debug)]
+    struct CrashProbe {
+        target: PathBuf,
+        phase: CrashPhase,
+        marker: PathBuf,
+    }
+
+    impl CrashProbe {
+        fn check(&self, path: &Path, phase: CrashPhase) -> io::Result<()> {
+            if path != self.target || phase != self.phase {
+                return Ok(());
+            }
+            let mut marker = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&self.marker)?;
+            write!(
+                marker,
+                "{}\n{}\n",
+                self.phase.as_str(),
+                self.target.display()
+            )?;
+            marker.sync_all()?;
+            std::process::exit(CRASH_EXIT_CODE);
+        }
+    }
+
+    impl BlobPublicationProbeRoot {
+        fn check_crash(&self, path: &Path, phase: CrashPhase) -> io::Result<()> {
+            if let Some(probe) = &self.crash_probe {
+                probe.check(path, phase)?;
+            }
+            Ok(())
+        }
     }
 
     #[derive(Debug)]
@@ -1751,6 +1988,7 @@ mod tests {
             staging: &Path,
             destination: &Path,
         ) -> io::Result<CreateOnceOutcome> {
+            self.check_crash(destination, CrashPhase::Before)?;
             if let Some(probe) = &self.failed_install {
                 if destination == probe.destination {
                     let tag_is_valid = match self
@@ -1771,7 +2009,11 @@ mod tests {
                     ));
                 }
             }
-            self.inner.install_staged_create_once(staging, destination)
+            let outcome = self
+                .inner
+                .install_staged_create_once(staging, destination)?;
+            self.check_crash(destination, CrashPhase::After)?;
+            Ok(outcome)
         }
 
         fn create_once(
@@ -1780,7 +2022,10 @@ mod tests {
             bytes: &[u8],
             staging: &StagingName,
         ) -> io::Result<CreateOnceOutcome> {
-            self.inner.create_once(path, bytes, staging)
+            self.check_crash(path, CrashPhase::Before)?;
+            let outcome = self.inner.create_once(path, bytes, staging)?;
+            self.check_crash(path, CrashPhase::After)?;
+            Ok(outcome)
         }
 
         fn create_relative_symlink_once(
@@ -1797,6 +2042,7 @@ mod tests {
             destination: &Path,
             staging: &StagingName,
         ) -> io::Result<CreateOnceOutcome> {
+            self.check_crash(destination, CrashPhase::Before)?;
             if let Some(probe) = &self.lock_lifetime {
                 if destination == probe.snapshot {
                     probe
@@ -1804,8 +2050,11 @@ mod tests {
                         .store(probe.active.load(Ordering::Acquire), Ordering::Release);
                 }
             }
-            self.inner
-                .copy_regular_create_once(source, destination, staging)
+            let outcome = self
+                .inner
+                .copy_regular_create_once(source, destination, staging)?;
+            self.check_crash(destination, CrashPhase::After)?;
+            Ok(outcome)
         }
 
         fn copy_regular_create_once_from_staging(
@@ -1814,6 +2063,7 @@ mod tests {
             destination: &Path,
             staging_path: &Path,
         ) -> io::Result<CreateOnceOutcome> {
+            self.check_crash(destination, CrashPhase::Before)?;
             if let Some(probe) = &self.lock_lifetime {
                 if destination == probe.snapshot {
                     probe
@@ -1821,12 +2071,19 @@ mod tests {
                         .store(probe.active.load(Ordering::Acquire), Ordering::Release);
                 }
             }
-            self.inner
-                .copy_regular_create_once_from_staging(source, destination, staging_path)
+            let outcome = self.inner.copy_regular_create_once_from_staging(
+                source,
+                destination,
+                staging_path,
+            )?;
+            self.check_crash(destination, CrashPhase::After)?;
+            Ok(outcome)
         }
 
         fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {
-            self.inner.replace(path, bytes, staging)
+            self.check_crash(path, CrashPhase::Before)?;
+            self.inner.replace(path, bytes, staging)?;
+            self.check_crash(path, CrashPhase::After)
         }
 
         fn replace_from_staging(
@@ -1835,7 +2092,9 @@ mod tests {
             bytes: &[u8],
             staging_path: &Path,
         ) -> io::Result<()> {
-            self.inner.replace_from_staging(path, bytes, staging_path)
+            self.check_crash(path, CrashPhase::Before)?;
+            self.inner.replace_from_staging(path, bytes, staging_path)?;
+            self.check_crash(path, CrashPhase::After)
         }
 
         fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
@@ -1864,6 +2123,257 @@ mod tests {
         fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
             self.inner.read_dir(path)
         }
+    }
+
+    fn run_standard_cache_crash_case(
+        boundary: CrashBoundary,
+        phase: CrashPhase,
+    ) -> Result<(), Box<dyn Error>> {
+        StandardCacheCrashCase::new(boundary, phase)?.run()
+    }
+
+    struct StandardCacheCrashCase {
+        fixture: Fixture,
+        path: RepoPath,
+        revision: Revision,
+        new_tree: HubTree,
+        layout: HubCacheLayout,
+        blob: PathBuf,
+        tree: PathBuf,
+        snapshot: PathBuf,
+        manifest: PathBuf,
+        reference: PathBuf,
+        target_relative: PathBuf,
+        marker: PathBuf,
+        boundary: CrashBoundary,
+        phase: CrashPhase,
+    }
+
+    impl StandardCacheCrashCase {
+        fn new(boundary: CrashBoundary, phase: CrashPhase) -> Result<Self, Box<dyn Error>> {
+            let fixture = Fixture::new()?;
+            let path = RepoPath::parse("config.json")?;
+            let revision = Revision::parse("refs/pr/7")?;
+            seed_old_standard_cache_snapshot(&fixture, &revision, &path)?;
+            let new_commit = CommitId::parse(CRASH_NEW_COMMIT)?;
+            let new_entry = git_entry(CRASH_NEW_BYTES)?;
+            let new_tree = HubTree::new([(path.clone(), new_entry.clone())])?;
+            let new_key = crate::cache::hub_cache::compatible_blob_key(&new_entry)?;
+            let selection = SelectionId::derive(std::slice::from_ref(&path))?;
+            let layout = fixture.layout()?;
+            let blob = layout.blob_path(&new_key);
+            let tree = layout.tree_path(&new_commit);
+            let snapshot = layout.snapshot_file(&new_commit, &path);
+            let manifest = layout.sidecar().snapshot_manifest(&new_commit, &selection);
+            let reference = layout.ref_path(&revision)?;
+            let target = match boundary {
+                CrashBoundary::Blob => &blob,
+                CrashBoundary::Tree => &tree,
+                CrashBoundary::Snapshot => &snapshot,
+                CrashBoundary::Manifest => &manifest,
+                CrashBoundary::Ref => &reference,
+            };
+            let target_relative = target.strip_prefix(&fixture.root)?.to_path_buf();
+            let marker = fixture.directory.path().join(format!(
+                "crash-{:?}-{}.marker",
+                boundary,
+                phase.as_str()
+            ));
+            Ok(Self {
+                fixture,
+                path,
+                revision,
+                new_tree,
+                layout,
+                blob,
+                tree,
+                snapshot,
+                manifest,
+                reference,
+                target_relative,
+                marker,
+                boundary,
+                phase,
+            })
+        }
+
+        fn run(self) -> Result<(), Box<dyn Error>> {
+            self.run_child()?;
+            self.assert_complete_state()
+        }
+
+        fn run_child(&self) -> Result<(), Box<dyn Error>> {
+            let child = Command::new(std::env::current_exe()?)
+                .arg("--exact")
+                .arg(CRASH_CHILD_TEST)
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CRASH_CHILD_ENV, "1")
+                .env(CROSS_PROCESS_ROOT_ENV, &self.fixture.root)
+                .env(CRASH_TARGET_ENV, &self.target_relative)
+                .env(CRASH_PHASE_ENV, self.phase.as_str())
+                .env(CRASH_MARKER_ENV, &self.marker)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let output = StandardWriterChild::new(child)
+                .wait_until(Instant::now() + CROSS_PROCESS_TIMEOUT)?;
+            assert_eq!(
+                output.status.code(),
+                Some(CRASH_EXIT_CODE),
+                "crash child for {:?} {:?} exited unexpectedly; stdout: {}; stderr: {}",
+                self.boundary,
+                self.phase,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = format!(
+                "{}\n{}\n",
+                self.phase.as_str(),
+                self.target_relative.display()
+            );
+            assert_eq!(fs::read_to_string(&self.marker)?, expected);
+            Ok(())
+        }
+
+        fn assert_complete_state(&self) -> Result<(), Box<dyn Error>> {
+            let blob_reached = self.reached(CrashBoundary::Blob);
+            let tree_reached = self.reached(CrashBoundary::Tree);
+            let snapshot_reached = self.reached(CrashBoundary::Snapshot);
+            let manifest_reached = self.reached(CrashBoundary::Manifest);
+            let ref_reached = self.reached(CrashBoundary::Ref);
+            assert_complete_regular_file(&self.blob, blob_reached, CRASH_NEW_BYTES)?;
+            if tree_reached {
+                assert_eq!(decode_tree(&fs::read(&self.tree)?)?, self.new_tree);
+            } else {
+                assert!(!self.tree.try_exists()?);
+            }
+            assert_complete_regular_file(&self.snapshot, snapshot_reached, CRASH_NEW_BYTES)?;
+            assert_eq!(self.manifest.try_exists()?, manifest_reached);
+            let expected_active = if ref_reached {
+                CRASH_NEW_COMMIT
+            } else {
+                COMMIT
+            };
+            assert_ref_is_complete(&self.reference, expected_active)?;
+            self.assert_offline_snapshots(expected_active, manifest_reached)?;
+            assert_eq!(fs::read(self.layout.cachedir_tag())?, CACHEDIR_TAG);
+            assert!(self.layout.snapshots_directory().is_dir());
+            let staging = fs::read_dir(self.layout.staging_directory())?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<io::Result<Vec<_>>>()?;
+            assert!(!staging.is_empty());
+            assert!(staging.iter().all(|path| path.is_file()));
+            assert_no_standard_writer_temporary_files(&self.fixture.root)?;
+            Ok(())
+        }
+
+        fn assert_offline_snapshots(
+            &self,
+            expected_active: &str,
+            manifest_reached: bool,
+        ) -> Result<(), Box<dyn Error>> {
+            let offline = CompatibleCacheOffline::shared(
+                &self.fixture.root,
+                &self.fixture.endpoint,
+                &self.fixture.spec,
+                Fixture::effects(),
+            )?;
+            assert_snapshot_bytes(&offline, COMMIT, &self.path, CONFIG_BYTES)?;
+            let active = offline.open(&self.revision, std::slice::from_ref(&self.path))?;
+            assert_eq!(active.commit().as_str(), expected_active);
+            let expected_bytes = if expected_active == CRASH_NEW_COMMIT {
+                CRASH_NEW_BYTES
+            } else {
+                CONFIG_BYTES
+            };
+            assert_eq!(fs::read(active.files()[0].content_path())?, expected_bytes);
+            let new_revision = Revision::parse(CRASH_NEW_COMMIT)?;
+            let immutable_new = offline.open(&new_revision, std::slice::from_ref(&self.path));
+            if manifest_reached {
+                let snapshot = immutable_new?;
+                assert_eq!(snapshot.commit().as_str(), CRASH_NEW_COMMIT);
+                assert_eq!(
+                    fs::read(snapshot.files()[0].content_path())?,
+                    CRASH_NEW_BYTES
+                );
+            } else {
+                assert!(
+                    immutable_new
+                        .expect_err("missing manifest opened")
+                        .is_incomplete()
+                );
+            }
+            Ok(())
+        }
+
+        fn reached(&self, destination: CrashBoundary) -> bool {
+            crash_cut_reached(self.boundary, self.phase, destination)
+        }
+    }
+
+    fn seed_old_standard_cache_snapshot(
+        fixture: &Fixture,
+        revision: &Revision,
+        path: &RepoPath,
+    ) -> Result<(), Box<dyn Error>> {
+        let tree = HubTree::new([(path.clone(), git_entry(CONFIG_BYTES)?)])?;
+        let contents = contents([(path.as_str(), CONFIG_BYTES)]);
+        fixture.writer(SnapshotMaterialization::Copy)?.publish(
+            revision,
+            &fixture.commit,
+            &tree,
+            std::slice::from_ref(path),
+            source(&contents, None),
+        )?;
+        Ok(())
+    }
+
+    fn assert_ref_is_complete(path: &Path, expected: &str) -> Result<(), Box<dyn Error>> {
+        let actual = fs::read_to_string(path)?;
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 40);
+        assert_eq!(CommitId::parse(&actual)?.as_str(), expected);
+        Ok(())
+    }
+
+    fn assert_snapshot_bytes(
+        offline: &CompatibleCacheOffline,
+        commit: &str,
+        path: &RepoPath,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn Error>> {
+        let snapshot = offline.open(&Revision::parse(commit)?, std::slice::from_ref(path))?;
+        assert_eq!(snapshot.commit().as_str(), commit);
+        assert_eq!(fs::read(snapshot.files()[0].content_path())?, bytes);
+        Ok(())
+    }
+
+    fn crash_cut_reached(
+        cut: CrashBoundary,
+        phase: CrashPhase,
+        destination: CrashBoundary,
+    ) -> bool {
+        cut > destination || (cut == destination && phase == CrashPhase::After)
+    }
+
+    fn assert_complete_regular_file(path: &Path, expected: bool, bytes: &[u8]) -> io::Result<()> {
+        if expected {
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.file_type().is_file() || fs::read(path)? != bytes {
+                return Err(io::Error::other(format!(
+                    "published destination is not a complete regular file: {}",
+                    path.display()
+                )));
+            }
+        } else if path.try_exists()? {
+            return Err(io::Error::other(format!(
+                "pre-publication destination is visible: {}",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     fn required_standard_writer_child_path(name: &str) -> io::Result<PathBuf> {

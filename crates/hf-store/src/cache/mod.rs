@@ -10,6 +10,8 @@ mod metadata;
 mod publication;
 #[cfg(test)]
 mod python_cache_conformance;
+#[cfg(test)]
+mod python_writer_race;
 mod rooted_fs;
 mod sanitized_io;
 mod standard_cache;
