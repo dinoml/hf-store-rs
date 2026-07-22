@@ -21,6 +21,19 @@ use super::rooted_fs::{
 };
 use super::sanitized_io::SanitizedIo;
 
+pub(super) trait Cancellation: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct NeverCancelled;
+
+impl Cancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct LocalDirFileTarget {
     path: RepoPath,
@@ -145,23 +158,53 @@ impl LocalDirFileMaterializer {
         source: &mut dyn Read,
         policy: ExistingFilePolicy,
     ) -> Result<LocalDirFileMaterialization, LocalDirMaterializationError> {
+        self.materialize_with_cancellation(target, source, policy, &NeverCancelled)
+    }
+
+    pub(super) fn inspect(
+        &self,
+        target: &LocalDirFileTarget,
+        cancellation: &dyn Cancellation,
+    ) -> Result<LocalDirDestinationInspection, LocalDirMaterializationError> {
+        Self::check_cancellation(cancellation, false)?;
+        let destination = self.layout.file_path(target.path())?;
+        let destination_relative = self.layout.capability_relative(&destination)?;
+        self.inspect_destination(destination_relative, target, cancellation, false)
+    }
+
+    pub(super) fn materialize_with_cancellation(
+        &self,
+        target: &LocalDirFileTarget,
+        source: &mut dyn Read,
+        policy: ExistingFilePolicy,
+        cancellation: &dyn Cancellation,
+    ) -> Result<LocalDirFileMaterialization, LocalDirMaterializationError> {
+        Self::check_cancellation(cancellation, false)?;
         let destination = self.layout.file_path(target.path())?;
         let destination_relative = self.layout.capability_relative(&destination)?.to_path_buf();
-        let initial = self.inspect_destination(&destination_relative, target)?;
+        let initial =
+            self.inspect_destination(&destination_relative, target, cancellation, false)?;
         match initial {
-            DestinationState::Exact => {
+            LocalDirDestinationInspection::Exact => {
                 return Ok(LocalDirFileMaterialization::new(
                     destination,
                     target,
                     LocalDirFileDisposition::Reused,
                 ));
             }
-            DestinationState::DifferentRegular if policy == ExistingFilePolicy::Reject => {
+            LocalDirDestinationInspection::DifferentRegular
+                if policy == ExistingFilePolicy::Reject =>
+            {
                 return Err(LocalDirMaterializationError::conflict(false));
             }
-            DestinationState::Missing | DestinationState::DifferentRegular => {}
+            LocalDirDestinationInspection::Conflict => {
+                return Err(LocalDirMaterializationError::conflict(false));
+            }
+            LocalDirDestinationInspection::Missing
+            | LocalDirDestinationInspection::DifferentRegular => {}
         }
 
+        Self::check_cancellation(cancellation, false)?;
         let staging_name = self.effects.next_staging_name()?;
         let paths = MaterializationPaths {
             destination,
@@ -170,7 +213,8 @@ impl LocalDirFileMaterializer {
         };
         paths.ensure_distinct_staging(target)?;
         let mut cleanup = StagingCleanup::new(self.root.as_ref(), paths.staging.clone());
-        let result = self.stage_and_install(target, source, policy, &paths, &mut cleanup);
+        let result =
+            self.stage_and_install(target, source, policy, cancellation, &paths, &mut cleanup);
         cleanup.finish(result)
     }
 
@@ -179,36 +223,45 @@ impl LocalDirFileMaterializer {
         target: &LocalDirFileTarget,
         source: &mut dyn Read,
         policy: ExistingFilePolicy,
+        cancellation: &dyn Cancellation,
         paths: &MaterializationPaths,
         cleanup: &mut StagingCleanup<'_>,
     ) -> Result<LocalDirFileMaterialization, LocalDirMaterializationError> {
+        Self::check_cancellation(cancellation, false)?;
         let mut writer = self.root.create_new(&paths.staging)?;
         cleanup.activate();
         self.check_fault(PublicationPoint::AfterStagingCreate, false)?;
+        Self::check_cancellation(cancellation, false)?;
         let (_size, actual_digest) =
-            copy_and_validate_content(source, writer.as_mut(), target.entry())
-                .map_err(LocalDirMaterializationError::content)?;
+            copy_with_cancellation(source, writer.as_mut(), target.entry(), cancellation, false)?;
         if actual_digest != target.digest() {
             return Err(LocalDirMaterializationError::digest_mismatch(false));
         }
+        Self::check_cancellation(cancellation, false)?;
         writer.flush()?;
         writer.sync_all()?;
         drop(writer);
         self.check_fault(PublicationPoint::AfterStagingSync, false)?;
+        Self::check_cancellation(cancellation, false)?;
 
-        match self.inspect_destination(&paths.relative, target)? {
-            DestinationState::Exact => Ok(LocalDirFileMaterialization::new(
+        match self.inspect_destination(&paths.relative, target, cancellation, false)? {
+            LocalDirDestinationInspection::Exact => Ok(LocalDirFileMaterialization::new(
                 paths.destination.clone(),
                 target,
                 LocalDirFileDisposition::Reused,
             )),
-            DestinationState::Missing => self.install_missing(target, policy, paths, cleanup),
-            DestinationState::DifferentRegular => {
+            LocalDirDestinationInspection::Missing => {
+                self.install_missing(target, policy, cancellation, paths, cleanup)
+            }
+            LocalDirDestinationInspection::DifferentRegular => {
                 if policy == ExistingFilePolicy::Reject {
                     Err(LocalDirMaterializationError::conflict(false))
                 } else {
-                    self.install_replacement(target, paths, cleanup)
+                    self.install_replacement(target, cancellation, paths, cleanup)
                 }
+            }
+            LocalDirDestinationInspection::Conflict => {
+                Err(LocalDirMaterializationError::conflict(false))
             }
         }
     }
@@ -217,35 +270,41 @@ impl LocalDirFileMaterializer {
         &self,
         target: &LocalDirFileTarget,
         policy: ExistingFilePolicy,
+        cancellation: &dyn Cancellation,
         paths: &MaterializationPaths,
         cleanup: &mut StagingCleanup<'_>,
     ) -> Result<LocalDirFileMaterialization, LocalDirMaterializationError> {
         self.check_fault(PublicationPoint::BeforeAtomicReplace, false)?;
+        Self::check_cancellation(cancellation, false)?;
         cleanup.mark_publication_attempted();
         let outcome = self
             .root
             .install_staged_create_once(&paths.staging, &paths.relative)
             .map_err(|source| LocalDirMaterializationError::io(&source, true))?;
+        Self::check_cancellation(cancellation, true)?;
         match outcome {
             CreateOnceOutcome::Created => self.finish_install(
                 target,
                 &paths.destination,
                 &paths.relative,
                 LocalDirFileDisposition::Copied,
+                cancellation,
             ),
             CreateOnceOutcome::Existing => {
-                match self.inspect_destination(&paths.relative, target)? {
-                    DestinationState::Exact => Ok(LocalDirFileMaterialization::new(
+                match self.inspect_destination(&paths.relative, target, cancellation, true)? {
+                    LocalDirDestinationInspection::Exact => Ok(LocalDirFileMaterialization::new(
                         paths.destination.clone(),
                         target,
                         LocalDirFileDisposition::Reused,
                     )),
-                    DestinationState::DifferentRegular
+                    LocalDirDestinationInspection::DifferentRegular
                         if policy == ExistingFilePolicy::ReplaceRegularFile =>
                     {
-                        self.install_replacement(target, paths, cleanup)
+                        self.install_replacement(target, cancellation, paths, cleanup)
                     }
-                    DestinationState::Missing | DestinationState::DifferentRegular => {
+                    LocalDirDestinationInspection::Missing
+                    | LocalDirDestinationInspection::DifferentRegular
+                    | LocalDirDestinationInspection::Conflict => {
                         Err(LocalDirMaterializationError::conflict(true))
                     }
                 }
@@ -256,6 +315,7 @@ impl LocalDirFileMaterializer {
     fn install_replacement(
         &self,
         target: &LocalDirFileTarget,
+        cancellation: &dyn Cancellation,
         paths: &MaterializationPaths,
         cleanup: &mut StagingCleanup<'_>,
     ) -> Result<LocalDirFileMaterialization, LocalDirMaterializationError> {
@@ -263,16 +323,19 @@ impl LocalDirFileMaterializer {
             PublicationPoint::BeforeAtomicReplace,
             cleanup.publication_attempted(),
         )?;
+        Self::check_cancellation(cancellation, cleanup.publication_attempted())?;
         cleanup.mark_publication_attempted();
         self.root
             .install_staged_replace(&paths.staging, &paths.relative)
             .map_err(|source| LocalDirMaterializationError::io(&source, true))?;
         cleanup.deactivate();
+        Self::check_cancellation(cancellation, true)?;
         self.finish_install(
             target,
             &paths.destination,
             &paths.relative,
             LocalDirFileDisposition::Copied,
+            cancellation,
         )
     }
 
@@ -282,11 +345,17 @@ impl LocalDirFileMaterializer {
         destination: &Path,
         destination_relative: &Path,
         disposition: LocalDirFileDisposition,
+        cancellation: &dyn Cancellation,
     ) -> Result<LocalDirFileMaterialization, LocalDirMaterializationError> {
         self.check_fault(PublicationPoint::AfterAtomicReplace, true)?;
-        match self.inspect_destination(destination_relative, target) {
-            Ok(DestinationState::Exact) => {}
-            Ok(DestinationState::Missing | DestinationState::DifferentRegular) => {
+        Self::check_cancellation(cancellation, true)?;
+        match self.inspect_destination(destination_relative, target, cancellation, true) {
+            Ok(LocalDirDestinationInspection::Exact) => {}
+            Ok(
+                LocalDirDestinationInspection::Missing
+                | LocalDirDestinationInspection::DifferentRegular
+                | LocalDirDestinationInspection::Conflict,
+            ) => {
                 return Err(LocalDirMaterializationError::final_validation());
             }
             Err(source) => return Err(source.with_may_have_published()),
@@ -304,30 +373,45 @@ impl LocalDirFileMaterializer {
         &self,
         destination: &Path,
         target: &LocalDirFileTarget,
-    ) -> Result<DestinationState, LocalDirMaterializationError> {
+        cancellation: &dyn Cancellation,
+        may_have_published: bool,
+    ) -> Result<LocalDirDestinationInspection, LocalDirMaterializationError> {
+        Self::check_cancellation(cancellation, may_have_published)?;
         self.validate_parent(destination)?;
+        Self::check_cancellation(cancellation, may_have_published)?;
         let opened = self.root.open_regular(destination).map_err(|source| {
             if is_unsafe_cache_path_error(&source) {
-                LocalDirMaterializationError::conflict(false)
+                LocalDirMaterializationError::conflict(may_have_published)
             } else {
-                LocalDirMaterializationError::io(&source, false)
+                LocalDirMaterializationError::io(&source, may_have_published)
             }
         })?;
+        Self::check_cancellation(cancellation, may_have_published)?;
         let (mut reader, size) = match opened {
             RootedRegularFile::File { reader, size, .. } => (reader, size),
-            RootedRegularFile::Missing => return Ok(DestinationState::Missing),
+            RootedRegularFile::Missing => return Ok(LocalDirDestinationInspection::Missing),
             RootedRegularFile::Other => {
-                return Err(LocalDirMaterializationError::conflict(false));
+                return Ok(LocalDirDestinationInspection::Conflict);
             }
         };
         if size != target.entry().size() {
-            return Ok(DestinationState::DifferentRegular);
+            return Ok(LocalDirDestinationInspection::DifferentRegular);
         }
-        match copy_and_validate_content(reader.as_mut(), &mut io::sink(), target.entry()) {
-            Ok((_size, digest)) if digest == target.digest() => Ok(DestinationState::Exact),
-            Ok(_) => Ok(DestinationState::DifferentRegular),
-            Err(source) if source.is_corrupt() => Ok(DestinationState::DifferentRegular),
-            Err(source) => Err(LocalDirMaterializationError::content(source)),
+        match copy_with_cancellation(
+            reader.as_mut(),
+            &mut io::sink(),
+            target.entry(),
+            cancellation,
+            may_have_published,
+        ) {
+            Ok((_size, digest)) if digest == target.digest() => {
+                Ok(LocalDirDestinationInspection::Exact)
+            }
+            Ok(_) => Ok(LocalDirDestinationInspection::DifferentRegular),
+            Err(source) if source.is_source_mismatch() => {
+                Ok(LocalDirDestinationInspection::DifferentRegular)
+            }
+            Err(source) => Err(source),
         }
     }
 
@@ -372,6 +456,17 @@ impl LocalDirFileMaterializer {
             .check_publication_fault(point)
             .map_err(|source| LocalDirMaterializationError::io(&source, may_have_published))
     }
+
+    fn check_cancellation(
+        cancellation: &dyn Cancellation,
+        may_have_published: bool,
+    ) -> Result<(), LocalDirMaterializationError> {
+        if cancellation.is_cancelled() {
+            Err(LocalDirMaterializationError::cancelled(may_have_published))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Debug for LocalDirFileMaterializer {
@@ -383,10 +478,68 @@ impl Debug for LocalDirFileMaterializer {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DestinationState {
+pub(super) enum LocalDirDestinationInspection {
     Missing,
     Exact,
     DifferentRegular,
+    Conflict,
+}
+
+fn copy_with_cancellation<W: io::Write + ?Sized>(
+    reader: &mut dyn Read,
+    writer: &mut W,
+    entry: &HubTreeEntry,
+    cancellation: &dyn Cancellation,
+    may_have_published: bool,
+) -> Result<(u64, BlobDigest), LocalDirMaterializationError> {
+    let mut reader = CancellableReader::new(reader, cancellation);
+    let result = copy_and_validate_content(&mut reader, writer, entry);
+    if reader.observed_cancellation() {
+        Err(LocalDirMaterializationError::cancelled(may_have_published))
+    } else {
+        result.map_err(|source| LocalDirMaterializationError::content(source, may_have_published))
+    }
+}
+
+struct CancellableReader<'a> {
+    inner: &'a mut dyn Read,
+    cancellation: &'a dyn Cancellation,
+    observed_cancellation: bool,
+}
+
+impl<'a> CancellableReader<'a> {
+    const fn new(inner: &'a mut dyn Read, cancellation: &'a dyn Cancellation) -> Self {
+        Self {
+            inner,
+            cancellation,
+            observed_cancellation: false,
+        }
+    }
+
+    const fn observed_cancellation(&self) -> bool {
+        self.observed_cancellation
+    }
+
+    fn check_cancellation(&mut self) -> io::Result<()> {
+        if self.cancellation.is_cancelled() {
+            self.observed_cancellation = true;
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "local-dir operation cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Read for CancellableReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.check_cancellation()?;
+        let result = self.inner.read(buffer);
+        self.check_cancellation()?;
+        result
+    }
 }
 
 #[derive(Debug)]
@@ -502,6 +655,7 @@ enum LocalDirMaterializationErrorKind {
     DigestMismatch,
     Conflict,
     FinalValidation,
+    Cancelled,
 }
 
 impl LocalDirMaterializationError {
@@ -524,8 +678,11 @@ impl LocalDirMaterializationError {
         Self::new(kind, may_have_published)
     }
 
-    fn content(source: HubCacheReadError) -> Self {
-        Self::new(LocalDirMaterializationErrorKind::Content(source), false)
+    fn content(source: HubCacheReadError, may_have_published: bool) -> Self {
+        Self::new(
+            LocalDirMaterializationErrorKind::Content(source),
+            may_have_published,
+        )
     }
 
     fn digest_mismatch(may_have_published: bool) -> Self {
@@ -544,6 +701,13 @@ impl LocalDirMaterializationError {
 
     fn final_validation() -> Self {
         Self::new(LocalDirMaterializationErrorKind::FinalValidation, true)
+    }
+
+    fn cancelled(may_have_published: bool) -> Self {
+        Self::new(
+            LocalDirMaterializationErrorKind::Cancelled,
+            may_have_published,
+        )
     }
 
     fn with_may_have_published(mut self) -> Self {
@@ -582,6 +746,13 @@ impl LocalDirMaterializationError {
         )
     }
 
+    pub(super) fn is_cancelled(&self) -> bool {
+        matches!(
+            self.kind.as_ref(),
+            LocalDirMaterializationErrorKind::Cancelled
+        )
+    }
+
     pub(super) const fn may_have_published(&self) -> bool {
         self.may_have_published
     }
@@ -599,7 +770,8 @@ impl LocalDirMaterializationError {
             | LocalDirMaterializationErrorKind::Content(_)
             | LocalDirMaterializationErrorKind::DigestMismatch
             | LocalDirMaterializationErrorKind::Conflict
-            | LocalDirMaterializationErrorKind::FinalValidation => None,
+            | LocalDirMaterializationErrorKind::FinalValidation
+            | LocalDirMaterializationErrorKind::Cancelled => None,
         }
     }
 }
@@ -628,6 +800,7 @@ impl Display for LocalDirMaterializationError {
             LocalDirMaterializationErrorKind::FinalValidation => {
                 "local-dir destination failed validation after publication"
             }
+            LocalDirMaterializationErrorKind::Cancelled => "local-dir materialization cancelled",
         };
         formatter.write_str(message)
     }
@@ -642,7 +815,8 @@ impl Error for LocalDirMaterializationError {
             | LocalDirMaterializationErrorKind::UnsafeFileSystem(_)
             | LocalDirMaterializationErrorKind::DigestMismatch
             | LocalDirMaterializationErrorKind::Conflict
-            | LocalDirMaterializationErrorKind::FinalValidation => None,
+            | LocalDirMaterializationErrorKind::FinalValidation
+            | LocalDirMaterializationErrorKind::Cancelled => None,
         }
     }
 }
@@ -666,7 +840,7 @@ mod tests {
     use std::fs::{self, File, FileTimes};
     use std::io::{self, Cursor, Read};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
@@ -682,13 +856,15 @@ mod tests {
         PublicationPoint, SequenceOperationIds, SystemClock,
     };
     use crate::cache::rooted_fs::{
-        CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockGuard,
-        RootedRead, RootedRegularFile, RootedWrite, StagingName, staging_path,
+        CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockAttempt,
+        RootedLockGuard, RootedRead, RootedRegularFile, RootedWrite, StagingName, staging_path,
+        unsafe_cache_path,
     };
     use crate::{Endpoint, RepoPath, RepositoryId, RepositorySpec};
 
     use super::{
-        ExistingFilePolicy, LocalDirFileDisposition, LocalDirFileMaterializer, LocalDirFileTarget,
+        Cancellation, ExistingFilePolicy, LocalDirDestinationInspection, LocalDirFileDisposition,
+        LocalDirFileMaterializer, LocalDirFileTarget, NeverCancelled,
     };
 
     const CONTENT: &[u8] = b"validated local-dir payload\n";
@@ -784,6 +960,251 @@ mod tests {
         assert_eq!(result.digest(), BlobDigest::for_bytes(CONTENT));
         assert_eq!(source.reads(), 0);
         assert_eq!(fs::metadata(&destination)?.modified()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn destination_inspection_is_read_only_and_needs_no_source() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let target = Fixture::target("nested/config.json")?;
+        let destination = fixture.destination(target.path().as_str());
+        fs::create_dir_all(destination.parent().ok_or("destination has no parent")?)?;
+        fs::write(&destination, CONTENT)?;
+        let fixed_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        File::options()
+            .write(true)
+            .open(&destination)?
+            .set_times(FileTimes::new().set_modified(fixed_time))?;
+        let before = fs::metadata(&destination)?.modified()?;
+
+        let inspection = fixture.materializer().inspect(&target, &NeverCancelled)?;
+
+        assert_eq!(inspection, LocalDirDestinationInspection::Exact);
+        assert_eq!(fs::metadata(&destination)?.modified()?, before);
+        fixture.assert_no_staging(target.path().as_str())?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_before_inspection_avoids_filesystem_and_source_access()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let target = Fixture::target("config.json")?;
+        let (cancellation, flag) = FlagCancellation::new();
+        flag.store(true, Ordering::Release);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let root: Arc<dyn RootedFileSystem> = Arc::new(CancellationBoundaryRoot::new(
+            Arc::clone(&fixture.root),
+            Arc::clone(&flag),
+            Arc::clone(&calls),
+            CancellationRootPoint::Never,
+        ));
+        let mut source = ReadCounter::new(CONTENT);
+
+        let error = fixture
+            .with_root(root)
+            .materialize_with_cancellation(
+                &target,
+                &mut source,
+                ExistingFilePolicy::Reject,
+                &cancellation,
+            )
+            .expect_err("ignored cancellation before destination inspection");
+
+        assert!(error.is_cancelled());
+        assert!(!error.may_have_published());
+        assert_eq!(source.reads(), 0);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert!(!fixture.destination("config.json").try_exists()?);
+        fixture.assert_no_staging("config.json")?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_during_large_destination_hash_stops_before_source_or_writes()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let content = vec![b'x'; 3 * 64 * 1024];
+        let target = target("weights/model.bin", &content)?;
+        let destination = fixture.destination(target.path().as_str());
+        fs::create_dir_all(destination.parent().ok_or("destination has no parent")?)?;
+        fs::write(&destination, &content)?;
+        let (cancellation, flag) = FlagCancellation::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let root: Arc<dyn RootedFileSystem> = Arc::new(CancellationBoundaryRoot::new(
+            Arc::clone(&fixture.root),
+            flag,
+            Arc::clone(&calls),
+            CancellationRootPoint::DestinationRead,
+        ));
+        let mut source = ReadCounter::new(&content);
+
+        let error = fixture
+            .with_root(root)
+            .materialize_with_cancellation(
+                &target,
+                &mut source,
+                ExistingFilePolicy::Reject,
+                &cancellation,
+            )
+            .expect_err("ignored cancellation while hashing the destination");
+
+        assert!(error.is_cancelled());
+        assert!(!error.may_have_published());
+        assert_eq!(source.reads(), 0);
+        assert!(calls.load(Ordering::Acquire) > 0);
+        assert_eq!(fs::read(&destination)?, content);
+        fixture.assert_no_staging(target.path().as_str())?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_during_source_copy_never_publishes_partial_bytes() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = Fixture::new()?;
+        let content = vec![b'x'; 3 * 64 * 1024];
+        let target = target("weights/model.bin", &content)?;
+        let (cancellation, flag) = FlagCancellation::new();
+        let mut source = CancelAfterRead::new(Cursor::new(content), flag);
+
+        let error = fixture
+            .materializer()
+            .materialize_with_cancellation(
+                &target,
+                &mut source,
+                ExistingFilePolicy::Reject,
+                &cancellation,
+            )
+            .expect_err("ignored cancellation while copying source bytes");
+
+        assert!(error.is_cancelled());
+        assert!(!error.may_have_published());
+        assert!(!fixture.destination("weights/model.bin").try_exists()?);
+        fixture.assert_no_staging("weights/model.bin")?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_immediately_before_replacement_preserves_old_bytes()
+    -> Result<(), Box<dyn Error>> {
+        let (cancellation, flag) = FlagCancellation::new();
+        let faults: Arc<dyn PublicationFaults> = Arc::new(ToggleCancellationFault {
+            point: PublicationPoint::BeforeAtomicReplace,
+            flag,
+        });
+        let fixture = Fixture::with_effects(Arc::new(SequenceOperationIds::new(1)), faults)?;
+        let target = Fixture::target("config.json")?;
+        fs::write(fixture.destination("config.json"), OLD_CONTENT)?;
+        let mut source = Cursor::new(CONTENT);
+
+        let error = fixture
+            .materializer()
+            .materialize_with_cancellation(
+                &target,
+                &mut source,
+                ExistingFilePolicy::ReplaceRegularFile,
+                &cancellation,
+            )
+            .expect_err("ignored cancellation before replacement");
+
+        assert!(error.is_cancelled());
+        assert!(!error.may_have_published());
+        assert_eq!(fs::read(fixture.destination("config.json"))?, OLD_CONTENT);
+        fixture.assert_no_staging("config.json")?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_immediately_after_replacement_reports_visible_complete_bytes()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let target = Fixture::target("config.json")?;
+        fs::write(fixture.destination("config.json"), OLD_CONTENT)?;
+        let (cancellation, flag) = FlagCancellation::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let root: Arc<dyn RootedFileSystem> = Arc::new(CancellationBoundaryRoot::new(
+            Arc::clone(&fixture.root),
+            flag,
+            calls,
+            CancellationRootPoint::AfterReplace,
+        ));
+        let mut source = Cursor::new(CONTENT);
+
+        let error = fixture
+            .with_root(root)
+            .materialize_with_cancellation(
+                &target,
+                &mut source,
+                ExistingFilePolicy::ReplaceRegularFile,
+                &cancellation,
+            )
+            .expect_err("ignored cancellation after replacement");
+
+        assert!(error.is_cancelled());
+        assert!(error.may_have_published());
+        assert_eq!(fs::read(fixture.destination("config.json"))?, CONTENT);
+        fixture.assert_no_staging("config.json")?;
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_final_open_after_replacement_preserves_publication_uncertainty()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let target = Fixture::target("config.json")?;
+        fs::write(fixture.destination("config.json"), OLD_CONTENT)?;
+        let flag = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let root: Arc<dyn RootedFileSystem> = Arc::new(CancellationBoundaryRoot::new(
+            Arc::clone(&fixture.root),
+            flag,
+            calls,
+            CancellationRootPoint::UnsafeFinalOpen,
+        ));
+        let mut source = Cursor::new(CONTENT);
+
+        let error = fixture
+            .with_root(root)
+            .materialize_with_cancellation(
+                &target,
+                &mut source,
+                ExistingFilePolicy::ReplaceRegularFile,
+                &NeverCancelled,
+            )
+            .expect_err("ignored an unsafe final open after replacement");
+
+        assert!(error.is_conflict());
+        assert!(error.may_have_published());
+        assert_eq!(fs::read(fixture.destination("config.json"))?, CONTENT);
+        fixture.assert_no_staging("config.json")?;
+        Ok(())
+    }
+
+    #[test]
+    fn completed_publication_wins_over_later_cancellation() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let target = Fixture::target("config.json")?;
+        fs::write(fixture.destination("config.json"), OLD_CONTENT)?;
+        let (cancellation, flag) = FlagCancellation::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let root: Arc<dyn RootedFileSystem> = Arc::new(CancellationBoundaryRoot::new(
+            Arc::clone(&fixture.root),
+            Arc::clone(&flag),
+            calls,
+            CancellationRootPoint::AfterParentSync,
+        ));
+        let mut source = Cursor::new(CONTENT);
+
+        let result = fixture.with_root(root).materialize_with_cancellation(
+            &target,
+            &mut source,
+            ExistingFilePolicy::ReplaceRegularFile,
+            &cancellation,
+        )?;
+
+        assert_eq!(result.disposition(), LocalDirFileDisposition::Copied);
+        assert!(flag.load(Ordering::Acquire));
+        assert_eq!(fs::read(fixture.destination("config.json"))?, CONTENT);
         Ok(())
     }
 
@@ -932,7 +1353,7 @@ mod tests {
                 fs::metadata(source_path)?.ino(),
                 fs::metadata(destination)?.ino()
             );
-        }
+        };
         Ok(())
     }
 
@@ -966,7 +1387,7 @@ mod tests {
             assert!(error.is_conflict());
             assert_eq!(source.reads(), 0);
             assert_eq!(fs::read(outside)?, OLD_CONTENT);
-        }
+        };
         Ok(())
     }
 
@@ -1269,6 +1690,32 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn cancellation_diagnostics_are_classified_and_redacted() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse(format!("{SECRET_SENTINEL}/config.json"))?;
+        let entry = HubTreeEntry::new(CONTENT.len() as u64, SECRET_SENTINEL)?;
+        let target = LocalDirFileTarget::new(path, entry, BlobDigest::for_bytes(CONTENT));
+        let (cancellation, flag) = FlagCancellation::new();
+        flag.store(true, Ordering::Release);
+        let mut source = FailingRead;
+
+        let error = fixture
+            .materializer()
+            .materialize_with_cancellation(
+                &target,
+                &mut source,
+                ExistingFilePolicy::Reject,
+                &cancellation,
+            )
+            .expect_err("ignored cancellation carrying sensitive target context");
+
+        assert!(error.is_cancelled());
+        assert!(!error.may_have_published());
+        assert_secret_absent(&error);
+        Ok(())
+    }
+
     fn target(path: &str, bytes: &[u8]) -> Result<LocalDirFileTarget, Box<dyn Error>> {
         let entry = HubTreeEntry::new(bytes.len() as u64, "opaque-validator")?;
         Ok(LocalDirFileTarget::new(
@@ -1371,6 +1818,217 @@ mod tests {
             entry,
             BlobDigest::for_bytes(bytes),
         ))
+    }
+
+    #[derive(Debug)]
+    struct FlagCancellation {
+        flag: Arc<AtomicBool>,
+    }
+
+    impl FlagCancellation {
+        fn new() -> (Self, Arc<AtomicBool>) {
+            let flag = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    flag: Arc::clone(&flag),
+                },
+                flag,
+            )
+        }
+    }
+
+    impl Cancellation for FlagCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.flag.load(Ordering::Acquire)
+        }
+    }
+
+    struct CancelAfterRead<R> {
+        inner: R,
+        flag: Arc<AtomicBool>,
+    }
+
+    impl<R> CancelAfterRead<R> {
+        const fn new(inner: R, flag: Arc<AtomicBool>) -> Self {
+            Self { inner, flag }
+        }
+    }
+
+    impl<R: Read> Read for CancelAfterRead<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            if count != 0 {
+                self.flag.store(true, Ordering::Release);
+            }
+            Ok(count)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CancellationRootPoint {
+        Never,
+        DestinationRead,
+        AfterReplace,
+        AfterParentSync,
+        UnsafeFinalOpen,
+    }
+
+    #[derive(Debug)]
+    struct CancellationBoundaryRoot {
+        inner: Arc<dyn RootedFileSystem>,
+        flag: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        point: CancellationRootPoint,
+    }
+
+    impl CancellationBoundaryRoot {
+        const fn new(
+            inner: Arc<dyn RootedFileSystem>,
+            flag: Arc<AtomicBool>,
+            calls: Arc<AtomicUsize>,
+            point: CancellationRootPoint,
+        ) -> Self {
+            Self {
+                inner,
+                flag,
+                calls,
+                point,
+            }
+        }
+
+        fn observe_call(&self) {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn cancel_at(&self, point: CancellationRootPoint) {
+            if self.point == point {
+                self.flag.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    impl RootedFileSystem for CancellationBoundaryRoot {
+        fn ensure_dir(&self, path: &Path) -> io::Result<()> {
+            self.observe_call();
+            self.inner.ensure_dir(path)
+        }
+
+        fn entry_kind(&self, path: &Path) -> io::Result<RootedEntryKind> {
+            self.observe_call();
+            self.inner.entry_kind(path)
+        }
+
+        fn open_regular(&self, path: &Path) -> io::Result<RootedRegularFile> {
+            self.observe_call();
+            if self.point == CancellationRootPoint::UnsafeFinalOpen
+                && self.flag.load(Ordering::Acquire)
+            {
+                return Err(unsafe_cache_path("injected unsafe final open"));
+            }
+            match self.inner.open_regular(path)? {
+                RootedRegularFile::File {
+                    reader,
+                    size,
+                    modified,
+                } if self.point == CancellationRootPoint::DestinationRead => {
+                    Ok(RootedRegularFile::File {
+                        reader: Box::new(CancelAfterRead::new(reader, Arc::clone(&self.flag))),
+                        size,
+                        modified,
+                    })
+                }
+                opened => Ok(opened),
+            }
+        }
+
+        fn read_regular_bounded(&self, path: &Path, limit: usize) -> io::Result<RootedRead> {
+            self.observe_call();
+            self.inner.read_regular_bounded(path, limit)
+        }
+
+        fn create_new(&self, path: &Path) -> io::Result<Box<dyn RootedWrite>> {
+            self.observe_call();
+            self.inner.create_new(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.observe_call();
+            self.inner.remove_file(path)
+        }
+
+        fn install_staged_create_once(
+            &self,
+            staging: &Path,
+            destination: &Path,
+        ) -> io::Result<CreateOnceOutcome> {
+            self.observe_call();
+            let outcome = self
+                .inner
+                .install_staged_create_once(staging, destination)?;
+            self.cancel_at(CancellationRootPoint::AfterReplace);
+            self.cancel_at(CancellationRootPoint::UnsafeFinalOpen);
+            Ok(outcome)
+        }
+
+        fn install_staged_replace(&self, staging: &Path, destination: &Path) -> io::Result<()> {
+            self.observe_call();
+            self.inner.install_staged_replace(staging, destination)?;
+            self.cancel_at(CancellationRootPoint::AfterReplace);
+            self.cancel_at(CancellationRootPoint::UnsafeFinalOpen);
+            Ok(())
+        }
+
+        fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {
+            self.observe_call();
+            self.inner.replace(path, bytes, staging)
+        }
+
+        fn replace_from_staging(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            staging_path: &Path,
+        ) -> io::Result<()> {
+            self.observe_call();
+            self.inner.replace_from_staging(path, bytes, staging_path)
+        }
+
+        fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
+            self.observe_call();
+            self.inner.lock_exclusive(path)
+        }
+
+        fn try_lock_exclusive(&self, path: &Path) -> io::Result<RootedLockAttempt> {
+            self.observe_call();
+            self.inner.try_lock_exclusive(path)
+        }
+
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            self.observe_call();
+            self.inner.sync_directory(path)?;
+            self.cancel_at(CancellationRootPoint::AfterParentSync);
+            Ok(())
+        }
+
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            self.observe_call();
+            self.inner.read_dir(path)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ToggleCancellationFault {
+        point: PublicationPoint,
+        flag: Arc<AtomicBool>,
+    }
+
+    impl PublicationFaults for ToggleCancellationFault {
+        fn check(&self, point: PublicationPoint) -> io::Result<()> {
+            if point == self.point {
+                self.flag.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
     }
 
     struct ReadCounter<'a> {
@@ -1487,6 +2145,10 @@ mod tests {
             self.inner.lock_exclusive(path)
         }
 
+        fn try_lock_exclusive(&self, path: &Path) -> io::Result<RootedLockAttempt> {
+            self.inner.try_lock_exclusive(path)
+        }
+
         fn sync_directory(&self, path: &Path) -> io::Result<()> {
             if !self.state.installed.load(Ordering::Acquire) {
                 return Err(io::Error::other("synchronized parent before install"));
@@ -1593,6 +2255,9 @@ mod tests {
                 fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
                     self.inner.lock_exclusive(path)
                 }
+                fn try_lock_exclusive(&self, path: &Path) -> io::Result<RootedLockAttempt> {
+                    self.inner.try_lock_exclusive(path)
+                }
                 fn sync_directory(&self, path: &Path) -> io::Result<()> {
                     self.inner.sync_directory(path)
                 }
@@ -1657,6 +2322,9 @@ mod tests {
                 }
                 fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
                     self.inner.lock_exclusive(path)
+                }
+                fn try_lock_exclusive(&self, path: &Path) -> io::Result<RootedLockAttempt> {
+                    self.inner.try_lock_exclusive(path)
                 }
                 fn sync_directory(&self, $path_ident: &Path) -> io::Result<()> {
                     let $self_ident = self;
