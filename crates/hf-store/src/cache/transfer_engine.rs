@@ -1,4 +1,5 @@
 use crate::error::{CacheFailure, HubOperationError};
+use crate::progress::ProgressObserver;
 use crate::transfer::stream_validated_body;
 use crate::transport::TransportBody;
 use crate::{CancellationToken, CommitId, RepoPath};
@@ -8,6 +9,10 @@ use super::key::BlobDigest;
 use super::publication::CacheKernel;
 
 impl CacheKernel {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the transfer boundary keeps remote identity, cancellation, and progress explicit"
+    )]
     pub(super) async fn stream_fresh_file_to_blob(
         &self,
         body: &mut dyn TransportBody,
@@ -16,11 +21,13 @@ impl CacheKernel {
         entry: &HubTreeEntry,
         validator: Option<&str>,
         cancellation: &CancellationToken,
+        progress: &dyn ProgressObserver,
     ) -> Result<BlobDigest, HubOperationError> {
         let mut sink = self
             .create_fresh_partial_sink(commit, path)
             .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
-        let streamed = stream_validated_body(body, &mut sink, entry, cancellation).await;
+        let streamed =
+            stream_validated_body(body, &mut sink, path, entry, cancellation, progress).await;
         drop(sink);
         let digest = match streamed {
             Ok(digest) => digest,
@@ -123,6 +130,7 @@ mod tests {
             &entry,
             None,
             &CancellationToken::new(),
+            &crate::progress::NoopProgress,
         ))?;
         assert_eq!(std::fs::read(kernel.blob_path(&digest))?, bytes);
         assert!(!kernel.partial_data_path(&commit, &path)?.try_exists()?);
@@ -144,6 +152,7 @@ mod tests {
             &entry,
             None,
             &CancellationToken::new(),
+            &crate::progress::NoopProgress,
         ))
         .expect_err("accepted truncated content");
         assert!(!kernel.partial_data_path(&commit, &path)?.try_exists()?);
@@ -174,6 +183,7 @@ mod tests {
             &entry,
             Some("etag"),
             &cancellation,
+            &crate::progress::NoopProgress,
         ))
         .expect_err("published a cancelled transfer");
         assert!(error.is_cancelled());

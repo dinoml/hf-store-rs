@@ -41,6 +41,7 @@ mod fetch_plan;
     reason = "private Hub protocol implementation precedes the public request API"
 )]
 mod hub_protocol;
+mod progress;
 mod repo;
 mod repo_path;
 #[cfg(feature = "network")]
@@ -76,6 +77,8 @@ pub use endpoint::Endpoint;
 pub use error::HubOperationError as HubError;
 #[doc(inline)]
 pub use fetch_plan::{FetchPlan, PlannedFile};
+#[doc(inline)]
+pub use progress::{ProgressEvent, ProgressObserver, ProgressPhase, ReuseDecision};
 
 #[doc(inline)]
 pub use repo::{RepositoryId, RepositoryKind, RepositorySpec};

@@ -6,10 +6,11 @@ use std::time::Duration;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
-use crate::CancellationToken;
 use crate::cache::{BlobDigest, HubTreeEntry};
 use crate::error::{CacheFailure, HubOperationError};
+use crate::progress::{ProgressEvent, ProgressObserver};
 use crate::transport::TransportBody;
+use crate::{CancellationToken, RepoPath};
 
 pub(crate) type RetryFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -78,8 +79,10 @@ pub(crate) trait PartialSink: Debug + Send {
 pub(crate) async fn stream_validated_body(
     body: &mut dyn TransportBody,
     sink: &mut dyn PartialSink,
+    path: &RepoPath,
     entry: &HubTreeEntry,
     cancellation: &CancellationToken,
+    progress: &dyn ProgressObserver,
 ) -> Result<BlobDigest, HubOperationError> {
     if cancellation.is_cancelled() {
         return Err(HubOperationError::cancelled());
@@ -122,6 +125,11 @@ pub(crate) async fn stream_validated_body(
         if let Some(hasher) = git_hasher.as_mut() {
             hasher.update(&chunk);
         }
+        progress.observe(&ProgressEvent::transfer(
+            path.clone(),
+            received,
+            entry.size(),
+        ));
         if cancellation.is_cancelled() {
             sink.sync_all()
                 .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
@@ -146,6 +154,7 @@ pub(crate) async fn stream_validated_body(
             return Err(HubOperationError::validation(transfer_validation_error()));
         }
     }
+    progress.observe(&ProgressEvent::validated(path.clone(), received));
     Ok(digest)
 }
 
@@ -326,6 +335,17 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingProgress(Mutex<Vec<ProgressEvent>>);
+
+    impl ProgressObserver for RecordingProgress {
+        fn observe(&self, event: &ProgressEvent) {
+            if let Ok(mut events) = self.0.lock() {
+                events.push(event.clone());
+            }
+        }
+    }
+
     impl PartialSink for MemorySink {
         fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
             if self.fail_write {
@@ -486,15 +506,30 @@ mod tests {
                 Ok(Box::<[u8]>::from(&bytes[4..])),
             ]));
             let mut sink = MemorySink::default();
+            let progress = RecordingProgress::default();
             let digest = run_ready(stream_validated_body(
                 &mut body,
                 &mut sink,
+                &RepoPath::parse("model.bin")?,
                 &entry,
                 &CancellationToken::new(),
+                &progress,
             ))?;
             assert_eq!(sink.bytes, bytes);
             assert!(sink.synced.load(Ordering::Acquire));
             assert_eq!(digest, BlobDigest::for_bytes(bytes));
+            let events = progress
+                .0
+                .lock()
+                .map_err(|_poisoned| "progress lock poisoned")?;
+            assert_eq!(
+                events.last().map(ProgressEvent::phase),
+                Some(crate::ProgressPhase::Validating)
+            );
+            assert_eq!(
+                events.last().map(ProgressEvent::validated_bytes),
+                Some(bytes.len() as u64)
+            );
         }
         Ok(())
     }
@@ -513,8 +548,10 @@ mod tests {
             run_ready(stream_validated_body(
                 &mut body,
                 &mut sink,
+                &RepoPath::parse("model.bin")?,
                 &entry,
                 &CancellationToken::new(),
+                &crate::progress::NoopProgress,
             ))
             .expect_err("accepted an invalid stream");
         }
@@ -527,8 +564,10 @@ mod tests {
             run_ready(stream_validated_body(
                 &mut body,
                 &mut sink,
+                &RepoPath::parse("model.bin")?,
                 &entry,
                 &CancellationToken::new(),
+                &crate::progress::NoopProgress,
             ))
             .expect_err("accepted a sink failure")
             .is_cache()
