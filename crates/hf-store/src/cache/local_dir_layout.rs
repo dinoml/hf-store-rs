@@ -59,6 +59,14 @@ impl HubLocalDirLayout {
             .join(format!("{commit}.json"))
     }
 
+    pub(super) fn gitignore_path(&self) -> PathBuf {
+        self.upstream_bookkeeping.join(".gitignore")
+    }
+
+    pub(super) fn cachedir_tag_path(&self) -> PathBuf {
+        self.upstream_bookkeeping.join("CACHEDIR.TAG")
+    }
+
     pub(super) const fn completion_sidecar(&self) -> &CacheLayout {
         &self.completion_sidecar
     }

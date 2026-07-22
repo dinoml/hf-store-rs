@@ -11,7 +11,9 @@ use crate::validation::{ValidationError, ValidationErrorKind};
 use crate::{CommitId, RepoPath};
 
 use super::filter::RepositorySelection;
+use super::hub_metadata::{HubMetadataError, HubTree};
 use super::key::{BlobDigest, SelectionId};
+use super::local_dir_bookkeeping::{LocalDirBookkeepingWriteError, LocalDirBookkeepingWriter};
 use super::local_dir_completion::{
     LocalDirCompletionError, LocalDirCompletionFile, LocalDirCompletionWriter,
 };
@@ -401,6 +403,32 @@ impl LocalDirReconciler {
             report.destination_bytes_written != 0,
         )
         .map_err(LocalDirReconciliationError::with_change)?;
+        let tree = HubTree::new(
+            plan.targets()
+                .iter()
+                .map(|target| (target.path().clone(), target.entry().clone())),
+        )
+        .map_err(LocalDirReconciliationError::metadata)
+        .map_err(LocalDirReconciliationError::with_change)?;
+        let bookkeeping = LocalDirBookkeepingWriter::from_layout(
+            plan.layout.clone(),
+            Arc::clone(&self.root),
+            self.effects.clone(),
+        );
+        for target in plan.targets() {
+            let etag = target
+                .entry()
+                .lfs_sha256()
+                .unwrap_or_else(|| target.entry().blob_id());
+            bookkeeping
+                .write_file_hint(target.path(), plan.commit(), etag)
+                .map_err(LocalDirReconciliationError::bookkeeping)
+                .map_err(LocalDirReconciliationError::with_change)?;
+        }
+        bookkeeping
+            .write_tree_hint(plan.commit(), &tree)
+            .map_err(LocalDirReconciliationError::bookkeeping)
+            .map_err(LocalDirReconciliationError::with_change)?;
         let completed_files = report
             .files()
             .iter()
@@ -807,6 +835,8 @@ enum LocalDirReconciliationErrorKind {
     LockWait(SanitizedIo),
     Source(LocalDirSourceError),
     Materialization(LocalDirMaterializationError),
+    Metadata(HubMetadataError),
+    Bookkeeping(LocalDirBookkeepingWriteError),
     Completion(LocalDirCompletionError),
     Conflict,
     Cancelled,
@@ -857,6 +887,18 @@ impl LocalDirReconciliationError {
         let may_have_changed = source.may_have_published();
         Self::new(
             LocalDirReconciliationErrorKind::Completion(source),
+            may_have_changed,
+        )
+    }
+
+    fn metadata(source: HubMetadataError) -> Self {
+        Self::new(LocalDirReconciliationErrorKind::Metadata(source), false)
+    }
+
+    fn bookkeeping(source: LocalDirBookkeepingWriteError) -> Self {
+        let may_have_changed = source.may_have_published();
+        Self::new(
+            LocalDirReconciliationErrorKind::Bookkeeping(source),
             may_have_changed,
         )
     }
@@ -953,6 +995,12 @@ impl Display for LocalDirReconciliationError {
             LocalDirReconciliationErrorKind::Materialization(_) => {
                 "local-dir selected file reconciliation failed"
             }
+            LocalDirReconciliationErrorKind::Metadata(_) => {
+                "local-dir compatible tree construction failed"
+            }
+            LocalDirReconciliationErrorKind::Bookkeeping(_) => {
+                "local-dir compatible bookkeeping publication failed"
+            }
             LocalDirReconciliationErrorKind::Completion(_) => {
                 "local-dir completion state publication failed"
             }
@@ -977,6 +1025,8 @@ impl Error for LocalDirReconciliationError {
             LocalDirReconciliationErrorKind::Plan(source) => Some(source),
             LocalDirReconciliationErrorKind::Source(source) => Some(source),
             LocalDirReconciliationErrorKind::Materialization(source) => Some(source),
+            LocalDirReconciliationErrorKind::Metadata(source) => Some(source),
+            LocalDirReconciliationErrorKind::Bookkeeping(source) => Some(source),
             LocalDirReconciliationErrorKind::Completion(source) => Some(source),
             LocalDirReconciliationErrorKind::Lock(_)
             | LocalDirReconciliationErrorKind::LockWait(_)
@@ -1005,10 +1055,12 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime};
 
+    use serde_json::json;
+    use sha1::{Digest as _, Sha1};
     use tempfile::TempDir;
 
     use crate::cache::filter::RepositoryFilter;
-    use crate::cache::hub_metadata::HubTreeEntry;
+    use crate::cache::hub_metadata::{HubTreeEntry, decode_local_download, decode_tree};
     use crate::cache::metadata::{LocalDirStateRecord, decode_record};
     use crate::cache::publication::{
         NoPublicationFaults, OsFileSystem, PublicationFaults, PublicationPoint,
@@ -1023,6 +1075,233 @@ mod tests {
     const FIRST: &[u8] = b"first validated file";
     const SECOND: &[u8] = b"second validated file";
     const THIRD: &[u8] = b"third validated file";
+
+    #[test]
+    fn rust_local_dir_conformance_emitter_replaces_user_bytes_and_reopens_offline()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let inventory = emit_rust_local_dir_conformance(directory.path())?;
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(inventory)?)?;
+        let fixture = &value["local_directories"][0];
+        assert_eq!(fixture["repo_id"], "fixture-org/fixture-rust-local-dir");
+        assert_eq!(fixture["files"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            fs::read(directory.path().join("local-dir/config.json"))?,
+            FIRST
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "invoked by the pinned-Python conformance job with an explicit output path"]
+    fn emit_python_local_dir_conformance_fixture() -> Result<(), Box<dyn Error>> {
+        let output = std::env::var_os("HF_STORE_CONFORMANCE_OUTPUT")
+            .map(PathBuf::from)
+            .ok_or("HF_STORE_CONFORMANCE_OUTPUT is required")?;
+        let inventory = emit_rust_local_dir_conformance(&output)?;
+        println!("{}", inventory.display());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "invoked by the pinned-Python conformance job with a generated local_dir"]
+    fn reuse_python_written_local_dir_and_reopen_offline() -> Result<(), Box<dyn Error>> {
+        let inventory = std::env::var_os("HF_STORE_PYTHON_LOCAL_DIR_INVENTORY")
+            .map(PathBuf::from)
+            .ok_or("HF_STORE_PYTHON_LOCAL_DIR_INVENTORY is required")?;
+        let corpus = inventory.parent().ok_or("Python inventory has no parent")?;
+        let local_dir = corpus.join("local-dir");
+        let endpoint = Endpoint::hugging_face();
+        let repository =
+            RepositorySpec::model(RepositoryId::parse("fixture-org/fixture-local-dir")?);
+        let commit = CommitId::parse("4444444444444444444444444444444444444444")?;
+        let layout = HubLocalDirLayout::new(&local_dir, &endpoint, &repository)?;
+        let root: Arc<dyn RootedFileSystem> = Arc::new(CacheRoot::open(&local_dir)?);
+        let tree = decode_tree(&fs::read(layout.tree_path(&commit))?)?;
+        let mut original = BTreeMap::new();
+        let mut targets = Vec::with_capacity(tree.files().len());
+        for (path, entry) in tree.files() {
+            let bytes = fs::read(layout.file_path(path)?)?;
+            original.insert(path.clone(), bytes.clone());
+            targets.push(LocalDirFileTarget::new(
+                path.clone(),
+                entry.clone(),
+                BlobDigest::for_bytes(&bytes),
+            ));
+        }
+        let selection = RepositoryFilter::new(None, &[])
+            .select(targets.iter().map(|target| target.path().clone()))?;
+        let plan =
+            LocalDirReconciliationPlan::new(layout.clone(), commit.clone(), &selection, targets)?;
+        let reconciler = LocalDirReconciler::new(
+            Arc::clone(&root),
+            Effects::new(
+                Arc::new(OsFileSystem),
+                Arc::new(SequenceOperationIds::new(1)),
+                Arc::new(SystemClock),
+                Arc::new(NoPublicationFaults),
+            ),
+            Arc::new(YieldWait::default()),
+        );
+        let initial = report(reconciler.reconcile(
+            &plan,
+            &mut CandidateMap::default(),
+            ExistingFilePolicy::Reject,
+            &super::super::local_dir_materialization::NeverCancelled,
+        )?)?;
+        assert!(
+            initial
+                .files()
+                .iter()
+                .all(|file| file.provenance() == LocalDirFileProvenance::ExistingDestination)
+        );
+        let config = plan
+            .targets()
+            .iter()
+            .find(|target| target.path().as_str() == "config/fixture.json")
+            .ok_or("Python fixture config target is missing")?;
+        fs::write(layout.file_path(config.path())?, b"user edit")?;
+        let config_bytes = original
+            .get(config.path())
+            .ok_or("Python fixture config bytes are missing")?;
+        let mut replacement = CandidateMap::default().with_compatible(config, config_bytes);
+        let replaced = report(reconciler.reconcile(
+            &plan,
+            &mut replacement,
+            ExistingFilePolicy::ReplaceRegularFile,
+            &super::super::local_dir_materialization::NeverCancelled,
+        )?)?;
+        assert_eq!(
+            replaced.files()[0].disposition(),
+            LocalDirFileDisposition::Copied
+        );
+        let _offline =
+            super::super::local_dir_completion::LocalDirOfflineReader::new(layout, root)?
+                .open(&commit, selection.selection_id())?;
+        Ok(())
+    }
+
+    fn emit_rust_local_dir_conformance(output: &Path) -> Result<PathBuf, Box<dyn Error>> {
+        fs::create_dir_all(output)?;
+        let local_dir = output.join("local-dir");
+        fs::create_dir(&local_dir)?;
+        let endpoint = Endpoint::hugging_face();
+        let repository =
+            RepositorySpec::model(RepositoryId::parse("fixture-org/fixture-rust-local-dir")?);
+        let commit = CommitId::parse(COMMIT)?;
+        let layout = HubLocalDirLayout::new(&local_dir, &endpoint, &repository)?;
+        let root: Arc<dyn RootedFileSystem> = Arc::new(CacheRoot::open(&local_dir)?);
+        let effects = Effects::new(
+            Arc::new(OsFileSystem),
+            Arc::new(SequenceOperationIds::new(1)),
+            Arc::new(SystemClock),
+            Arc::new(NoPublicationFaults),
+        );
+        let config = LocalDirFileTarget::new(
+            RepoPath::parse("config.json")?,
+            git_entry(FIRST)?,
+            BlobDigest::for_bytes(FIRST),
+        );
+        let weights_digest = BlobDigest::for_bytes(SECOND);
+        let weights = LocalDirFileTarget::new(
+            RepoPath::parse("weights/model.safetensors")?,
+            HubTreeEntry::new(
+                u64::try_from(SECOND.len())?,
+                "2222222222222222222222222222222222222222",
+            )?
+            .with_lfs(weights_digest.to_string(), u64::try_from(SECOND.len())?)?,
+            weights_digest,
+        );
+        let targets = vec![config.clone(), weights.clone()];
+        let selection = RepositoryFilter::new(None, &[])
+            .select(targets.iter().map(|target| target.path().clone()))?;
+        let plan =
+            LocalDirReconciliationPlan::new(layout.clone(), commit.clone(), &selection, targets)?;
+        let reconciler =
+            LocalDirReconciler::new(Arc::clone(&root), effects, Arc::new(YieldWait::default()));
+        let mut initial = CandidateMap::default()
+            .with_new(&config, FIRST, u64::try_from(FIRST.len())?)
+            .with_new(&weights, SECOND, u64::try_from(SECOND.len())?);
+        let _initial_report = report(reconciler.reconcile(
+            &plan,
+            &mut initial,
+            ExistingFilePolicy::Reject,
+            &super::super::local_dir_materialization::NeverCancelled,
+        )?)?;
+
+        fs::write(layout.file_path(config.path())?, b"user-modified bytes")?;
+        let mut replacement =
+            CandidateMap::default().with_new(&config, FIRST, u64::try_from(FIRST.len())?);
+        let _replacement_report = report(reconciler.reconcile(
+            &plan,
+            &mut replacement,
+            ExistingFilePolicy::ReplaceRegularFile,
+            &super::super::local_dir_materialization::NeverCancelled,
+        )?)?;
+        let _offline =
+            super::super::local_dir_completion::LocalDirOfflineReader::new(layout.clone(), root)?
+                .open(&commit, selection.selection_id())?;
+
+        let files = [config, weights]
+            .into_iter()
+            .map(|target| {
+                let metadata_path = layout.download_metadata_path(target.path())?;
+                let metadata = decode_local_download(&fs::read(&metadata_path)?)?;
+                let entry = target.entry();
+                Ok(json!({
+                    "path": target.path().as_str(),
+                    "metadata_path": relative_posix(&local_dir, &metadata_path)?,
+                    "etag": metadata.etag(),
+                    "metadata_timestamp": metadata.timestamp(),
+                    "size": entry.size(),
+                    "content_sha256": target.digest().to_string(),
+                    "blob_id": entry.blob_id(),
+                    "lfs_sha256": entry.lfs_sha256(),
+                    "lfs_size": entry.lfs_size(),
+                }))
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        let inventory = json!({
+            "format_version": 1,
+            "local_directories": [{
+                "path": "local-dir",
+                "repo_type": "model",
+                "repo_id": repository.id().as_str(),
+                "commit": commit.as_str(),
+                "tree_path": relative_posix(&local_dir, &layout.tree_path(&commit))?,
+                "gitignore_path": relative_posix(&local_dir, &layout.gitignore_path())?,
+                "cachedir_tag_path": relative_posix(&local_dir, &layout.cachedir_tag_path())?,
+                "files": files,
+            }],
+        });
+        let inventory_path = output.join("local-dir-inventory.json");
+        let mut bytes = serde_json::to_vec_pretty(&inventory)?;
+        bytes.push(b'\n');
+        fs::write(&inventory_path, bytes)?;
+        Ok(inventory_path)
+    }
+
+    fn relative_posix(base: &Path, path: &Path) -> Result<String, io::Error> {
+        let relative = path
+            .strip_prefix(base)
+            .map_err(|_outside| io::Error::other("conformance path escaped its base"))?;
+        let rendered = relative.to_string_lossy().replace('\\', "/");
+        if rendered.is_empty() || rendered.starts_with('/') || rendered.contains(':') {
+            Err(io::Error::other("conformance path is not portable"))
+        } else {
+            Ok(rendered)
+        }
+    }
+
+    fn git_entry(bytes: &[u8]) -> Result<HubTreeEntry, Box<dyn Error>> {
+        let mut hasher = Sha1::new();
+        hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
+        hasher.update(bytes);
+        Ok(HubTreeEntry::new(
+            u64::try_from(bytes.len())?,
+            format!("{:x}", hasher.finalize()),
+        )?)
+    }
 
     struct Fixture {
         directory: TempDir,

@@ -21,6 +21,12 @@ use super::rooted_fs::{
 };
 use super::sanitized_io::SanitizedIo;
 
+const GITIGNORE_BYTES: &[u8] = b"*";
+const CACHEDIR_TAG_BYTES: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n\
+# This file is a cache directory tag created by huggingface_hub.\n\
+# For information about cache directory tags, see:\n\
+#\thttps://bford.info/cachedir/\n";
+
 const MAX_LOCAL_DOWNLOAD_METADATA_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_TREE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -183,6 +189,7 @@ impl LocalDirBookkeepingWriter {
         commit: &CommitId,
         etag: &str,
     ) -> Result<(), LocalDirBookkeepingWriteError> {
+        self.ensure_scaffold()?;
         let destination = self.layout.file_path(path)?;
         let destination_relative = self.relative(&destination)?.to_path_buf();
         let metadata = self.layout.download_metadata_path(path)?;
@@ -216,6 +223,7 @@ impl LocalDirBookkeepingWriter {
         commit: &CommitId,
         tree: &HubTree,
     ) -> Result<LocalDirTreeWrite, LocalDirBookkeepingWriteError> {
+        self.ensure_scaffold()?;
         let destination = self.layout.tree_path(commit);
         let relative = self.relative(&destination)?.to_path_buf();
         let bytes = encode_tree(tree)?;
@@ -278,6 +286,27 @@ impl LocalDirBookkeepingWriter {
         }
         self.sync_parent(destination)
             .map_err(|source| LocalDirBookkeepingWriteError::io(&source, true))
+    }
+
+    fn ensure_scaffold(&self) -> Result<(), LocalDirBookkeepingWriteError> {
+        let gitignore = self.layout.gitignore_path();
+        let cachedir_tag = self.layout.cachedir_tag_path();
+        let directory = gitignore.parent().ok_or_else(|| {
+            LocalDirBookkeepingWriteError::io(
+                &io::Error::other("local-dir bookkeeping directory is unavailable"),
+                false,
+            )
+        })?;
+        self.root.ensure_dir(self.relative(directory)?)?;
+        for (path, bytes) in [
+            (&cachedir_tag, CACHEDIR_TAG_BYTES),
+            (&gitignore, GITIGNORE_BYTES),
+        ] {
+            let relative = self.relative(path)?;
+            let staging = self.effects.next_staging_name()?;
+            let _outcome = self.root.create_once(relative, bytes, &staging)?;
+        }
+        Ok(())
     }
 
     fn stage_record(
@@ -719,7 +748,10 @@ mod tests {
     };
     use crate::{CommitId, Endpoint, RepoPath, RepositoryId, RepositorySpec};
 
-    use super::{LocalDirBookkeepingWriter, LocalDirHintReader, LocalDirTreeWrite};
+    use super::{
+        CACHEDIR_TAG_BYTES, GITIGNORE_BYTES, LocalDirBookkeepingWriter, LocalDirHintReader,
+        LocalDirTreeWrite,
+    };
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const ETAG: &str = "9e107d9d372bb6826bd81d3542a419d6";
@@ -1213,6 +1245,11 @@ mod tests {
         assert_eq!(
             fs::read(fixture.layout.download_metadata_path(&path)?)?,
             PINNED_METADATA
+        );
+        assert_eq!(fs::read(fixture.layout.gitignore_path())?, GITIGNORE_BYTES);
+        assert_eq!(
+            fs::read(fixture.layout.cachedir_tag_path())?,
+            CACHEDIR_TAG_BYTES
         );
         let hint = fixture
             .reader

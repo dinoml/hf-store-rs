@@ -192,6 +192,19 @@ jobs:
       - name: Pin cross-process file lock
         run: python -m pip install --disable-pip-version-check filelock==3.25.2
 
+      - name: Generate pinned Python local_dir corpus
+        run: >-
+          python crates/hf-store/tests/fixtures/huggingface_hub-v1.24.0/generate.py
+          --output "${{ runner.temp }}/hf-store-python-local-dir"
+
+      - name: Reuse and replace Python-written local_dir through Rust
+        env:
+          HF_STORE_PYTHON_LOCAL_DIR_INVENTORY: ${{ runner.temp }}/hf-store-python-local-dir/local-dir-inventory.json
+        run: >-
+          cargo +stable test -p hf-store --lib
+          cache::local_dir_reconciliation::tests::reuse_python_written_local_dir_and_reopen_offline
+          --locked -- --ignored --exact
+
       - name: Emit Rust-written standard-cache corpus
         env:
           HF_STORE_CONFORMANCE_OUTPUT: ${{ runner.temp }}/hf-store-rust-conformance
@@ -200,7 +213,15 @@ jobs:
           cache::standard_cache::tests::emit_python_conformance_fixture
           --locked -- --ignored --exact
 
-      - name: Exercise Rust-written cache with pinned Python readers offline
+      - name: Emit Rust-written local_dir replacement corpus
+        env:
+          HF_STORE_CONFORMANCE_OUTPUT: ${{ runner.temp }}/hf-store-rust-conformance
+        run: >-
+          cargo +stable test -p hf-store --lib
+          cache::local_dir_reconciliation::tests::emit_python_local_dir_conformance_fixture
+          --locked -- --ignored --exact
+
+      - name: Exercise Rust-written cache and local_dir with pinned Python readers offline
         run: >-
           python conformance/python/rust_writer_conformance.py
           --reference-root .conformance/huggingface_hub

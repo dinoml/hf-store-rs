@@ -14,7 +14,9 @@ from cache_conformance import (
     ConformanceError,
     Inventory,
     exercise_python_cache_readers,
+    exercise_python_local_dir_readers,
     load_inventory,
+    load_local_dir_inventory,
     load_python_readers,
     verify_reference_checkout,
 )
@@ -70,6 +72,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
         repositories, files = exercise_python_cache_readers(
             inventory, parsed.inventory.parent, readers
         )
+        local_dir_inventory = load_local_dir_inventory(
+            parsed.inventory.with_name("local-dir-inventory.json")
+        )
+        local_directories, local_dir_files = exercise_python_local_dir_readers(
+            local_dir_inventory, parsed.inventory.parent, readers
+        )
     except ConformanceError as error:
         print(f"conformance error: {error}", file=sys.stderr)
         return 1
@@ -78,7 +86,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         "verified Rust-written standard cache with pinned Python readers: "
         f"huggingface_hub {EXPECTED_HUGGINGFACE_HUB_VERSION} "
         f"at {EXPECTED_HUGGINGFACE_HUB_COMMIT}; "
-        f"{repositories} repositories and {files} files"
+        f"{repositories} repositories and {files} files; "
+        f"{local_directories} local_dir and {local_dir_files} files"
     )
     return 0
 
