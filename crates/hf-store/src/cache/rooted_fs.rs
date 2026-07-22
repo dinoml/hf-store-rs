@@ -489,7 +489,7 @@ impl RootedFileSystem for CacheRoot {
         #[cfg(unix)]
         {
             let (parent, name) = self.open_parent_and_name(path, true)?;
-            return match parent.symlink_contents(target, name) {
+            match parent.symlink_contents(target, name) {
                 Ok(()) => Ok(RelativeSymlinkOutcome::Created),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     Ok(RelativeSymlinkOutcome::Existing)
@@ -503,7 +503,7 @@ impl RootedFileSystem for CacheRoot {
                     Ok(RelativeSymlinkOutcome::Unsupported)
                 }
                 Err(error) => Err(error),
-            };
+            }
         }
 
         #[cfg(not(unix))]

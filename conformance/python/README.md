@@ -19,6 +19,14 @@ python crates/hf-store/tests/fixtures/huggingface_hub-v1.24.0/generate.py \
 python conformance/python/cache_conformance.py \
   --reference-root <huggingface_hub-checkout> \
   --inventory <temporary-directory>/inventory.json
+
+HF_STORE_CONFORMANCE_OUTPUT=<rust-temporary-directory> \
+  cargo test -p hf-store --lib \
+  cache::standard_cache::tests::emit_python_conformance_fixture \
+  --locked -- --ignored --exact
+python conformance/python/rust_writer_conformance.py \
+  --reference-root <huggingface_hub-checkout> \
+  --inventory <rust-temporary-directory>/inventory.json
 ```
 
 The checkout must be at commit
@@ -40,7 +48,10 @@ timestamp. It then exercises `read_download_metadata`, `read_tree_cache`,
 The repository-info method is patched to fail if that offline call attempts a
 network lookup.
 
-Passing this lane means the pinned Python readers accept the Python-written
-corpus. It does not claim hf-store offline completeness, that Python can read
-Rust-written entries, or that Rust can completely import Python cache or
-`local_dir` state; those remain separate roadmap gates.
+Passing the Python-writer lane means the pinned Python readers accept the
+Python-written corpus. Passing the Rust-writer matrix means those readers also
+accept Rust-written model, dataset, and space snapshots on Linux, macOS, and
+Windows, including Git and LFS identities and slash-containing refs. Neither
+lane claims hf-store offline completeness, that Rust can completely import
+Python cache or `local_dir` state, or compatibility with unpinned
+`huggingface_hub` versions; those remain separate roadmap gates.

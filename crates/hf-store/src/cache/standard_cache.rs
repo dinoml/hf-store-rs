@@ -663,6 +663,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use serde_json::{Value, json};
     use sha1::{Digest as _, Sha1};
     use sha2::Sha256;
     use tempfile::TempDir;
@@ -680,6 +681,19 @@ mod tests {
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const CONFIG_BYTES: &[u8] = b"{\"model_type\":\"fixture\"}\n";
     const WEIGHTS_BYTES: &[u8] = b"fixture-weights\n";
+    const MODEL_COMMIT: &str = "1111111111111111111111111111111111111111";
+    const DATASET_COMMIT: &str = "2222222222222222222222222222222222222222";
+    const SPACE_COMMIT: &str = "3333333333333333333333333333333333333333";
+    const DATASET_BLOB_ID: &str = "da60683925f47d433804d08c7128d3fd1bd850f1";
+    const MODEL_CONFORMANCE_BYTES: &[u8] = include_bytes!(
+        "../../tests/fixtures/huggingface_hub-v1.24.0/cache/models--fixture-model/snapshots/1111111111111111111111111111111111111111/config.json"
+    );
+    const DATASET_CONFORMANCE_BYTES: &[u8] = include_bytes!(
+        "../../tests/fixtures/huggingface_hub-v1.24.0/cache/datasets--fixture-org--fixture-dataset/snapshots/2222222222222222222222222222222222222222/data/train.jsonl"
+    );
+    const SPACE_CONFORMANCE_BYTES: &[u8] = include_bytes!(
+        "../../tests/fixtures/huggingface_hub-v1.24.0/cache/spaces--fixture-org--fixture-space/blobs/8d7bedcfa905ca2dc23b3a5c5f048cd8d4eacd05"
+    );
 
     #[test]
     fn writes_a_complete_python_layout_and_opens_it_offline() -> Result<(), Box<dyn Error>> {
@@ -1030,7 +1044,7 @@ mod tests {
             &Revision::parse("main")?,
             &fixture.commit,
             &tree,
-            &[path.clone()],
+            std::slice::from_ref(&path),
             source(&contents, None),
         )?;
 
@@ -1047,6 +1061,183 @@ mod tests {
             .ok_or("relative link target")?
         );
         Ok(())
+    }
+
+    #[test]
+    fn rust_writer_conformance_emitter_covers_all_repository_kinds() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let inventory = emit_rust_writer_conformance(&directory.path().join("output"))?;
+        let value: Value = serde_json::from_slice(&fs::read(inventory)?)?;
+
+        assert_eq!(value["producer"], "hf-store-rs");
+        assert_eq!(value["cache_root"], "cache");
+        let repositories = value["repositories"]
+            .as_array()
+            .ok_or("conformance repositories")?;
+        assert_eq!(repositories.len(), 3);
+        assert_eq!(repositories[0]["repo_type"], "model");
+        assert_eq!(repositories[1]["repo_type"], "dataset");
+        assert_eq!(repositories[2]["repo_type"], "space");
+        assert_eq!(repositories[1]["refs"][1]["revision"], "refs/pr/7");
+        assert_eq!(value["runtime_symlinks_materialized"], cfg!(unix));
+        for repository in repositories {
+            assert_eq!(
+                repository["files"][0]["snapshot_form"],
+                if cfg!(unix) {
+                    "relative_symlink_runtime"
+                } else {
+                    "copied_regular_with_blob"
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "invoked by the pinned-Python conformance job with an explicit output path"]
+    fn emit_python_conformance_fixture() -> Result<(), Box<dyn Error>> {
+        let output = std::env::var_os("HF_STORE_CONFORMANCE_OUTPUT")
+            .map(std::path::PathBuf::from)
+            .ok_or("HF_STORE_CONFORMANCE_OUTPUT is required")?;
+        let inventory = emit_rust_writer_conformance(&output)?;
+        println!("{}", inventory.display());
+        Ok(())
+    }
+
+    struct ConformanceCase {
+        spec: RepositorySpec,
+        commit: CommitId,
+        refs: &'static [&'static str],
+        path: RepoPath,
+        bytes: &'static [u8],
+        entry: HubTreeEntry,
+    }
+
+    fn emit_rust_writer_conformance(
+        output: &std::path::Path,
+    ) -> Result<std::path::PathBuf, Box<dyn Error>> {
+        fs::create_dir(output)?;
+        let cache = output.join("cache");
+        fs::create_dir(&cache)?;
+        let endpoint = Endpoint::hugging_face();
+        let cases = rust_writer_conformance_cases()?;
+        let mut repositories = Vec::with_capacity(cases.len());
+        let mut runtime_symlinks_materialized = false;
+
+        for case in cases {
+            let layout = HubCacheLayout::shared(&cache, &endpoint, &case.spec)?;
+            let tree = HubTree::new([(case.path.clone(), case.entry.clone())])?;
+            let writer = StandardCacheWriter::shared_with_materialization(
+                &cache,
+                &endpoint,
+                &case.spec,
+                Fixture::effects(),
+                SnapshotMaterialization::Auto,
+            )?;
+            let mut refs = Vec::with_capacity(case.refs.len());
+            for revision in case.refs {
+                let revision = Revision::parse(revision)?;
+                writer.publish(
+                    &revision,
+                    &case.commit,
+                    &tree,
+                    std::slice::from_ref(&case.path),
+                    |_path| Ok(Cursor::new(case.bytes.to_vec())),
+                )?;
+                refs.push(json!({
+                    "revision": revision.as_str(),
+                    "path": relative_posix(
+                        layout.repository_directory(),
+                        &layout.ref_path(&revision)?,
+                    )?,
+                }));
+            }
+            let snapshot = layout.snapshot_file(&case.commit, &case.path);
+            let snapshot_form = if fs::symlink_metadata(&snapshot)?.file_type().is_symlink() {
+                runtime_symlinks_materialized = true;
+                "relative_symlink_runtime"
+            } else {
+                "copied_regular_with_blob"
+            };
+            let key = crate::cache::hub_cache::compatible_blob_key(&case.entry)?;
+            repositories.push(json!({
+                "repo_type": case.spec.kind().to_string(),
+                "repo_id": case.spec.id().as_str(),
+                "cache_directory": relative_posix(&cache, layout.repository_directory())?,
+                "commit": case.commit.as_str(),
+                "refs": refs,
+                "tree_path": relative_posix(
+                    layout.repository_directory(),
+                    &layout.tree_path(&case.commit),
+                )?,
+                "files": [{
+                    "path": case.path.as_str(),
+                    "etag": key.as_str(),
+                    "blob_id": case.entry.blob_id(),
+                    "size": case.entry.size(),
+                    "content_sha256": sha256_hex(case.bytes),
+                    "snapshot_form": snapshot_form,
+                }],
+                "missing_paths": [],
+            }));
+        }
+
+        let inventory = json!({
+            "format_version": 1,
+            "producer": "hf-store-rs",
+            "cache_root": "cache",
+            "runtime_symlinks_materialized": runtime_symlinks_materialized,
+            "repositories": repositories,
+        });
+        let inventory_path = output.join("inventory.json");
+        let mut encoded = serde_json::to_vec_pretty(&inventory)?;
+        encoded.push(b'\n');
+        fs::write(&inventory_path, encoded)?;
+        Ok(inventory_path)
+    }
+
+    fn rust_writer_conformance_cases() -> Result<[ConformanceCase; 3], Box<dyn Error>> {
+        let dataset_size = u64::try_from(DATASET_CONFORMANCE_BYTES.len())?;
+        let dataset_sha256 = sha256_hex(DATASET_CONFORMANCE_BYTES);
+        Ok([
+            ConformanceCase {
+                spec: RepositorySpec::model(RepositoryId::parse("fixture-model")?),
+                commit: CommitId::parse(MODEL_COMMIT)?,
+                refs: &["main"],
+                path: RepoPath::parse("config.json")?,
+                bytes: MODEL_CONFORMANCE_BYTES,
+                entry: git_entry(MODEL_CONFORMANCE_BYTES)?,
+            },
+            ConformanceCase {
+                spec: RepositorySpec::dataset(RepositoryId::parse("fixture-org/fixture-dataset")?),
+                commit: CommitId::parse(DATASET_COMMIT)?,
+                refs: &["main", "refs/pr/7"],
+                path: RepoPath::parse("data/train.jsonl")?,
+                bytes: DATASET_CONFORMANCE_BYTES,
+                entry: HubTreeEntry::new(dataset_size, DATASET_BLOB_ID)?
+                    .with_lfs(&dataset_sha256, dataset_size)?,
+            },
+            ConformanceCase {
+                spec: RepositorySpec::space(RepositoryId::parse("fixture-org/fixture-space")?),
+                commit: CommitId::parse(SPACE_COMMIT)?,
+                refs: &["main"],
+                path: RepoPath::parse("src/app.py")?,
+                bytes: SPACE_CONFORMANCE_BYTES,
+                entry: git_entry(SPACE_CONFORMANCE_BYTES)?,
+            },
+        ])
+    }
+
+    fn relative_posix(base: &std::path::Path, path: &std::path::Path) -> Result<String, io::Error> {
+        let relative = path
+            .strip_prefix(base)
+            .map_err(|_outside| io::Error::other("conformance path escaped its base"))?;
+        let rendered = relative.to_string_lossy().replace('\\', "/");
+        if rendered.is_empty() || rendered.starts_with('/') || rendered.contains(':') {
+            Err(io::Error::other("conformance path is not portable"))
+        } else {
+            Ok(rendered)
+        }
     }
 
     struct Fixture {
@@ -1126,19 +1317,27 @@ mod tests {
     }
 
     fn git_entry(bytes: &[u8]) -> Result<HubTreeEntry, Box<dyn Error>> {
+        Ok(HubTreeEntry::new(
+            u64::try_from(bytes.len())?,
+            git_blob_id(bytes),
+        )?)
+    }
+
+    fn git_blob_id(bytes: &[u8]) -> String {
         let mut hasher = Sha1::new();
         hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
         hasher.update(bytes);
-        Ok(HubTreeEntry::new(
-            u64::try_from(bytes.len())?,
-            format!("{:x}", hasher.finalize()),
-        )?)
+        format!("{:x}", hasher.finalize())
     }
 
     fn lfs_entry(bytes: &[u8]) -> Result<HubTreeEntry, Box<dyn Error>> {
         let size = u64::try_from(bytes.len())?;
-        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let sha256 = sha256_hex(bytes);
         Ok(HubTreeEntry::new(size, "opaque-lfs-pointer")?.with_lfs(sha256, size)?)
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
     }
 
     fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {

@@ -62,6 +62,7 @@ class FileFixture:
 
     path: PurePosixPath
     etag: str
+    blob_id: str
     size: int
     content_sha256: str
     snapshot_form: str
@@ -88,6 +89,7 @@ class Inventory:
     cache_root: PurePosixPath
     runtime_symlinks_materialized: bool
     repositories: tuple[RepositoryFixture, ...]
+    producer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -402,6 +404,10 @@ def load_inventory(path: Path) -> Inventory:
                         _required(file_record, "etag", file_context),
                         f"{file_context}.etag",
                     ),
+                    blob_id=_string(
+                        _required(file_record, "blob_id", file_context),
+                        f"{file_context}.blob_id",
+                    ),
                     size=_integer(
                         _required(file_record, "size", file_context),
                         f"{file_context}.size",
@@ -461,6 +467,11 @@ def load_inventory(path: Path) -> Inventory:
             "fixture inventory runtime_symlinks_materialized",
         ),
         repositories=tuple(repositories),
+        producer=(
+            _string(root["producer"], "fixture inventory producer")
+            if "producer" in root
+            else None
+        ),
     )
 
 
@@ -923,6 +934,48 @@ def exercise_python_cache_readers(
         revisions = [repository.commit, *(ref.revision for ref in repository.refs)]
         expected_snapshot = repo_directory / "snapshots" / repository.commit
         for revision in revisions:
+            cached_tree = readers.get_cached_repo_tree(
+                repo_id=repository.repo_id,
+                repo_type=repository.repo_type,
+                revision=revision,
+                cache_dir=cache_root,
+            )
+            cached_tree_by_path: dict[str, object] = {}
+            for cached_entry in cached_tree:
+                cached_path = getattr(cached_entry, "path", None)
+                if not isinstance(cached_path, str):
+                    raise ConformanceError(
+                        "pinned get_cached_repo_tree returned a record without a path for "
+                        f"{repository.repo_type}/{repository.repo_id}@{revision}"
+                    )
+                if cached_path in cached_tree_by_path:
+                    raise ConformanceError(
+                        "pinned get_cached_repo_tree returned a duplicate path for "
+                        f"{repository.repo_type}/{repository.repo_id}@{revision}:"
+                        f"{cached_path}"
+                    )
+                cached_tree_by_path[cached_path] = cached_entry
+
+            if set(cached_tree_by_path) != expected_tree_paths:
+                raise ConformanceError(
+                    "pinned get_cached_repo_tree returned the wrong paths for "
+                    f"{repository.repo_type}/{repository.repo_id}@{revision}"
+                )
+            for fixture in repository.files:
+                cached_entry = cached_tree_by_path[fixture.path.as_posix()]
+                if getattr(cached_entry, "size", None) != fixture.size:
+                    raise ConformanceError(
+                        "pinned get_cached_repo_tree returned the wrong size for "
+                        f"{repository.repo_type}/{repository.repo_id}@{revision}:"
+                        f"{fixture.path.as_posix()}"
+                    )
+                if getattr(cached_entry, "blob_id", None) != fixture.blob_id:
+                    raise ConformanceError(
+                        "pinned get_cached_repo_tree returned the wrong object ID for "
+                        f"{repository.repo_type}/{repository.repo_id}@{revision}:"
+                        f"{fixture.path.as_posix()}"
+                    )
+
             for fixture in repository.files:
                 cached = readers.try_to_load_from_cache(
                     repo_id=repository.repo_id,
