@@ -13,7 +13,6 @@ categories = ["caching", "web-programming::http-client"]
 publish = false
 
 [dependencies]
-atomic-write-file.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 fs4.workspace = true

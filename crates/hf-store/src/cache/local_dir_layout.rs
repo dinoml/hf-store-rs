@@ -21,7 +21,7 @@ impl HubLocalDirLayout {
         let root = root.as_ref().to_path_buf();
         let upstream_bookkeeping = root.join(".cache").join("huggingface");
         let completion_sidecar =
-            CacheLayout::new(root.join(".cache").join("hf-store"), endpoint, spec)?;
+            CacheLayout::nested(&root, Path::new(".cache/hf-store"), endpoint, spec)?;
         Ok(Self {
             root,
             upstream_bookkeeping,
@@ -155,6 +155,11 @@ mod tests {
         let spec = RepositorySpec::dataset(RepositoryId::parse("org/data")?);
         let layout = HubLocalDirLayout::new(&root, &endpoint, &spec)?;
 
+        assert_eq!(layout.completion_sidecar().capability_root(), root);
+        assert_eq!(
+            layout.completion_sidecar().cache_root_relative(),
+            PathBuf::from(".cache/hf-store/hf-store-v1")
+        );
         assert!(
             layout
                 .completion_sidecar()

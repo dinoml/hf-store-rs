@@ -18,6 +18,21 @@ destination. A writer completes, flushes, synchronizes, and validates staged
 bytes before publication. Normal lookup never searches staging or partial
 namespaces.
 
+The caller-authorized cache or materialization root is opened once as a
+filesystem capability and retained for the operation. Read and mutation
+adapters are derived from that same opened directory handle; neither adapter
+may reopen the caller's path independently. Every descendant path is relative,
+contains only normal components, and is traversed or created one component at a
+time without following symbolic links or Windows reparse points. Windows
+adapters inspect the reparse attribute before and after opening entries so tags
+that are not reported as symbolic links are rejected too. Reads, locks,
+staging, publication, replacement, cleanup, and directory synchronization all
+operate through that retained root. A descendant directory or final entry that
+is a link, reparse point, or other unexpected file type is rejected; it is
+never resolved through an ambient joined path. The authorized root itself may
+intentionally name a caller-selected link, but no nested cache component
+becomes a new authority boundary.
+
 Cooperating processes coordinate with operating-system advisory file locks on
 fixed-size lock keys. Writers take exclusive locks for a blob or mutable ref;
 readers take shared locks where replacement or garbage collection could race.
@@ -63,6 +78,8 @@ removing snapshot or blob reachability.
 
 - Abrupt termination can leave staging files and inert lock files, but cannot
   make them visible as completed blobs, snapshots, or refs.
+- A mutable shared cache cannot redirect hf-store reads or writes through a
+  nested link or reparse point outside the caller-authorized root.
 - Competing publishers converge on one validated immutable object.
 - Windows correctness does not require Developer Mode or symlink privileges.
 - Cache roots on filesystems without reliable advisory locking are rejected for

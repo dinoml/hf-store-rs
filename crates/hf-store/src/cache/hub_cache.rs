@@ -15,6 +15,7 @@ use super::hub_layout::{HubBlobKey, HubCacheLayout};
 use super::hub_metadata::{HubMetadataError, HubTree, HubTreeEntry, decode_ref, decode_tree};
 use super::key::BlobDigest;
 use super::publication::{CacheDirectory, EntryKind, FileSystem, RegularFileOpen};
+use super::rooted_fs::is_unsafe_cache_path_error;
 
 // A standard-cache ref contains one 40-byte commit. Leave limited headroom for
 // detecting malformed records without permitting an unbounded allocation.
@@ -25,10 +26,9 @@ const MAX_TREE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(super) struct HubCacheReader {
-    cache_root: PathBuf,
+    root: Arc<dyn CacheDirectory>,
     layout: HubCacheLayout,
     repository_relative: PathBuf,
-    file_system: Arc<dyn FileSystem>,
 }
 
 impl HubCacheReader {
@@ -36,10 +36,18 @@ impl HubCacheReader {
         root: impl AsRef<Path>,
         endpoint: &Endpoint,
         spec: &RepositorySpec,
-        file_system: Arc<dyn FileSystem>,
-    ) -> Result<Self, ValidationError> {
+        file_system: &dyn FileSystem,
+    ) -> Result<Self, HubCacheReadError> {
         let root = root.as_ref();
         let layout = HubCacheLayout::shared(root, endpoint, spec)?;
+        let authority = file_system.open_cache_authority(root)?;
+        Self::from_layout(layout, authority.reader()).map_err(HubCacheReadError::from)
+    }
+
+    pub(super) fn from_layout(
+        layout: HubCacheLayout,
+        root: Arc<dyn CacheDirectory>,
+    ) -> Result<Self, ValidationError> {
         let repository_relative = layout
             .repository_directory()
             .file_name()
@@ -51,10 +59,9 @@ impl HubCacheReader {
                 )
             })?;
         Ok(Self {
-            cache_root: root.to_path_buf(),
+            root,
             layout,
             repository_relative,
-            file_system,
         })
     }
 
@@ -91,6 +98,10 @@ impl HubCacheReader {
         })
     }
 
+    pub(super) const fn layout(&self) -> &HubCacheLayout {
+        &self.layout
+    }
+
     pub(super) fn read_snapshot_file(
         &self,
         index: &HubCacheIndex,
@@ -118,6 +129,7 @@ impl HubCacheReader {
                         &snapshot_relative,
                         &blob_path,
                         &blob_relative,
+                        blob_key,
                         entry,
                     );
                 }
@@ -156,6 +168,7 @@ impl HubCacheReader {
             size,
             digest,
             form,
+            hub_blob_key: blob_key,
         })
     }
 
@@ -166,6 +179,7 @@ impl HubCacheReader {
         snapshot_relative: &Path,
         blob_path: &Path,
         blob_relative: &Path,
+        hub_blob_key: HubBlobKey,
         entry: &HubTreeEntry,
     ) -> Result<HubCacheFile, HubCacheReadError> {
         let target = match directory.read_link(snapshot_relative) {
@@ -195,6 +209,7 @@ impl HubCacheReader {
             size,
             digest,
             form: HubSnapshotFileForm::RelativeSymlink,
+            hub_blob_key,
         })
     }
 
@@ -260,17 +275,11 @@ impl HubCacheReader {
         &self,
         missing: MissingRecord,
     ) -> Result<Arc<dyn CacheDirectory>, HubCacheReadError> {
-        let root = match self.file_system.open_directory(&self.cache_root) {
-            Ok(root) => root,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Err(missing.into_error());
-            }
-            Err(source) => return Err(source.into()),
-        };
-        match root.entry_kind(&self.repository_relative)? {
+        match self.root.entry_kind(&self.repository_relative)? {
             EntryKind::Missing => Err(missing.into_error()),
             EntryKind::RegularFile => Err(HubCacheReadError::corrupt()),
-            EntryKind::Other => root
+            EntryKind::Other => self
+                .root
                 .open_dir_nofollow(&self.repository_relative)
                 .map_err(HubCacheReadError::from),
         }
@@ -314,14 +323,16 @@ pub(super) struct HubCacheFile {
     size: u64,
     digest: BlobDigest,
     form: HubSnapshotFileForm,
+    hub_blob_key: HubBlobKey,
 }
 
 impl HubCacheFile {
     /// Returns the path observed during validation.
     ///
     /// A compatible cache is mutable and does not participate in hf-store
-    /// leases. A later importer must stage and revalidate bytes rather than
-    /// treating this path as permanently bound to `digest`.
+    /// leases. Consumers must reopen and revalidate the bytes rather than
+    /// treating this path as permanently bound to `digest`. A later owned
+    /// materializer may independently stage the validated bytes.
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
@@ -340,6 +351,10 @@ impl HubCacheFile {
 
     pub(super) const fn form(&self) -> HubSnapshotFileForm {
         self.form
+    }
+
+    pub(super) const fn hub_blob_key(&self) -> &HubBlobKey {
+        &self.hub_blob_key
     }
 }
 
@@ -492,6 +507,8 @@ pub(super) struct HubCacheReadError {
 #[derive(Debug)]
 enum HubCacheReadErrorKind {
     Io(io::Error),
+    UnsafeFileSystem(io::Error),
+    Validation(ValidationError),
     Missing,
     Incomplete,
     Corrupt(Option<HubMetadataError>),
@@ -562,7 +579,13 @@ impl HubCacheReadError {
     }
 
     pub(super) fn is_unsafe(&self) -> bool {
-        matches!(self.kind.as_ref(), HubCacheReadErrorKind::Unsafe(_))
+        matches!(
+            self.kind.as_ref(),
+            HubCacheReadErrorKind::Unsafe(_) | HubCacheReadErrorKind::UnsafeFileSystem(_)
+        ) || matches!(
+            self.kind.as_ref(),
+            HubCacheReadErrorKind::Validation(source) if source.is_unsafe_path()
+        )
     }
 
     pub(super) fn backtrace(&self) -> &Backtrace {
@@ -574,6 +597,8 @@ impl Display for HubCacheReadError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         let message = match self.kind.as_ref() {
             HubCacheReadErrorKind::Io(_) => "Hub cache filesystem operation failed",
+            HubCacheReadErrorKind::UnsafeFileSystem(_) => "Hub cache filesystem path is unsafe",
+            HubCacheReadErrorKind::Validation(_) => "Hub cache identity validation failed",
             HubCacheReadErrorKind::Missing => "Hub cache revision is missing",
             HubCacheReadErrorKind::Incomplete => "Hub cache revision is incomplete",
             HubCacheReadErrorKind::Corrupt(_) => "Hub cache metadata is corrupt",
@@ -589,10 +614,14 @@ impl Display for HubCacheReadError {
 impl Error for HubCacheReadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self.kind.as_ref() {
-            HubCacheReadErrorKind::Io(source) => Some(source),
+            HubCacheReadErrorKind::Io(source) | HubCacheReadErrorKind::UnsafeFileSystem(source) => {
+                Some(source)
+            }
+            HubCacheReadErrorKind::Validation(source) | HubCacheReadErrorKind::Unsafe(source) => {
+                Some(source)
+            }
             HubCacheReadErrorKind::Corrupt(Some(source))
             | HubCacheReadErrorKind::UnsupportedVersion(source) => Some(source),
-            HubCacheReadErrorKind::Unsafe(source) => Some(source),
             HubCacheReadErrorKind::Missing
             | HubCacheReadErrorKind::Incomplete
             | HubCacheReadErrorKind::Corrupt(None) => None,
@@ -602,7 +631,17 @@ impl Error for HubCacheReadError {
 
 impl From<io::Error> for HubCacheReadError {
     fn from(source: io::Error) -> Self {
-        Self::new(HubCacheReadErrorKind::Io(source))
+        if is_unsafe_cache_path_error(&source) {
+            Self::new(HubCacheReadErrorKind::UnsafeFileSystem(source))
+        } else {
+            Self::new(HubCacheReadErrorKind::Io(source))
+        }
+    }
+}
+
+impl From<ValidationError> for HubCacheReadError {
+    fn from(source: ValidationError) -> Self {
+        Self::new(HubCacheReadErrorKind::Validation(source))
     }
 }
 
@@ -637,8 +676,7 @@ mod tests {
             let directory = TempDir::new()?;
             let endpoint = Endpoint::hugging_face();
             let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
-            let reader =
-                HubCacheReader::shared(directory.path(), &endpoint, &spec, Arc::new(OsFileSystem))?;
+            let reader = HubCacheReader::shared(directory.path(), &endpoint, &spec, &OsFileSystem)?;
             Ok(Self { directory, reader })
         }
 
@@ -750,6 +788,23 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn reader_rejects_a_repository_junction_as_unsafe() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let outside = TempDir::new()?;
+        create_dir_junction(outside.path(), fixture.repository())?;
+
+        let error = fixture
+            .reader
+            .read_index(&Revision::parse(COMMIT)?)
+            .expect_err("followed a repository junction outside the cache root");
+
+        assert!(error.is_unsafe());
+        fs::remove_dir(fixture.repository())?;
+        Ok(())
+    }
+
     #[test]
     fn reader_rejects_non_file_records_and_oversized_metadata()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -853,8 +908,7 @@ mod tests {
         ];
 
         for (spec, revision, path, expected_form, expected_digest) in cases {
-            let reader =
-                HubCacheReader::shared(&cache_root, &endpoint, &spec, Arc::new(OsFileSystem))?;
+            let reader = HubCacheReader::shared(&cache_root, &endpoint, &spec, &OsFileSystem)?;
             let index = reader.read_index(&revision)?;
             let file = reader.read_snapshot_file(&index, &path)?;
 
@@ -889,8 +943,7 @@ mod tests {
         symlink(format!("../../../blobs/{SPACE_BLOB}"), &link)?;
         let endpoint = Endpoint::hugging_face();
         let spec = RepositorySpec::space(RepositoryId::parse("fixture-org/fixture-space")?);
-        let reader =
-            HubCacheReader::shared(directory.path(), &endpoint, &spec, Arc::new(OsFileSystem))?;
+        let reader = HubCacheReader::shared(directory.path(), &endpoint, &spec, &OsFileSystem)?;
         let index = reader.read_index(&Revision::parse("main")?)?;
 
         let file = reader.read_snapshot_file(&index, &crate::RepoPath::parse("src/app.py")?)?;
@@ -1444,7 +1497,7 @@ mod tests {
         fs::create_dir_all(&root)?;
         let endpoint = Endpoint::hugging_face();
         let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
-        let reader = HubCacheReader::shared(&root, &endpoint, &spec, Arc::new(OsFileSystem))?;
+        let reader = HubCacheReader::shared(&root, &endpoint, &spec, &OsFileSystem)?;
         let repository = reader.layout.repository_directory();
         let tree_path = repository.join(format!("trees/{COMMIT}.json"));
         fs::create_dir_all(tree_path.parent().ok_or("tree has no parent")?)?;
@@ -1494,6 +1547,23 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn create_dir_junction(target: &Path, link: &Path) -> io::Result<()> {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "failed to create test junction: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )))
+        }
     }
 
     #[cfg(unix)]

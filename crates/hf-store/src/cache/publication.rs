@@ -1,13 +1,13 @@
 use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
-use std::fs::{File, OpenOptions};
+#[cfg(test)]
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use atomic_write_file::AtomicWriteFile;
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsSyncExt;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::validation::ValidationError;
 use crate::{CommitId, Endpoint, RepoPath, RepositorySpec, Revision};
 
-use super::hub_layout::HubBlobKey;
+use super::hub_layout::{HubBlobKey, HubCacheLayout};
 use super::key::{BlobDigest, OriginKey, RepositoryKey, SelectionId};
 use super::layout::CacheLayout;
 use super::metadata::{
@@ -25,6 +25,12 @@ use super::metadata::{
     PartialTransferRecord, RefRecord, RepositoryRecord, SnapshotFileRecord, SnapshotManifestRecord,
     decode_record, encode_record,
 };
+use super::rooted_fs::{
+    CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedRegularFile,
+    StagingName, is_reparse_point, is_unsafe_cache_path_error, unsafe_cache_path,
+};
+#[cfg(test)]
+use super::rooted_fs::{RootedLockGuard, RootedRead, RootedWrite};
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_SMALL_RECORD_BYTES: usize = 64 * 1024;
@@ -96,18 +102,6 @@ impl Clock for SystemClock {
     }
 }
 
-pub(super) trait DurableWrite: Write + Send {
-    fn sync_all(&self) -> io::Result<()>;
-}
-
-impl DurableWrite for File {
-    fn sync_all(&self) -> io::Result<()> {
-        File::sync_all(self)
-    }
-}
-
-pub(super) trait LockGuard: Send {}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum EntryKind {
     Missing,
@@ -131,89 +125,46 @@ pub(super) trait CacheDirectory: Debug + Send + Sync {
     fn read_link(&self, path: &Path) -> io::Result<PathBuf>;
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct CacheAuthority {
+    reader: Arc<dyn CacheDirectory>,
+    writer: Arc<dyn RootedFileSystem>,
+}
+
+impl CacheAuthority {
+    fn new(reader: Arc<dyn CacheDirectory>, writer: Arc<dyn RootedFileSystem>) -> Self {
+        Self { reader, writer }
+    }
+
+    pub(super) fn reader(&self) -> Arc<dyn CacheDirectory> {
+        Arc::clone(&self.reader)
+    }
+
+    pub(super) fn writer(&self) -> Arc<dyn RootedFileSystem> {
+        Arc::clone(&self.writer)
+    }
+}
+
 pub(super) trait FileSystem: Debug + Send + Sync {
-    fn open_directory(&self, path: &Path) -> io::Result<Arc<dyn CacheDirectory>>;
-    fn create_dir_all(&self, path: &Path) -> io::Result<()>;
-    fn create_new(&self, path: &Path) -> io::Result<Box<dyn DurableWrite>>;
-    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>>;
-    fn entry_kind(&self, path: &Path) -> io::Result<EntryKind>;
-    fn remove_file(&self, path: &Path) -> io::Result<()>;
-    fn rename(&self, source: &Path, destination: &Path) -> io::Result<()>;
-    fn atomic_replace(&self, destination: &Path, bytes: &[u8]) -> io::Result<()>;
-    fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn LockGuard>>;
-    fn sync_directory(&self, path: &Path) -> io::Result<()>;
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
+    fn open_cache_authority(&self, path: &Path) -> io::Result<CacheAuthority>;
 }
 
 #[derive(Debug)]
 pub(super) struct OsFileSystem;
 
 impl FileSystem for OsFileSystem {
-    fn open_directory(&self, path: &Path) -> io::Result<Arc<dyn CacheDirectory>> {
+    fn open_cache_authority(&self, path: &Path) -> io::Result<CacheAuthority> {
         let path = if path.as_os_str().is_empty() {
             Path::new(".")
         } else {
             path
         };
         let directory = Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
-        Ok(Arc::new(OsCacheDirectory { directory }))
-    }
-
-    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(path)
-    }
-
-    fn create_new(&self, path: &Path) -> io::Result<Box<dyn DurableWrite>> {
-        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        Ok(Box::new(file))
-    }
-
-    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
-        Ok(Box::new(File::open(path)?))
-    }
-
-    fn entry_kind(&self, path: &Path) -> io::Result<EntryKind> {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_file() => Ok(EntryKind::RegularFile),
-            Ok(_metadata) => Ok(EntryKind::Other),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(EntryKind::Missing),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
-        std::fs::remove_file(path)
-    }
-
-    fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
-        std::fs::rename(source, destination)
-    }
-
-    fn atomic_replace(&self, destination: &Path, bytes: &[u8]) -> io::Result<()> {
-        let mut file = AtomicWriteFile::open(destination)?;
-        file.write_all(bytes)?;
-        file.commit()
-    }
-
-    fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn LockGuard>> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
-        fs4::FileExt::lock(&file)?;
-        Ok(Box::new(OsLockGuard { _file: file }))
-    }
-
-    fn sync_directory(&self, path: &Path) -> io::Result<()> {
-        sync_directory(path)
-    }
-
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
-        std::fs::read_dir(path)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect()
+        let reader = Arc::new(OsCacheDirectory {
+            directory: directory.try_clone()?,
+        });
+        let writer = Arc::new(CacheRoot::from_dir(directory));
+        Ok(CacheAuthority::new(reader, writer))
     }
 }
 
@@ -229,7 +180,7 @@ impl OsCacheDirectory {
             let Component::Normal(name) = component else {
                 return Err(invalid_cache_relative_path());
             };
-            directory = directory.open_dir_nofollow(name)?;
+            directory = open_cache_child_directory(&directory, name)?;
         }
         Ok(directory)
     }
@@ -264,6 +215,11 @@ impl CacheDirectory for OsCacheDirectory {
                 return Ok(RegularFileOpen::Missing);
             }
             Err(error) => return Err(error),
+            Ok(metadata) if metadata_is_redirect(&metadata) => {
+                return Err(unsafe_cache_path(
+                    "Hub cache file is a link or reparse point",
+                ));
+            }
             Ok(metadata) if metadata.file_type().is_file() => {}
             Ok(_metadata) => return Ok(RegularFileOpen::Other),
         }
@@ -280,6 +236,11 @@ impl CacheDirectory for OsCacheDirectory {
             Err(error) => return Err(error),
         };
         let metadata = file.metadata()?;
+        if is_reparse_point(&metadata) {
+            return Err(unsafe_cache_path(
+                "opened Hub cache file is a reparse point",
+            ));
+        }
         if !metadata.file_type().is_file() {
             return Ok(RegularFileOpen::Other);
         }
@@ -298,6 +259,7 @@ impl CacheDirectory for OsCacheDirectory {
             Err(error) => return Err(error),
         };
         match parent.symlink_metadata(name) {
+            Ok(metadata) if metadata_is_redirect(&metadata) => Ok(EntryKind::Other),
             Ok(metadata) if metadata.file_type().is_file() => Ok(EntryKind::RegularFile),
             Ok(_metadata) => Ok(EntryKind::Other),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(EntryKind::Missing),
@@ -311,31 +273,45 @@ impl CacheDirectory for OsCacheDirectory {
     }
 }
 
+fn open_cache_child_directory(parent: &Dir, name: &std::ffi::OsStr) -> io::Result<Dir> {
+    let metadata = parent.symlink_metadata(name)?;
+    if metadata_is_redirect(&metadata) {
+        return Err(unsafe_cache_path(
+            "Hub cache directory component is a link or reparse point",
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Hub cache directory component is not a directory",
+        ));
+    }
+
+    let directory = parent.open_dir_nofollow(name)?;
+    let opened = directory.dir_metadata()?;
+    if is_reparse_point(&opened) {
+        return Err(unsafe_cache_path(
+            "opened Hub cache directory is a reparse point",
+        ));
+    }
+    if !opened.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened Hub cache entry is not a directory",
+        ));
+    }
+    Ok(directory)
+}
+
+fn metadata_is_redirect(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || is_reparse_point(metadata)
+}
+
 fn invalid_cache_relative_path() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         "cache capability path must contain only relative normal components",
     )
-}
-
-#[derive(Debug)]
-struct OsLockGuard {
-    _file: File,
-}
-
-impl LockGuard for OsLockGuard {}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    // This preserves an explicit filesystem boundary without claiming that
-    // Windows directory metadata reached durable storage. ADR 0003 reserves
-    // that stronger guarantee for a future capability-aware durable mode.
-    std::fs::metadata(path).map(|_metadata| ())
 }
 
 #[derive(Clone, Debug)]
@@ -360,11 +336,16 @@ impl Effects {
             faults,
         }
     }
+
+    pub(super) fn open_cache_authority(&self, path: &Path) -> io::Result<CacheAuthority> {
+        self.file_system.open_cache_authority(path)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct CacheKernel {
     layout: CacheLayout,
+    root: Arc<dyn RootedFileSystem>,
     origin_record: OriginRecord,
     repository_record: RepositoryRecord,
     effects: Effects,
@@ -377,10 +358,37 @@ impl CacheKernel {
         spec: &RepositorySpec,
         effects: Effects,
     ) -> Result<Self, CacheError> {
+        let layout = CacheLayout::new(root, endpoint, spec)?;
+        let authority = effects.open_cache_authority(layout.capability_root())?;
+        Self::with_layout(layout, endpoint, spec, authority.writer(), effects)
+    }
+
+    pub(super) fn for_compatible_cache(
+        layout: &HubCacheLayout,
+        root: Arc<dyn RootedFileSystem>,
+        effects: Effects,
+    ) -> Result<Self, CacheError> {
+        Self::with_layout(
+            layout.sidecar().clone(),
+            layout.endpoint(),
+            layout.repository(),
+            root,
+            effects,
+        )
+    }
+
+    fn with_layout(
+        layout: CacheLayout,
+        endpoint: &Endpoint,
+        spec: &RepositorySpec,
+        root: Arc<dyn RootedFileSystem>,
+        effects: Effects,
+    ) -> Result<Self, CacheError> {
         let origin_key = OriginKey::derive(endpoint)?;
         let repository_key = RepositoryKey::derive(&origin_key, spec)?;
         Ok(Self {
-            layout: CacheLayout::new(root, endpoint, spec)?,
+            layout,
+            root,
             origin_record: OriginRecord::new(endpoint),
             repository_record: RepositoryRecord::new(&origin_key, &repository_key, spec),
             effects,
@@ -388,20 +396,19 @@ impl CacheKernel {
     }
 
     pub(super) fn initialize(&self) -> Result<(), CacheError> {
-        self.effects
-            .file_system
-            .create_dir_all(self.layout.cache_root())?;
+        self.root.ensure_dir(self.layout.cache_root_relative())?;
         let format_lock = self.layout.format_lock();
-        create_parent_directories(self.effects.file_system.as_ref(), &format_lock)?;
-        let _guard = self.effects.file_system.lock_exclusive(&format_lock)?;
+        self.ensure_parent(&format_lock)?;
+        let format_lock_relative = self.relative_path(&format_lock)?;
+        let _guard = self.root.lock_exclusive(format_lock_relative)?;
         self.ensure_record(&self.layout.format_record(), &FormatRecord::new())?;
 
-        self.effects
-            .file_system
-            .create_dir_all(&self.layout.repository_directory())?;
-        self.effects
-            .file_system
-            .create_dir_all(&self.layout.staging_directory())?;
+        let repository_directory = self.layout.repository_directory();
+        let staging_directory = self.layout.staging_directory();
+        self.root
+            .ensure_dir(self.relative_path(&repository_directory)?)?;
+        self.root
+            .ensure_dir(self.relative_path(&staging_directory)?)?;
         self.ensure_record(&self.layout.origin_record(), &self.origin_record)?;
         self.ensure_record(&self.layout.repository_record(), &self.repository_record)?;
         Ok(())
@@ -415,10 +422,10 @@ impl CacheKernel {
     ) -> Result<BlobPublication, CacheError> {
         let operation_id = self.effects.operation_ids.next()?;
         let staging_path = self.layout.staged_blob(&operation_id.to_string());
-        create_parent_directories(self.effects.file_system.as_ref(), &staging_path)?;
-        let mut cleanup =
-            StagingCleanup::inactive(self.effects.file_system.as_ref(), staging_path.clone());
-        let mut staging_file = self.effects.file_system.create_new(&staging_path)?;
+        self.ensure_parent(&staging_path)?;
+        let staging_relative = self.relative_path(&staging_path)?.to_path_buf();
+        let mut cleanup = StagingCleanup::inactive(self.root.as_ref(), staging_relative.clone());
+        let mut staging_file = self.root.create_new(&staging_relative)?;
         cleanup.activate();
         self.check_fault(PublicationPoint::AfterStagingCreate, false)?;
         let (actual_size, actual_digest) =
@@ -436,41 +443,73 @@ impl CacheKernel {
 
         let destination = self.layout.blob_path(&expected_digest);
         let lock_path = self.layout.blob_lock(&expected_digest);
-        create_parent_directories(self.effects.file_system.as_ref(), &destination)?;
-        create_parent_directories(self.effects.file_system.as_ref(), &lock_path)?;
-        let _guard = self.effects.file_system.lock_exclusive(&lock_path)?;
+        self.ensure_parent(&destination)?;
+        self.ensure_parent(&lock_path)?;
+        let destination_relative = self.relative_path(&destination)?;
+        let lock_relative = self.relative_path(&lock_path)?;
+        let _guard = self.root.lock_exclusive(lock_relative)?;
 
-        match self.effects.file_system.entry_kind(&destination)? {
-            EntryKind::RegularFile => {
+        match self.root.entry_kind(destination_relative)? {
+            RootedEntryKind::RegularFile => {
                 validate_existing_blob(
-                    self.effects.file_system.as_ref(),
-                    &destination,
+                    self.root.as_ref(),
+                    destination_relative,
                     expected_size,
                     expected_digest,
                 )?;
-                self.effects.file_system.remove_file(&staging_path)?;
+                self.root.remove_file(&staging_relative)?;
                 cleanup.deactivate();
                 return Ok(BlobPublication::new(
                     destination,
                     BlobPublicationOutcome::Reused,
                 ));
             }
-            EntryKind::Other => return Err(CacheError::corrupt_existing_blob()),
-            EntryKind::Missing => {}
+            RootedEntryKind::Directory | RootedEntryKind::Other => {
+                return Err(CacheError::corrupt_existing_blob());
+            }
+            RootedEntryKind::Missing => {}
         }
 
         self.check_fault(PublicationPoint::BeforeBlobPublish, false)?;
-        self.effects
-            .file_system
-            .rename(&staging_path, &destination)?;
-        cleanup.deactivate();
-        self.check_fault(PublicationPoint::AfterBlobPublish, true)?;
-        sync_parent_directory(self.effects.file_system.as_ref(), &destination)
-            .map_err(|source| CacheError::io(source, true))?;
-        Ok(BlobPublication::new(
-            destination,
-            BlobPublicationOutcome::Published,
-        ))
+        let outcome = self
+            .root
+            .install_staged_create_once(&staging_relative, destination_relative)?;
+        match outcome {
+            CreateOnceOutcome::Created => {
+                validate_existing_blob(
+                    self.root.as_ref(),
+                    destination_relative,
+                    expected_size,
+                    expected_digest,
+                )
+                .map_err(CacheError::with_may_have_published)?;
+                self.check_fault(PublicationPoint::AfterBlobPublish, true)?;
+                self.root
+                    .remove_file(&staging_relative)
+                    .map_err(|source| CacheError::io(source, true))?;
+                cleanup.deactivate();
+                self.sync_parent(&destination)
+                    .map_err(|source| CacheError::io(source, true))?;
+                Ok(BlobPublication::new(
+                    destination,
+                    BlobPublicationOutcome::Published,
+                ))
+            }
+            CreateOnceOutcome::Existing => {
+                validate_existing_blob(
+                    self.root.as_ref(),
+                    destination_relative,
+                    expected_size,
+                    expected_digest,
+                )?;
+                self.root.remove_file(&staging_relative)?;
+                cleanup.deactivate();
+                Ok(BlobPublication::new(
+                    destination,
+                    BlobPublicationOutcome::Reused,
+                ))
+            }
+        }
     }
 
     pub(super) fn blob_path(&self, digest: &BlobDigest) -> PathBuf {
@@ -478,10 +517,14 @@ impl CacheKernel {
     }
 
     pub(super) fn staging_entries(&self) -> Result<Vec<PathBuf>, CacheError> {
+        let directory = self.layout.staging_directory();
+        let relative = self.relative_path(&directory)?;
         Ok(self
-            .effects
-            .file_system
-            .read_dir(&self.layout.staging_directory())?)
+            .root
+            .read_dir(relative)?
+            .into_iter()
+            .map(|path| self.layout.capability_root().join(path))
+            .collect())
     }
 
     pub(super) fn write_ref(
@@ -491,9 +534,12 @@ impl CacheKernel {
     ) -> Result<(), CacheError> {
         let destination = self.layout.ref_record(revision)?;
         let lock_path = self.layout.ref_lock(revision)?;
-        create_parent_directories(self.effects.file_system.as_ref(), &lock_path)?;
-        let _guard = self.effects.file_system.lock_exclusive(&lock_path)?;
-        if self.effects.file_system.entry_kind(&destination)? == EntryKind::Other {
+        self.ensure_parent(&lock_path)?;
+        let _guard = self.root.lock_exclusive(self.relative_path(&lock_path)?)?;
+        if matches!(
+            self.root.entry_kind(self.relative_path(&destination)?)?,
+            RootedEntryKind::Directory | RootedEntryKind::Other
+        ) {
             return Err(CacheError::conflicting_record());
         }
         self.replace_record(&destination, &RefRecord::new(revision, commit))
@@ -599,14 +645,15 @@ impl CacheKernel {
     }
 
     fn replace_encoded_record(&self, destination: &Path, encoded: &[u8]) -> Result<(), CacheError> {
-        create_parent_directories(self.effects.file_system.as_ref(), destination)?;
+        self.ensure_parent(destination)?;
+        let relative = self.relative_path(destination)?;
+        let staging = self.next_staging_name()?;
         self.check_fault(PublicationPoint::BeforeAtomicReplace, false)?;
-        self.effects
-            .file_system
-            .atomic_replace(destination, encoded)
+        self.root
+            .replace(relative, encoded, &staging)
             .map_err(|source| CacheError::io(source, true))?;
         self.check_fault(PublicationPoint::AfterAtomicReplace, true)?;
-        sync_parent_directory(self.effects.file_system.as_ref(), destination)
+        self.sync_parent(destination)
             .map_err(|source| CacheError::io(source, true))
     }
 
@@ -635,10 +682,11 @@ impl CacheKernel {
     where
         T: CacheRecord + Eq,
     {
-        create_parent_directories(self.effects.file_system.as_ref(), lock_path)?;
-        let _guard = self.effects.file_system.lock_exclusive(lock_path)?;
-        match self.effects.file_system.entry_kind(destination)? {
-            EntryKind::RegularFile => {
+        self.ensure_parent(lock_path)?;
+        let lock_relative = self.relative_path(lock_path)?;
+        let _guard = self.root.lock_exclusive(lock_relative)?;
+        match self.root.entry_kind(self.relative_path(destination)?)? {
+            RootedEntryKind::RegularFile => {
                 let existing = self.read_record::<T>(destination, max_bytes)?;
                 if &existing == expected {
                     Ok(())
@@ -646,8 +694,12 @@ impl CacheKernel {
                     Err(CacheError::conflicting_record())
                 }
             }
-            EntryKind::Missing => self.replace_encoded_record(destination, encoded),
-            EntryKind::Other => Err(CacheError::conflicting_record()),
+            RootedEntryKind::Missing => {
+                self.publish_encoded_create_once(destination, expected, encoded, max_bytes)
+            }
+            RootedEntryKind::Directory | RootedEntryKind::Other => {
+                Err(CacheError::conflicting_record())
+            }
         }
     }
 
@@ -656,29 +708,23 @@ impl CacheKernel {
         destination: &Path,
         max_bytes: usize,
     ) -> Result<T, CacheError> {
-        let cache_root = self
-            .effects
-            .file_system
-            .open_directory(self.layout.cache_root())?;
-        let relative = destination
-            .strip_prefix(self.layout.cache_root())
-            .map_err(|_outside| io::Error::other("cache record is outside its capability root"))?;
-        let bytes = match cache_root.open_regular(relative)? {
-            RegularFileOpen::File { mut reader, size } => {
+        let relative = self.relative_path(destination)?;
+        let bytes = match self.root.open_regular(relative)? {
+            RootedRegularFile::File { mut reader, size } => {
                 let max_size = u64::try_from(max_bytes).map_err(io::Error::other)?;
                 if size > max_size {
                     return Err(CacheError::record_too_large());
                 }
                 read_bounded(reader.as_mut(), max_bytes)?
             }
-            RegularFileOpen::Missing => {
+            RootedRegularFile::Missing => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "cache metadata record is missing",
                 )
                 .into());
             }
-            RegularFileOpen::Other => return Err(CacheError::conflicting_record()),
+            RootedRegularFile::Other => return Err(CacheError::conflicting_record()),
         };
         Ok(decode_record::<T>(&bytes)?)
     }
@@ -703,17 +749,94 @@ impl CacheKernel {
     where
         T: CacheRecord + Eq,
     {
-        match self.effects.file_system.entry_kind(destination)? {
-            EntryKind::RegularFile => {
+        match self.root.entry_kind(self.relative_path(destination)?)? {
+            RootedEntryKind::RegularFile => {
                 let existing = self.read_record::<T>(destination, MAX_SMALL_RECORD_BYTES)?;
                 if &existing != expected {
                     return Err(CacheError::conflicting_record());
                 }
                 Ok(())
             }
-            EntryKind::Missing => self.replace_record(destination, expected),
-            EntryKind::Other => Err(CacheError::conflicting_record()),
+            RootedEntryKind::Missing => {
+                let encoded = encode_record_bounded(expected, MAX_SMALL_RECORD_BYTES)?;
+                self.publish_encoded_create_once(
+                    destination,
+                    expected,
+                    &encoded,
+                    MAX_SMALL_RECORD_BYTES,
+                )
+            }
+            RootedEntryKind::Directory | RootedEntryKind::Other => {
+                Err(CacheError::conflicting_record())
+            }
         }
+    }
+
+    fn publish_encoded_create_once<T>(
+        &self,
+        destination: &Path,
+        expected: &T,
+        encoded: &[u8],
+        max_bytes: usize,
+    ) -> Result<(), CacheError>
+    where
+        T: CacheRecord + Eq,
+    {
+        self.ensure_parent(destination)?;
+        let relative = self.relative_path(destination)?;
+        let staging = self.next_staging_name()?;
+        self.check_fault(PublicationPoint::BeforeAtomicReplace, false)?;
+        let outcome = self
+            .root
+            .create_once(relative, encoded, &staging)
+            .map_err(|source| CacheError::io(source, true))?;
+        match outcome {
+            CreateOnceOutcome::Created => {
+                self.check_fault(PublicationPoint::AfterAtomicReplace, true)?;
+                self.sync_parent(destination)
+                    .map_err(|source| CacheError::io(source, true))
+            }
+            CreateOnceOutcome::Existing => {
+                let actual = self.read_record::<T>(destination, max_bytes)?;
+                if &actual == expected {
+                    Ok(())
+                } else {
+                    Err(CacheError::conflicting_record())
+                }
+            }
+        }
+    }
+
+    fn relative_path<'a>(&self, path: &'a Path) -> Result<&'a Path, CacheError> {
+        path.strip_prefix(self.layout.capability_root())
+            .map_err(|_outside| {
+                io::Error::other("cache path is outside its retained capability root").into()
+            })
+    }
+
+    fn ensure_parent(&self, path: &Path) -> Result<(), CacheError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("cache path has no parent directory"))?;
+        self.root.ensure_dir(self.relative_path(parent)?)?;
+        Ok(())
+    }
+
+    fn sync_parent(&self, path: &Path) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("cache path has no parent directory"))?;
+        let relative = parent
+            .strip_prefix(self.layout.capability_root())
+            .map_err(|_outside| {
+                io::Error::other("cache path is outside its retained capability root")
+            })?;
+        self.root.sync_directory(relative)
+    }
+
+    fn next_staging_name(&self) -> Result<StagingName, CacheError> {
+        let operation_id = self.effects.operation_ids.next()?;
+        Ok(StagingName::new(&operation_id.to_string())?)
     }
 
     fn check_fault(
@@ -764,6 +887,7 @@ pub(super) struct CacheError {
 #[derive(Debug)]
 enum CacheErrorKind {
     Io(io::Error),
+    UnsafePath(io::Error),
     Validation(ValidationError),
     Metadata(MetadataError),
     SizeMismatch { expected: u64, actual: u64 },
@@ -783,7 +907,12 @@ impl CacheError {
     }
 
     fn io(source: io::Error, may_have_published: bool) -> Self {
-        Self::new(CacheErrorKind::Io(source), may_have_published)
+        let kind = if is_unsafe_cache_path_error(&source) {
+            CacheErrorKind::UnsafePath(source)
+        } else {
+            CacheErrorKind::Io(source)
+        };
+        Self::new(kind, may_have_published)
     }
 
     fn size_mismatch(expected: u64, actual: u64) -> Self {
@@ -806,6 +935,11 @@ impl CacheError {
         Self::new(CacheErrorKind::RecordTooLarge, false)
     }
 
+    fn with_may_have_published(mut self) -> Self {
+        self.may_have_published = true;
+        self
+    }
+
     pub(super) fn is_size_mismatch(&self) -> bool {
         matches!(self.kind.as_ref(), CacheErrorKind::SizeMismatch { .. })
     }
@@ -822,6 +956,41 @@ impl CacheError {
         matches!(self.kind.as_ref(), CacheErrorKind::RecordTooLarge)
     }
 
+    pub(super) fn is_unsafe(&self) -> bool {
+        matches!(self.kind.as_ref(), CacheErrorKind::UnsafePath(_))
+            || matches!(
+                self.kind.as_ref(),
+                CacheErrorKind::Validation(source) if source.is_unsafe_path()
+            )
+    }
+
+    pub(super) fn is_not_found(&self) -> bool {
+        matches!(
+            self.kind.as_ref(),
+            CacheErrorKind::Io(source) if source.kind() == io::ErrorKind::NotFound
+        )
+    }
+
+    pub(super) fn is_corrupt_record(&self) -> bool {
+        match self.kind.as_ref() {
+            CacheErrorKind::Metadata(source) => source.is_corrupt(),
+            CacheErrorKind::ConflictingRecord | CacheErrorKind::RecordTooLarge => true,
+            CacheErrorKind::Io(_)
+            | CacheErrorKind::UnsafePath(_)
+            | CacheErrorKind::Validation(_)
+            | CacheErrorKind::SizeMismatch { .. }
+            | CacheErrorKind::DigestMismatch
+            | CacheErrorKind::CorruptExistingBlob => false,
+        }
+    }
+
+    pub(super) fn is_unsupported_record(&self) -> bool {
+        matches!(
+            self.kind.as_ref(),
+            CacheErrorKind::Metadata(source) if source.is_unknown_version()
+        )
+    }
+
     pub(super) const fn may_have_published(&self) -> bool {
         self.may_have_published
     }
@@ -835,6 +1004,7 @@ impl Display for CacheError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self.kind.as_ref() {
             CacheErrorKind::Io(_) => formatter.write_str("cache filesystem operation failed"),
+            CacheErrorKind::UnsafePath(_) => formatter.write_str("cache filesystem path is unsafe"),
             CacheErrorKind::Validation(_) => {
                 formatter.write_str("cache identity validation failed")
             }
@@ -860,7 +1030,7 @@ impl Display for CacheError {
 impl Error for CacheError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self.kind.as_ref() {
-            CacheErrorKind::Io(source) => Some(source),
+            CacheErrorKind::Io(source) | CacheErrorKind::UnsafePath(source) => Some(source),
             CacheErrorKind::Validation(source) => Some(source),
             CacheErrorKind::Metadata(source) => Some(source),
             CacheErrorKind::SizeMismatch { .. }
@@ -890,9 +1060,9 @@ impl From<MetadataError> for CacheError {
     }
 }
 
-fn copy_and_hash(
+fn copy_and_hash<W: Write + ?Sized>(
     reader: &mut dyn Read,
-    writer: &mut dyn DurableWrite,
+    writer: &mut W,
     expected_size: u64,
 ) -> Result<(u64, BlobDigest), CacheError> {
     let mut hasher = Sha256::new();
@@ -949,32 +1119,23 @@ fn bounded_read_capacity(expected_size: u64, current_size: u64, buffer_size: usi
 }
 
 fn validate_existing_blob(
-    file_system: &dyn FileSystem,
+    root: &dyn RootedFileSystem,
     path: &Path,
     expected_size: u64,
     expected_digest: BlobDigest,
 ) -> Result<(), CacheError> {
-    let mut reader = file_system.open_read(path)?;
+    let mut reader = match root.open_regular(path)? {
+        RootedRegularFile::File { reader, .. } => reader,
+        RootedRegularFile::Missing | RootedRegularFile::Other => {
+            return Err(CacheError::corrupt_existing_blob());
+        }
+    };
     let (actual_size, actual_digest) = hash_reader(reader.as_mut(), expected_size)?;
     if actual_size == expected_size && actual_digest == expected_digest {
         Ok(())
     } else {
         Err(CacheError::corrupt_existing_blob())
     }
-}
-
-fn create_parent_directories(file_system: &dyn FileSystem, path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("cache path has no parent directory"))?;
-    file_system.create_dir_all(parent)
-}
-
-fn sync_parent_directory(file_system: &dyn FileSystem, path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("cache path has no parent directory"))?;
-    file_system.sync_directory(parent)
 }
 
 fn encode_record_bounded<T: CacheRecord>(
@@ -1003,15 +1164,15 @@ fn read_bounded(reader: &mut dyn Read, max_bytes: usize) -> Result<Vec<u8>, Cach
 }
 
 struct StagingCleanup<'a> {
-    file_system: &'a dyn FileSystem,
+    root: &'a dyn RootedFileSystem,
     path: PathBuf,
     active: bool,
 }
 
 impl<'a> StagingCleanup<'a> {
-    fn inactive(file_system: &'a dyn FileSystem, path: PathBuf) -> Self {
+    fn inactive(root: &'a dyn RootedFileSystem, path: PathBuf) -> Self {
         Self {
-            file_system,
+            root,
             path,
             active: false,
         }
@@ -1029,7 +1190,7 @@ impl<'a> StagingCleanup<'a> {
 impl Drop for StagingCleanup<'_> {
     fn drop(&mut self) {
         if self.active {
-            let _result = self.file_system.remove_file(&self.path);
+            let _result = self.root.remove_file(&self.path);
         }
     }
 }
@@ -1211,10 +1372,11 @@ mod tests {
     fn staging_identifier_collisions_preserve_the_existing_entry()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new()?;
+        let next_id = fixture.ids.issued() + 1;
         let staging_path = fixture
             .kernel
             .layout
-            .staged_blob("00000000000000000000000000000001");
+            .staged_blob(&format!("{next_id:032x}"));
         let existing = b"another publisher's staged bytes";
         std::fs::write(&staging_path, existing)?;
         let payload = b"new payload";
@@ -1829,7 +1991,7 @@ mod tests {
         )?;
 
         assert_eq!(partial.updated_unix_millis(), 1_721_596_800_000);
-        assert_eq!(fixture.ids.issued(), 0);
+        assert_eq!(fixture.ids.issued(), 3);
 
         Ok(())
     }
@@ -2115,8 +2277,8 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct SyncFaultFileSystem {
-        fail_next_sync: AtomicBool,
-        serialized: Mutex<()>,
+        fail_next_sync: Arc<AtomicBool>,
+        serialized: Arc<Mutex<()>>,
     }
 
     impl SyncFaultFileSystem {
@@ -2126,40 +2288,74 @@ mod tests {
     }
 
     impl FileSystem for SyncFaultFileSystem {
-        fn open_directory(&self, path: &Path) -> io::Result<Arc<dyn CacheDirectory>> {
-            OsFileSystem.open_directory(path)
+        fn open_cache_authority(&self, path: &Path) -> io::Result<CacheAuthority> {
+            let authority = OsFileSystem.open_cache_authority(path)?;
+            Ok(CacheAuthority::new(
+                authority.reader(),
+                Arc::new(SyncFaultRoot {
+                    inner: authority.writer(),
+                    fail_next_sync: Arc::clone(&self.fail_next_sync),
+                    serialized: Arc::clone(&self.serialized),
+                }),
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SyncFaultRoot {
+        inner: Arc<dyn RootedFileSystem>,
+        fail_next_sync: Arc<AtomicBool>,
+        serialized: Arc<Mutex<()>>,
+    }
+
+    impl RootedFileSystem for SyncFaultRoot {
+        fn ensure_dir(&self, path: &Path) -> io::Result<()> {
+            self.inner.ensure_dir(path)
         }
 
-        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-            OsFileSystem.create_dir_all(path)
+        fn entry_kind(&self, path: &Path) -> io::Result<RootedEntryKind> {
+            self.inner.entry_kind(path)
         }
 
-        fn create_new(&self, path: &Path) -> io::Result<Box<dyn DurableWrite>> {
-            OsFileSystem.create_new(path)
+        fn open_regular(&self, path: &Path) -> io::Result<RootedRegularFile> {
+            self.inner.open_regular(path)
         }
 
-        fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
-            OsFileSystem.open_read(path)
+        fn read_regular_bounded(&self, path: &Path, limit: usize) -> io::Result<RootedRead> {
+            self.inner.read_regular_bounded(path, limit)
         }
 
-        fn entry_kind(&self, path: &Path) -> io::Result<EntryKind> {
-            OsFileSystem.entry_kind(path)
+        fn create_new(&self, path: &Path) -> io::Result<Box<dyn RootedWrite>> {
+            self.inner.create_new(path)
         }
 
         fn remove_file(&self, path: &Path) -> io::Result<()> {
-            OsFileSystem.remove_file(path)
+            self.inner.remove_file(path)
         }
 
-        fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
-            OsFileSystem.rename(source, destination)
+        fn install_staged_create_once(
+            &self,
+            staging: &Path,
+            destination: &Path,
+        ) -> io::Result<CreateOnceOutcome> {
+            self.inner.install_staged_create_once(staging, destination)
         }
 
-        fn atomic_replace(&self, destination: &Path, bytes: &[u8]) -> io::Result<()> {
-            OsFileSystem.atomic_replace(destination, bytes)
+        fn create_once(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            staging: &StagingName,
+        ) -> io::Result<CreateOnceOutcome> {
+            self.inner.create_once(path, bytes, staging)
         }
 
-        fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn LockGuard>> {
-            OsFileSystem.lock_exclusive(path)
+        fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {
+            self.inner.replace(path, bytes, staging)
+        }
+
+        fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
+            self.inner.lock_exclusive(path)
         }
 
         fn sync_directory(&self, path: &Path) -> io::Result<()> {
@@ -2170,12 +2366,12 @@ mod tests {
             if self.fail_next_sync.swap(false, Ordering::AcqRel) {
                 Err(io::Error::other("injected directory sync failure"))
             } else {
-                OsFileSystem.sync_directory(path)
+                self.inner.sync_directory(path)
             }
         }
 
         fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
-            OsFileSystem.read_dir(path)
+            self.inner.read_dir(path)
         }
     }
 

@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use crate::validation::ValidationError;
+use crate::validation::{ValidationError, ValidationErrorKind};
 use crate::{CommitId, Endpoint, RepositorySpec, Revision};
 
 use super::hub_layout::HubBlobKey;
@@ -12,6 +12,8 @@ const CACHE_DIRECTORY: &str = "hf-store-v1";
 
 #[derive(Clone, Debug)]
 pub(super) struct CacheLayout {
+    capability_root: PathBuf,
+    cache_root_relative: PathBuf,
     cache_root: PathBuf,
     origin: OriginKey,
     repository: RepositoryKey,
@@ -24,14 +26,45 @@ impl CacheLayout {
         endpoint: &Endpoint,
         spec: &RepositorySpec,
     ) -> Result<Self, ValidationError> {
+        Self::nested(root, Path::new(""), endpoint, spec)
+    }
+
+    pub(super) fn nested(
+        root: impl AsRef<Path>,
+        parent: impl AsRef<Path>,
+        endpoint: &Endpoint,
+        spec: &RepositorySpec,
+    ) -> Result<Self, ValidationError> {
+        let root = root.as_ref();
+        let parent = parent.as_ref();
+        if !parent
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(ValidationError::new(
+                "cache capability path",
+                ValidationErrorKind::UnsafePath,
+            ));
+        }
         let origin = OriginKey::derive(endpoint)?;
         let repository = RepositoryKey::derive(&origin, spec)?;
+        let cache_root_relative = parent.join(CACHE_DIRECTORY);
         Ok(Self {
-            cache_root: root.as_ref().join(CACHE_DIRECTORY),
+            capability_root: root.to_path_buf(),
+            cache_root: root.join(&cache_root_relative),
+            cache_root_relative,
             origin,
             repository,
             kind_directory: spec.kind().cache_directory(),
         })
+    }
+
+    pub(super) fn capability_root(&self) -> &Path {
+        &self.capability_root
+    }
+
+    pub(super) fn cache_root_relative(&self) -> &Path {
+        &self.cache_root_relative
     }
 
     pub(super) fn cache_root(&self) -> &Path {
@@ -227,6 +260,48 @@ mod tests {
 
         assert!(path.ends_with(PathBuf::from("sha256").join(&hex[..2]).join(&hex[2..])));
 
+        Ok(())
+    }
+
+    #[test]
+    fn nested_layout_keeps_paths_relative_to_the_authorized_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PathBuf::from("hub-cache");
+        let parent = PathBuf::from("models--org--repo").join(".hf-store");
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+
+        let layout = CacheLayout::nested(&root, &parent, &endpoint, &spec)?;
+
+        assert_eq!(layout.capability_root(), root);
+        assert_eq!(layout.cache_root_relative(), parent.join(CACHE_DIRECTORY));
+        assert_eq!(
+            layout.cache_root(),
+            PathBuf::from("hub-cache")
+                .join("models--org--repo/.hf-store")
+                .join(CACHE_DIRECTORY)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_layout_rejects_non_normal_capability_paths() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = PathBuf::from("cache-root");
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let absolute = std::env::temp_dir().join("absolute-cache-parent");
+
+        for parent in [
+            PathBuf::from(".."),
+            PathBuf::from("."),
+            PathBuf::from("safe/../escape"),
+            absolute,
+        ] {
+            let error = CacheLayout::nested(&root, parent, &endpoint, &spec)
+                .expect_err("accepted a non-normal nested cache path");
+            assert!(error.is_unsafe_path());
+        }
         Ok(())
     }
 }

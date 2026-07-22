@@ -9,6 +9,8 @@ use super::layout::CacheLayout;
 pub(super) struct HubCacheLayout {
     repository_directory: PathBuf,
     sidecar: CacheLayout,
+    endpoint: Endpoint,
+    repository: RepositorySpec,
 }
 
 impl HubCacheLayout {
@@ -41,12 +43,16 @@ impl HubCacheLayout {
     ) -> Result<Self, ValidationError> {
         let repository_name = spec.id().as_str().replace('/', "--");
         let directory_name = format!("{}--{repository_name}", spec.kind().cache_directory());
-        let repository_directory = root.join(directory_name);
-        let sidecar = CacheLayout::new(repository_directory.join(".hf-store"), endpoint, spec)?;
+        let repository_relative = PathBuf::from(directory_name);
+        let repository_directory = root.join(&repository_relative);
+        let sidecar =
+            CacheLayout::nested(root, repository_relative.join(".hf-store"), endpoint, spec)?;
 
         Ok(Self {
             repository_directory,
             sidecar,
+            endpoint: endpoint.clone(),
+            repository: spec.clone(),
         })
     }
 
@@ -56,6 +62,14 @@ impl HubCacheLayout {
 
     pub(super) const fn sidecar(&self) -> &CacheLayout {
         &self.sidecar
+    }
+
+    pub(super) const fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    pub(super) const fn repository(&self) -> &RepositorySpec {
+        &self.repository
     }
 
     pub(super) fn ref_path(&self, revision: &Revision) -> Result<PathBuf, ValidationError> {
@@ -154,6 +168,11 @@ mod tests {
         for (spec, directory) in cases {
             let layout = HubCacheLayout::shared(&root, &endpoint, &spec)?;
             assert_eq!(layout.repository_directory(), root.join(directory));
+            assert_eq!(layout.sidecar().capability_root(), root);
+            assert_eq!(
+                layout.sidecar().cache_root_relative(),
+                PathBuf::from(directory).join(".hf-store/hf-store-v1")
+            );
         }
 
         Ok(())
