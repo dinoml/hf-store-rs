@@ -77,6 +77,17 @@ impl HubLocalDirLayout {
 }
 
 fn ensure_not_reserved(path: &RepoPath) -> Result<(), ValidationError> {
+    if path
+        .as_str()
+        .split('/')
+        .any(looks_like_dos_short_name_alias)
+    {
+        return Err(ValidationError::new(
+            "local directory repository path",
+            ValidationErrorKind::UnsafePath,
+        ));
+    }
+
     let mut components = path.as_str().split('/');
     let first = components.next();
     let second = components.next();
@@ -93,6 +104,21 @@ fn ensure_not_reserved(path: &RepoPath) -> Result<(), ValidationError> {
     } else {
         Ok(())
     }
+}
+
+fn looks_like_dos_short_name_alias(component: &str) -> bool {
+    // Windows can resolve names such as `HUGGIN~1` to a different long-name
+    // entry. Reject the alias shape on every platform so one repository path
+    // cannot target ordinary content on Unix and reserved bookkeeping on
+    // Windows.
+    let stem = component
+        .split_once('.')
+        .map_or(component, |(stem, _extension)| stem);
+    stem.rsplit_once('~').is_some_and(|(prefix, ordinal)| {
+        !prefix.is_empty()
+            && !ordinal.is_empty()
+            && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn join_repo_path(base: &Path, path: &RepoPath) -> PathBuf {
@@ -155,6 +181,34 @@ mod tests {
                 .file_path(&path)
                 .expect_err(&format!("mapped reserved local-dir path {value:?}"));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_dir_rejects_dos_short_name_alias_components() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let layout = HubLocalDirLayout::new("local-dir", &endpoint, &spec)?;
+
+        for value in [
+            "CACHE~1/huggingface/config.json",
+            ".cache/HUGGIN~1/download/config.json",
+            "weights/MODEL~1.BIN",
+        ] {
+            let path = RepoPath::parse(value)?;
+            let error = layout
+                .file_path(&path)
+                .expect_err("mapped a DOS short-name alias-shaped path");
+            assert!(error.is_unsafe_path());
+        }
+
+        let ordinary_tilde = RepoPath::parse("weights/model~draft.bin")?;
+        assert_eq!(
+            layout.file_path(&ordinary_tilde)?,
+            PathBuf::from("local-dir/weights/model~draft.bin")
+        );
 
         Ok(())
     }
