@@ -185,6 +185,21 @@ impl HubCacheReader {
         })
     }
 
+    pub(super) fn open_validated_content(
+        &self,
+        path: &Path,
+        expected_size: u64,
+    ) -> Result<Box<dyn Read + Send>, HubCacheReadError> {
+        let directory = self.open_repository(MissingRecord::Incomplete)?;
+        let relative = self.repository_relative_path(path)?;
+        match directory.open_regular(&relative)? {
+            RegularFileOpen::File { reader, size } if size == expected_size => Ok(reader),
+            RegularFileOpen::File { .. } | RegularFileOpen::Missing | RegularFileOpen::Other => {
+                Err(HubCacheReadError::corrupt())
+            }
+        }
+    }
+
     pub(super) fn copy_regular_snapshot_content<W: Write + ?Sized>(
         &self,
         index: &HubCacheIndex,

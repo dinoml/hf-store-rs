@@ -532,6 +532,23 @@ impl CacheKernel {
         self.layout.blob_path(digest)
     }
 
+    pub(super) fn open_blob(
+        &self,
+        digest: &BlobDigest,
+        expected_size: u64,
+    ) -> Result<Option<Box<dyn Read + Send>>, CacheError> {
+        let path = self.layout.blob_path(digest);
+        match self.root.open_regular(self.relative_path(&path)?)? {
+            RootedRegularFile::Missing => Ok(None),
+            RootedRegularFile::File { reader, size, .. } if size == expected_size => {
+                Ok(Some(reader))
+            }
+            RootedRegularFile::Other | RootedRegularFile::File { .. } => {
+                Err(CacheError::corrupt_existing_blob())
+            }
+        }
+    }
+
     pub(super) fn staging_entries(&self) -> Result<Vec<PathBuf>, CacheError> {
         let directory = self.layout.staging_directory();
         let relative = self.relative_path(&directory)?;

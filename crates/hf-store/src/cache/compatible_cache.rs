@@ -10,6 +10,10 @@ use crate::{CommitId, Endpoint, RepoPath, RepositorySpec, Revision};
 use super::hub_cache::{HubCacheFile, HubCacheReadError, HubCacheReader, HubSnapshotFileForm};
 use super::hub_layout::HubBlobKey;
 use super::key::{BlobDigest, SelectionId};
+use super::local_dir_materialization::{Cancellation, LocalDirFileTarget};
+use super::local_dir_reconciliation::{
+    LocalDirCandidateSet, LocalDirSourceError, PreparedLocalDirSource,
+};
 use super::metadata::{SnapshotFileRecord, SnapshotManifestRecord};
 use super::publication::{CacheError, CacheKernel, Effects};
 
@@ -159,6 +163,52 @@ impl CompatibleCacheOffline {
             selection: selection.id,
             files: files.into_boxed_slice(),
         })
+    }
+
+    pub(super) fn local_dir_candidates(
+        &self,
+        snapshot: &CompatibleSnapshot,
+    ) -> CompatibleSnapshotCandidates {
+        CompatibleSnapshotCandidates::new(self.reader.clone(), snapshot)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CompatibleSnapshotCandidates {
+    reader: HubCacheReader,
+    files: BTreeMap<RepoPath, CompatibleSnapshotFile>,
+}
+
+impl CompatibleSnapshotCandidates {
+    fn new(reader: HubCacheReader, snapshot: &CompatibleSnapshot) -> Self {
+        let files = snapshot
+            .files()
+            .iter()
+            .cloned()
+            .map(|file| (file.path().clone(), file))
+            .collect();
+        Self { reader, files }
+    }
+}
+
+impl LocalDirCandidateSet for CompatibleSnapshotCandidates {
+    fn prepare_local(
+        &mut self,
+        target: &LocalDirFileTarget,
+        _cancellation: &dyn Cancellation,
+    ) -> Result<Option<PreparedLocalDirSource>, LocalDirSourceError> {
+        let Some(file) = self.files.get(target.path()) else {
+            return Ok(None);
+        };
+        if file.size() != target.entry().size() || file.digest() != target.digest() {
+            return Err(LocalDirSourceError::invalid());
+        }
+        let source_path = file.blob_path().unwrap_or_else(|| file.content_path());
+        self.reader
+            .open_validated_content(source_path, file.size())
+            .map(PreparedLocalDirSource::compatible_cache)
+            .map(Some)
+            .map_err(|_source| LocalDirSourceError::invalid())
     }
 }
 
@@ -490,7 +540,7 @@ impl From<ValidationError> for CompatibleCacheError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io;
+    use std::io::{self, Read};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -660,6 +710,31 @@ mod tests {
             );
             assert!(!file.hub_blob_key().as_str().is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_snapshot_candidate_reopens_validated_bytes_without_transport()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("config.json")?;
+        let importer = fixture.importer()?;
+        let snapshot = importer.import(&Revision::parse("main")?, std::slice::from_ref(&path))?;
+        let offline = fixture.offline()?;
+        let mut candidates = offline.local_dir_candidates(&snapshot);
+        let entry = git_entry(CONFIG_BYTES)?;
+        let target = LocalDirFileTarget::new(path, entry, BlobDigest::for_bytes(CONFIG_BYTES));
+
+        let prepared = candidates
+            .prepare_local(
+                &target,
+                &super::super::local_dir_materialization::NeverCancelled,
+            )?
+            .ok_or("compatible cache candidate was not found")?;
+        let mut reader = prepared.into_reader();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, CONFIG_BYTES);
         Ok(())
     }
 

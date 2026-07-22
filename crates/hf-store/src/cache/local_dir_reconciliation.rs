@@ -20,7 +20,7 @@ use super::local_dir_materialization::{
     Cancellation, ExistingFilePolicy, LocalDirDestinationInspection, LocalDirFileDisposition,
     LocalDirFileMaterializer, LocalDirFileTarget, LocalDirMaterializationError,
 };
-use super::publication::Effects;
+use super::publication::{CacheError, CacheKernel, Effects};
 use super::rooted_fs::{RootedFileSystem, RootedLockAttempt};
 use super::sanitized_io::SanitizedIo;
 
@@ -111,6 +111,31 @@ pub(super) trait LocalDirCandidateSet: Debug + Send {
     ) -> Result<Option<PreparedLocalDirSource>, LocalDirSourceError>;
 }
 
+/// Supplies immutable owned-cache blobs without constructing a transport.
+#[derive(Clone, Debug)]
+pub(super) struct OwnedBlobCandidates {
+    cache: CacheKernel,
+}
+
+impl OwnedBlobCandidates {
+    pub(super) const fn new(cache: CacheKernel) -> Self {
+        Self { cache }
+    }
+}
+
+impl LocalDirCandidateSet for OwnedBlobCandidates {
+    fn prepare_local(
+        &mut self,
+        target: &LocalDirFileTarget,
+        _cancellation: &dyn Cancellation,
+    ) -> Result<Option<PreparedLocalDirSource>, LocalDirSourceError> {
+        self.cache
+            .open_blob(&target.digest(), target.entry().size())
+            .map(|reader| reader.map(PreparedLocalDirSource::owned_cache))
+            .map_err(LocalDirSourceError::cache)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparedSourceProvenance {
     Owned,
@@ -153,6 +178,11 @@ impl PreparedLocalDirSource {
 
     fn into_parts(self) -> (Box<dyn Read + Send>, PreparedSourceProvenance) {
         (self.reader, self.provenance)
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_reader(self) -> Box<dyn Read + Send> {
+        self.reader
     }
 }
 
@@ -693,6 +723,7 @@ pub(super) struct LocalDirSourceError {
 #[derive(Debug)]
 enum LocalDirSourceErrorKind {
     Io(SanitizedIo),
+    Cache(CacheError),
     Invalid,
 }
 
@@ -707,6 +738,13 @@ impl LocalDirSourceError {
     pub(super) fn invalid() -> Self {
         Self {
             kind: LocalDirSourceErrorKind::Invalid,
+            backtrace: Backtrace::capture(),
+        }
+    }
+
+    fn cache(source: CacheError) -> Self {
+        Self {
+            kind: LocalDirSourceErrorKind::Cache(source),
             backtrace: Backtrace::capture(),
         }
     }
@@ -730,6 +768,9 @@ impl Display for LocalDirSourceError {
             LocalDirSourceErrorKind::Io(_) => {
                 formatter.write_str("local cache candidate filesystem operation failed")
             }
+            LocalDirSourceErrorKind::Cache(_) => {
+                formatter.write_str("owned cache candidate could not be opened")
+            }
             LocalDirSourceErrorKind::Invalid => {
                 formatter.write_str("local cache candidate failed validation")
             }
@@ -737,7 +778,14 @@ impl Display for LocalDirSourceError {
     }
 }
 
-impl Error for LocalDirSourceError {}
+impl Error for LocalDirSourceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.kind {
+            LocalDirSourceErrorKind::Cache(source) => Some(source),
+            LocalDirSourceErrorKind::Io(_) | LocalDirSourceErrorKind::Invalid => None,
+        }
+    }
+}
 
 impl From<io::Error> for LocalDirSourceError {
     fn from(source: io::Error) -> Self {
@@ -1427,6 +1475,49 @@ mod tests {
         );
         assert_eq!(result.files()[0].size(), u64::try_from(FIRST.len())?);
         assert_eq!(result.files()[0].digest(), first.digest());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_blob_cache_hit_materializes_without_network_bytes() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let target = Fixture::target("model.bin", FIRST)?;
+        let plan = fixture.plan(vec![target.clone()])?;
+        let endpoint = Endpoint::hugging_face();
+        let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let owned_root = fixture.directory.path().join("owned-cache");
+        fs::create_dir_all(&owned_root)?;
+        let kernel =
+            CacheKernel::new(&owned_root, &endpoint, &repository, fixture.effects.clone())?;
+        kernel.initialize()?;
+        kernel.publish_blob(
+            Cursor::new(FIRST),
+            u64::try_from(FIRST.len())?,
+            target.digest(),
+        )?;
+        let mut candidates = OwnedBlobCandidates::new(kernel);
+
+        let result = report(
+            fixture
+                .reconciler(Arc::new(YieldWait::default()))
+                .reconcile(
+                    &plan,
+                    &mut candidates,
+                    ExistingFilePolicy::Reject,
+                    &super::super::local_dir_materialization::NeverCancelled,
+                )?,
+        )?;
+
+        assert_eq!(fs::read(fixture.destination(target.path()))?, FIRST);
+        assert_eq!(result.downloaded_body_bytes(), 0);
+        assert_eq!(
+            result.files()[0].provenance(),
+            LocalDirFileProvenance::OwnedCache
+        );
+        assert_eq!(
+            result.destination_bytes_written(),
+            u64::try_from(FIRST.len())?
+        );
         Ok(())
     }
 
