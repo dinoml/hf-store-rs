@@ -60,6 +60,12 @@ return validated, lease-backed snapshot and file handles. See the
 
 ## Library usage
 
+The [full usage guide](https://github.com/dinoml/hf-store-rs/blob/main/docs/usage.md)
+covers dependency setup, cache selection,
+authentication, filtering, online and offline flows, `local_dir`, progress,
+cancellation, error handling, maintenance, DinoML-style integration, and CLI
+automation. The examples below are the shortest path to a snapshot.
+
 Online operations are async and run on the caller's entered Tokio runtime. The
 library never discovers credentials; pass an `AuthToken` on the request that
 needs it.
@@ -138,7 +144,8 @@ using the precedence fixed by ADR 0008. There is intentionally no raw `--token`
 argument.
 
 Detailed operational contracts are in
-[Cache modes, local directories, and offline guarantees](docs/cache-and-offline.md),
+[the full usage guide](https://github.com/dinoml/hf-store-rs/blob/main/docs/usage.md),
+[cache modes, local directories, and offline guarantees](docs/cache-and-offline.md),
 [the security policy](SECURITY.md), and [the release policy](docs/release-policy.md).
 
 ## Development
