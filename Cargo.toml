@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hf-store"]
+members = ["crates/hf-store", "crates/hf-store-cli"]
 resolver = "3"
 
 [workspace.package]
@@ -13,6 +13,7 @@ repository = "https://github.com/dinoml/hf-store-rs"
 [workspace.dependencies]
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
+clap = { version = "4.5", features = ["derive"] }
 fs4 = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 getrandom = { version = "0.3", features = ["std"] }
