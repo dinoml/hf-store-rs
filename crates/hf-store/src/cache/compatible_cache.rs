@@ -107,6 +107,11 @@ pub(super) struct CompatibleCacheOffline {
 }
 
 impl CompatibleCacheOffline {
+    pub(super) fn inventory_entries(
+        &self,
+    ) -> Result<Vec<super::publication::CacheInventoryEntry>, CompatibleCacheError> {
+        self.sidecar.inventory_entries().map_err(Into::into)
+    }
     pub(super) fn from_parts(reader: HubCacheReader, sidecar: CacheKernel) -> Self {
         Self { reader, sidecar }
     }

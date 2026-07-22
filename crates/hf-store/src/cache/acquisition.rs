@@ -315,6 +315,23 @@ enum OfflineBackend {
 }
 
 impl OfflineCache {
+    pub(crate) fn inventory_entries(&self) -> Result<Vec<InventoryRecord>, HubOperationError> {
+        let entries = match &self.backend {
+            OfflineBackend::Owned(cache) => cache.inventory_entries().map_err(map_cache_error),
+            OfflineBackend::Compatible(cache) => {
+                cache.inventory_entries().map_err(map_compatible_error)
+            }
+        }?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| InventoryRecord {
+                relative_path: entry.relative_path,
+                namespace: entry.namespace,
+                is_directory: entry.kind == super::rooted_fs::RootedEntryKind::Directory,
+                is_unsafe: entry.kind == super::rooted_fs::RootedEntryKind::Other,
+            })
+            .collect())
+    }
     pub(crate) fn shared(
         root: impl AsRef<Path>,
         endpoint: &Endpoint,
@@ -400,6 +417,14 @@ impl OfflineCache {
             files,
         })
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InventoryRecord {
+    pub(crate) relative_path: Box<str>,
+    pub(crate) namespace: Box<str>,
+    pub(crate) is_directory: bool,
+    pub(crate) is_unsafe: bool,
 }
 
 #[derive(Clone, Debug)]

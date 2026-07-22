@@ -2,6 +2,97 @@ use serde::Serialize;
 
 use crate::{CacheMode, HubError, Snapshot};
 
+/// Read-only state of one recognized repository-cache entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum InventoryState {
+    /// Recognized ordinary cache state.
+    Recognized,
+    /// Inert transfer or publication staging state.
+    Staging,
+    /// Resumable or incomplete transfer state.
+    Partial,
+    /// Quarantined deletion state.
+    Trash,
+    /// A link, reparse point, or special entry blocks safe classification.
+    Unsafe,
+}
+
+/// One cache-relative entry in a repository inventory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InventoryEntry {
+    path: Box<str>,
+    state: InventoryState,
+    directory: bool,
+}
+
+impl InventoryEntry {
+    /// Returns a cache-relative, slash-separated path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the classified entry state.
+    #[must_use]
+    pub const fn state(&self) -> InventoryState {
+        self.state
+    }
+
+    /// Returns whether this entry is a directory.
+    #[must_use]
+    pub const fn is_directory(&self) -> bool {
+        self.directory
+    }
+}
+
+/// Deterministic repository-wide read-only cache inventory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CacheInventoryReport {
+    schema: &'static str,
+    version: u32,
+    cache_mode: CacheMode,
+    entries: Box<[InventoryEntry]>,
+}
+
+impl CacheInventoryReport {
+    pub(crate) fn new(cache_mode: CacheMode, records: Vec<crate::cache::InventoryRecord>) -> Self {
+        let entries = records
+            .into_iter()
+            .map(|record| {
+                let state = if record.is_unsafe {
+                    InventoryState::Unsafe
+                } else {
+                    match record.namespace.as_ref() {
+                        "staging" => InventoryState::Staging,
+                        "partials" => InventoryState::Partial,
+                        "trash" => InventoryState::Trash,
+                        _ => InventoryState::Recognized,
+                    }
+                };
+                InventoryEntry {
+                    path: record.relative_path,
+                    state,
+                    directory: record.is_directory,
+                }
+            })
+            .collect();
+        Self {
+            schema: "hf-store.cache-inventory",
+            version: 1,
+            cache_mode,
+            entries,
+        }
+    }
+
+    /// Returns inventory entries in stable cache-relative path order.
+    #[must_use]
+    pub fn entries(&self) -> &[InventoryEntry] {
+        &self.entries
+    }
+}
+
 /// Stable classification of an exact-selection cache inspection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]

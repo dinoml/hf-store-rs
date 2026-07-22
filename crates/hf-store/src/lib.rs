@@ -83,6 +83,8 @@ pub use fetch_plan::{FetchPlan, PlannedFile};
 #[doc(inline)]
 pub use progress::{ProgressEvent, ProgressObserver, ProgressPhase, ReuseDecision};
 #[doc(inline)]
+pub use report::{CacheInventoryReport, InventoryEntry, InventoryState};
+#[doc(inline)]
 pub use report::{InspectedFile, InspectionReport, InspectionState, VerificationReport};
 
 #[doc(inline)]

@@ -399,6 +399,13 @@ pub(super) struct SnapshotLease {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct CacheInventoryEntry {
+    pub(super) relative_path: Box<str>,
+    pub(super) namespace: Box<str>,
+    pub(super) kind: RootedEntryKind,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct OwnedSnapshotRead {
     root: PathBuf,
     files: Vec<OwnedSnapshotFile>,
@@ -448,6 +455,49 @@ impl crate::transfer::PartialSink for CachePartialSink {
 }
 
 impl CacheKernel {
+    pub(super) fn inventory_entries(&self) -> Result<Vec<CacheInventoryEntry>, CacheError> {
+        let repository_path = self.layout.repository_directory();
+        let repository = self.relative_path(&repository_path)?;
+        let mut entries = Vec::new();
+        for namespace in [
+            "refs",
+            "trees",
+            "blobs",
+            "snapshots",
+            "partials",
+            "staging",
+            "trash",
+        ] {
+            self.walk_inventory(&repository.join(namespace), namespace, &mut entries)?;
+        }
+        entries.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(entries)
+    }
+
+    fn walk_inventory(
+        &self,
+        directory: &Path,
+        namespace: &str,
+        entries: &mut Vec<CacheInventoryEntry>,
+    ) -> Result<(), CacheError> {
+        let children = match self.root.read_dir(directory) {
+            Ok(children) => children,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for child in children {
+            let kind = self.root.entry_kind(&child)?;
+            entries.push(CacheInventoryEntry {
+                relative_path: child.to_string_lossy().replace('\\', "/").into(),
+                namespace: namespace.into(),
+                kind,
+            });
+            if kind == RootedEntryKind::Directory {
+                self.walk_inventory(&child, namespace, entries)?;
+            }
+        }
+        Ok(())
+    }
     pub(super) fn new(
         root: impl AsRef<Path>,
         endpoint: &Endpoint,

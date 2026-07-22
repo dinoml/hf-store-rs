@@ -16,8 +16,8 @@ use crate::hub_protocol::HubProtocol;
 use crate::progress::ProgressObserver;
 use crate::transport::Transport;
 use crate::{
-    AuthToken, CancellationToken, Endpoint, FetchPlan, InspectionReport, RepoPath, RepositorySpec,
-    Revision, Snapshot, VerificationReport,
+    AuthToken, CacheInventoryReport, CancellationToken, Endpoint, FetchPlan, InspectionReport,
+    RepoPath, RepositorySpec, Revision, Snapshot, VerificationReport,
 };
 
 /// A typed request to resolve and plan one repository revision.
@@ -603,6 +603,28 @@ impl OfflineStore {
         VerificationReport::from_inspection(self.inspect(repository, revision, paths))
     }
 
+    /// Inventories recognized repository cache namespaces without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified cache error when the selected root or repository
+    /// namespace cannot be traversed safely.
+    pub fn inspect_repository(
+        &self,
+        repository: &RepositorySpec,
+    ) -> Result<CacheInventoryReport, HubOperationError> {
+        let cache = OfflineCache::shared(
+            &self.cache_root,
+            &self.endpoint,
+            repository,
+            self.cache_mode.view(),
+        )?;
+        Ok(CacheInventoryReport::new(
+            self.cache_mode,
+            cache.inventory_entries()?,
+        ))
+    }
+
     /// Opens and fully revalidates a completed caller-owned local directory.
     ///
     /// The exact immutable commit and selected path set must match the
@@ -821,6 +843,13 @@ mod tests {
             std::slice::from_ref(&path),
         );
         assert_eq!(inspection.state(), crate::InspectionState::Complete);
+        let inventory = offline.inspect_repository(first.repository())?;
+        assert!(
+            inventory
+                .entries()
+                .iter()
+                .any(|entry| entry.path().contains("snapshots/"))
+        );
         assert!(
             offline
                 .verify(
