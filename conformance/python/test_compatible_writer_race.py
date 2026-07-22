@@ -18,6 +18,7 @@ from filelock import SoftFileLock
 
 from compatible_writer_race import (
     CRASH_EXIT_CODE,
+    EXPECTED_FILELOCK_VERSION,
     RaceConfig,
     RaceHarnessError,
     imported_reference_root,
@@ -90,6 +91,7 @@ class CompatibleWriterRaceTests(unittest.TestCase):
             storage = config.cache_root / "models--fixture-org--writer-race"
             snapshot = storage / "snapshots" / COMMIT / FILENAME
             self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["filelock_version"], EXPECTED_FILELOCK_VERSION)
             self.assertEqual(result["body_calls"], 1)
             self.assertEqual(result["pointer_form"], "regular")
             self.assertEqual(result["scan_warnings"], [])

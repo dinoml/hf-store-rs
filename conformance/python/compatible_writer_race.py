@@ -11,6 +11,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+from importlib.metadata import version as distribution_version
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -26,6 +27,7 @@ from cache_conformance import ConformanceError, verify_reference_checkout
 
 
 FORMAT_VERSION = 1
+EXPECTED_FILELOCK_VERSION = "3.25.2"
 CRASH_EXIT_CODE = 86
 POLL_INTERVAL_SECONDS = 0.01
 MODES = ("python-first", "rust-first")
@@ -252,6 +254,12 @@ def run_writer(config: RaceConfig) -> dict[str, Any]:
         verify_reference_checkout(config.reference_root, huggingface_hub)
     except ConformanceError as error:
         raise RaceHarnessError(str(error)) from error
+    filelock_version = distribution_version("filelock")
+    if filelock_version != EXPECTED_FILELOCK_VERSION:
+        raise RaceHarnessError(
+            "unexpected filelock package version: "
+            f"wanted {EXPECTED_FILELOCK_VERSION}, got {filelock_version}"
+        )
 
     content = config.content_path.read_bytes()
     content_sha256 = hashlib.sha256(content).hexdigest()
@@ -405,6 +413,7 @@ def run_writer(config: RaceConfig) -> dict[str, Any]:
     result: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
         "producer": "huggingface_hub",
+        "filelock_version": filelock_version,
         "status": "ok",
         "mode": config.mode,
         "repo_type": config.repo_type,
