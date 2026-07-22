@@ -22,7 +22,7 @@ use super::metadata::SnapshotFileRecord;
 use super::publication::{CacheError, CacheKernel, Effects};
 #[cfg(unix)]
 use super::rooted_fs::RelativeSymlinkOutcome;
-use super::rooted_fs::{CreateOnceOutcome, RootedFileSystem, RootedRegularFile};
+use super::rooted_fs::{CreateOnceOutcome, RootedFileSystem, RootedLockGuard, RootedRegularFile};
 
 pub(super) const CACHEDIR_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n\
 # This file is a cache directory tag created by huggingface_hub.\n\
@@ -103,10 +103,14 @@ impl StandardCacheWriter {
             let _validated_ref_path = self.layout.ref_path(revision)?;
         }
         let plan = WritePlan::new(full_tree, paths)?;
-        let (prepared, mut cleanup) =
-            self.prepare_blobs(commit, full_tree, &plan, &mut open_source)?;
-        let result = self.publish_prepared(revision, commit, full_tree, &plan, &prepared);
+        let PreparedBlobs {
+            blobs,
+            mut cleanup,
+            guards,
+        } = self.prepare_blobs(commit, full_tree, &plan, &mut open_source)?;
+        let result = self.publish_prepared(revision, commit, full_tree, &plan, &blobs);
         cleanup.remove_all();
+        drop(guards);
         result.map_err(CompatibleCacheError::with_may_have_published)
     }
 
@@ -116,13 +120,14 @@ impl StandardCacheWriter {
         full_tree: &HubTree,
         plan: &WritePlan,
         open_source: &mut F,
-    ) -> Result<(BTreeMap<HubBlobKey, PreparedBlob>, StagingCleanup), CompatibleCacheError>
+    ) -> Result<PreparedBlobs, CompatibleCacheError>
     where
         R: Read,
         F: FnMut(&RepoPath) -> io::Result<R>,
     {
         let mut cleanup = StagingCleanup::new(Arc::clone(&self.root));
         let mut prepared = BTreeMap::new();
+        let mut guards = Vec::with_capacity(plan.blobs.len());
         let reusable_index = match self.reader.index_from_tree(commit, full_tree) {
             Ok(index) => Some(index),
             Err(error) if error.is_incomplete() => None,
@@ -137,15 +142,20 @@ impl StandardCacheWriter {
                 open_source,
                 &mut cleanup,
             );
-            let (prepared_blob, published) = match prepared_blob {
+            let (prepared_blob, published, guard) = match prepared_blob {
                 Ok(prepared_blob) => prepared_blob,
                 Err(error) if published_any => return Err(error.with_may_have_published()),
                 Err(error) => return Err(error),
             };
             published_any |= published;
             prepared.insert(key.clone(), prepared_blob);
+            guards.push(guard);
         }
-        Ok((prepared, cleanup))
+        Ok(PreparedBlobs {
+            blobs: prepared,
+            cleanup,
+            guards,
+        })
     }
 
     fn prepare_blob<R, F>(
@@ -155,7 +165,7 @@ impl StandardCacheWriter {
         reusable_index: Option<&HubCacheIndex>,
         open_source: &mut F,
         cleanup: &mut StagingCleanup,
-    ) -> Result<(PreparedBlob, bool), CompatibleCacheError>
+    ) -> Result<(PreparedBlob, bool, Box<dyn RootedLockGuard>), CompatibleCacheError>
     where
         R: Read,
         F: FnMut(&RepoPath) -> io::Result<R>,
@@ -163,7 +173,7 @@ impl StandardCacheWriter {
         let destination = self.layout.blob_path(key);
         let destination_relative = self.relative(&destination)?;
         let lock = self.layout.blob_lock(key);
-        let _guard = self
+        let guard = self
             .root
             .lock_exclusive(&self.relative(&lock)?)
             .map_err(CacheError::from)?;
@@ -191,7 +201,7 @@ impl StandardCacheWriter {
             RootedRegularFile::Other => return Err(CompatibleCacheError::corrupt()),
         };
         let published = self.publish_blob_locked(&destination_relative, &prepared)?;
-        Ok((prepared, published))
+        Ok((prepared, published, guard))
     }
 
     fn prepare_missing_blob<R, F>(
@@ -316,10 +326,10 @@ impl StandardCacheWriter {
     fn initialize_python_layout(&self) -> Result<(), CompatibleCacheError> {
         let tag = self.layout.cachedir_tag();
         let tag_relative = self.relative(&tag)?;
-        let staging = self.effects.next_staging_name().map_err(CacheError::from)?;
+        let staging = self.next_staging_file()?;
         let outcome = self
             .root
-            .create_once(&tag_relative, CACHEDIR_TAG, &staging)
+            .create_once_from_staging(&tag_relative, CACHEDIR_TAG, &staging)
             .map_err(CacheError::from)?;
         if outcome == CreateOnceOutcome::Created {
             self.sync_parent(&tag_relative)?;
@@ -407,10 +417,10 @@ impl StandardCacheWriter {
         let encoded = encode_tree(full_tree)
             .map_err(HubCacheReadError::tree_metadata)
             .map_err(CompatibleCacheError::from)?;
-        let staging = self.effects.next_staging_name().map_err(CacheError::from)?;
+        let staging = self.next_staging_file()?;
         let outcome = self
             .root
-            .create_once(&self.relative(&destination)?, &encoded, &staging)
+            .create_once_from_staging(&self.relative(&destination)?, &encoded, &staging)
             .map_err(CacheError::from)?;
         if outcome == CreateOnceOutcome::Created {
             self.sync_parent(&self.relative(&destination)?)?;
@@ -446,7 +456,7 @@ impl StandardCacheWriter {
             let snapshot_relative = self.relative(&snapshot)?;
             let standard_blob = self.layout.blob_path(&file.key);
             let blob_relative = self.relative(&standard_blob)?;
-            let staging = self.effects.next_staging_name().map_err(CacheError::from)?;
+            let staging = self.next_staging_file()?;
             let copied = match self.materialization {
                 SnapshotMaterialization::Copy => true,
                 SnapshotMaterialization::Auto => {
@@ -463,7 +473,11 @@ impl StandardCacheWriter {
             if copied {
                 let outcome = self
                     .root
-                    .copy_regular_create_once(&blob_relative, &snapshot_relative, &staging)
+                    .copy_regular_create_once_from_staging(
+                        &blob_relative,
+                        &snapshot_relative,
+                        &staging,
+                    )
                     .map_err(CacheError::from)?;
                 if outcome == CreateOnceOutcome::Created {
                     self.sync_parent(&snapshot_relative)?;
@@ -510,9 +524,9 @@ impl StandardCacheWriter {
             .root
             .lock_exclusive(&self.relative(&lock)?)
             .map_err(CacheError::from)?;
-        let staging = self.effects.next_staging_name().map_err(CacheError::from)?;
+        let staging = self.next_staging_file()?;
         self.root
-            .replace(
+            .replace_from_staging(
                 &self.relative(&destination)?,
                 commit.as_str().as_bytes(),
                 &staging,
@@ -532,6 +546,13 @@ impl StandardCacheWriter {
             .ok_or_else(|| CacheError::from(io::Error::other("cache path has no parent")))?;
         self.root.sync_directory(parent).map_err(CacheError::from)?;
         Ok(())
+    }
+
+    fn next_staging_file(&self) -> Result<PathBuf, CompatibleCacheError> {
+        let name = self.effects.next_staging_name().map_err(CacheError::from)?;
+        let path = self.layout.staged_file(&name);
+        self.ensure_parent(&path)?;
+        self.relative(&path)
     }
 
     fn ensure_parent(&self, path: &Path) -> Result<(), CompatibleCacheError> {
@@ -620,6 +641,12 @@ struct PreparedBlob {
     size: u64,
     digest: BlobDigest,
     staging: Option<PathBuf>,
+}
+
+struct PreparedBlobs {
+    blobs: BTreeMap<HubBlobKey, PreparedBlob>,
+    cleanup: StagingCleanup,
+    guards: Vec<Box<dyn RootedLockGuard>>,
 }
 
 struct StagingCleanup {
@@ -1009,6 +1036,7 @@ mod tests {
             inner: Arc::clone(&writer.root),
             lock_barrier: Some((lock_path, Arc::new(Barrier::new(2)))),
             failed_install: None,
+            lock_lifetime: None,
         });
         let calls = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::with_capacity(2);
@@ -1050,6 +1078,46 @@ mod tests {
     }
 
     #[test]
+    fn blob_lock_is_held_until_the_snapshot_entry_is_complete() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("config.json")?;
+        let entry = git_entry(CONFIG_BYTES)?;
+        let key = crate::cache::hub_cache::compatible_blob_key(&entry)?;
+        let tree = HubTree::new([(path.clone(), entry)])?;
+        let revision = Revision::parse("main")?;
+        let layout = fixture.layout()?;
+        let mut writer = fixture.writer(SnapshotMaterialization::Copy)?;
+        let active = Arc::new(AtomicBool::new(false));
+        let observed_during_snapshot = Arc::new(AtomicBool::new(false));
+        writer.root = Arc::new(BlobPublicationProbeRoot {
+            inner: Arc::clone(&writer.root),
+            lock_barrier: None,
+            failed_install: None,
+            lock_lifetime: Some(LockLifetimeProbe {
+                lock: writer.relative(&layout.blob_lock(&key))?,
+                snapshot: writer.relative(&layout.snapshot_file(&fixture.commit, &path))?,
+                active: Arc::clone(&active),
+                observed_during_snapshot: Arc::clone(&observed_during_snapshot),
+            }),
+        });
+        let contents = contents([(path.as_str(), CONFIG_BYTES)]);
+        let calls = AtomicUsize::new(0);
+
+        writer.publish(
+            &revision,
+            &fixture.commit,
+            &tree,
+            std::slice::from_ref(&path),
+            source(&contents, Some(&calls)),
+        )?;
+
+        assert!(observed_during_snapshot.load(Ordering::Acquire));
+        assert!(!active.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
     fn scan_safe_scaffold_precedes_a_failing_blob_install() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new()?;
         let path = RepoPath::parse("config.json")?;
@@ -1069,6 +1137,7 @@ mod tests {
                 snapshots: writer.relative(&layout.snapshots_directory())?,
                 observed_scan_safe: Arc::clone(&observed_scan_safe),
             }),
+            lock_lifetime: None,
         });
         let contents = contents([(path.as_str(), CONFIG_BYTES)]);
         let calls = AtomicUsize::new(0);
@@ -1469,6 +1538,7 @@ mod tests {
         inner: Arc<dyn RootedFileSystem>,
         lock_barrier: Option<(PathBuf, Arc<Barrier>)>,
         failed_install: Option<FailedBlobInstall>,
+        lock_lifetime: Option<LockLifetimeProbe>,
     }
 
     #[derive(Debug)]
@@ -1477,6 +1547,28 @@ mod tests {
         cachedir_tag: PathBuf,
         snapshots: PathBuf,
         observed_scan_safe: Arc<AtomicBool>,
+    }
+
+    #[derive(Debug)]
+    struct LockLifetimeProbe {
+        lock: PathBuf,
+        snapshot: PathBuf,
+        active: Arc<AtomicBool>,
+        observed_during_snapshot: Arc<AtomicBool>,
+    }
+
+    #[derive(Debug)]
+    struct ProbedLockGuard {
+        _inner: Box<dyn RootedLockGuard>,
+        active: Arc<AtomicBool>,
+    }
+
+    impl RootedLockGuard for ProbedLockGuard {}
+
+    impl Drop for ProbedLockGuard {
+        fn drop(&mut self) {
+            self.active.store(false, Ordering::Release);
+        }
     }
 
     impl RootedFileSystem for BlobPublicationProbeRoot {
@@ -1555,12 +1647,45 @@ mod tests {
             destination: &Path,
             staging: &StagingName,
         ) -> io::Result<CreateOnceOutcome> {
+            if let Some(probe) = &self.lock_lifetime {
+                if destination == probe.snapshot {
+                    probe
+                        .observed_during_snapshot
+                        .store(probe.active.load(Ordering::Acquire), Ordering::Release);
+                }
+            }
             self.inner
                 .copy_regular_create_once(source, destination, staging)
         }
 
+        fn copy_regular_create_once_from_staging(
+            &self,
+            source: &Path,
+            destination: &Path,
+            staging_path: &Path,
+        ) -> io::Result<CreateOnceOutcome> {
+            if let Some(probe) = &self.lock_lifetime {
+                if destination == probe.snapshot {
+                    probe
+                        .observed_during_snapshot
+                        .store(probe.active.load(Ordering::Acquire), Ordering::Release);
+                }
+            }
+            self.inner
+                .copy_regular_create_once_from_staging(source, destination, staging_path)
+        }
+
         fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {
             self.inner.replace(path, bytes, staging)
+        }
+
+        fn replace_from_staging(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            staging_path: &Path,
+        ) -> io::Result<()> {
+            self.inner.replace_from_staging(path, bytes, staging_path)
         }
 
         fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
@@ -1569,7 +1694,17 @@ mod tests {
                     barrier.wait();
                 }
             }
-            self.inner.lock_exclusive(path)
+            let guard = self.inner.lock_exclusive(path)?;
+            if let Some(probe) = &self.lock_lifetime {
+                if path == probe.lock {
+                    probe.active.store(true, Ordering::Release);
+                    return Ok(Box::new(ProbedLockGuard {
+                        _inner: guard,
+                        active: Arc::clone(&probe.active),
+                    }));
+                }
+            }
+            Ok(guard)
         }
 
         fn sync_directory(&self, path: &Path) -> io::Result<()> {

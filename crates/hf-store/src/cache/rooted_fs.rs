@@ -158,7 +158,56 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         path: &Path,
         bytes: &[u8],
         staging: &StagingName,
-    ) -> io::Result<CreateOnceOutcome>;
+    ) -> io::Result<CreateOnceOutcome> {
+        let staging_path = staging_path(path, staging)?;
+        self.create_once_from_staging(path, bytes, &staging_path)
+    }
+    fn create_once_from_staging(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        staging_path: &Path,
+    ) -> io::Result<CreateOnceOutcome> {
+        ensure_distinct_staging(path, staging_path)?;
+        match self.entry_kind(path)? {
+            RootedEntryKind::Missing => {}
+            RootedEntryKind::RegularFile => return Ok(CreateOnceOutcome::Existing),
+            RootedEntryKind::Directory | RootedEntryKind::Other => {
+                return Err(invalid_data(
+                    "cache create-once destination is not a regular file",
+                ));
+            }
+        }
+        let mut file = self.create_new(staging_path)?;
+        let staged = file.write_all(bytes).and_then(|()| file.sync_all());
+        drop(file);
+        let publication = staged.and_then(|()| {
+            let outcome = self.install_staged_create_once(staging_path, path)?;
+            match outcome {
+                CreateOnceOutcome::Created => {
+                    match self.read_regular_bounded(path, bytes.len())? {
+                        RootedRead::Bytes(actual) if actual == bytes => {}
+                        RootedRead::Missing | RootedRead::Other | RootedRead::Bytes(_) => {
+                            return Err(invalid_data(
+                                "published cache record failed final validation",
+                            ));
+                        }
+                    }
+                }
+                CreateOnceOutcome::Existing
+                    if self.entry_kind(path)? != RootedEntryKind::RegularFile =>
+                {
+                    return Err(invalid_data(
+                        "cache create-once destination is not a regular file",
+                    ));
+                }
+                CreateOnceOutcome::Existing => {}
+            }
+            Ok(outcome)
+        });
+        let _cleanup_result = self.remove_file(staging_path);
+        publication
+    }
     fn create_relative_symlink_once(
         &self,
         _path: &Path,
@@ -172,6 +221,16 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         destination: &Path,
         staging: &StagingName,
     ) -> io::Result<CreateOnceOutcome> {
+        let staging_path = staging_path(destination, staging)?;
+        self.copy_regular_create_once_from_staging(source, destination, &staging_path)
+    }
+    fn copy_regular_create_once_from_staging(
+        &self,
+        source: &Path,
+        destination: &Path,
+        staging_path: &Path,
+    ) -> io::Result<CreateOnceOutcome> {
+        ensure_distinct_staging(destination, staging_path)?;
         match self.entry_kind(destination)? {
             RootedEntryKind::Missing => {}
             RootedEntryKind::RegularFile => return Ok(CreateOnceOutcome::Existing),
@@ -193,8 +252,7 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
             }
         };
 
-        let staging_path = staging_path(destination, staging)?;
-        let mut writer = self.create_new(&staging_path)?;
+        let mut writer = self.create_new(staging_path)?;
         let staged = io::copy(&mut reader, &mut writer)
             .and_then(|copied| {
                 if copied == expected_size {
@@ -207,7 +265,7 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         drop(writer);
 
         let publication = staged.and_then(|()| {
-            let outcome = self.install_staged_create_once(&staging_path, destination)?;
+            let outcome = self.install_staged_create_once(staging_path, destination)?;
             if outcome == CreateOnceOutcome::Existing
                 && self.entry_kind(destination)? != RootedEntryKind::RegularFile
             {
@@ -215,10 +273,16 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
             }
             Ok(outcome)
         });
-        let cleanup = self.remove_file(&staging_path);
+        let cleanup = self.remove_file(staging_path);
         finish_staging_cleanup(publication, cleanup)
     }
     fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()>;
+    fn replace_from_staging(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        staging_path: &Path,
+    ) -> io::Result<()>;
     fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>>;
     fn sync_directory(&self, path: &Path) -> io::Result<()>;
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
@@ -438,45 +502,8 @@ impl RootedFileSystem for CacheRoot {
         bytes: &[u8],
         staging: &StagingName,
     ) -> io::Result<CreateOnceOutcome> {
-        match self.entry_kind(path)? {
-            RootedEntryKind::Missing => {}
-            RootedEntryKind::RegularFile => return Ok(CreateOnceOutcome::Existing),
-            RootedEntryKind::Directory | RootedEntryKind::Other => {
-                return Err(invalid_data(
-                    "cache create-once destination is not a regular file",
-                ));
-            }
-        }
         let staging_path = staging_path(path, staging)?;
-        let mut file = self.create_new(&staging_path)?;
-        let staged = file.write_all(bytes).and_then(|()| file.sync_all());
-        drop(file);
-        let publication = staged.and_then(|()| {
-            let outcome = self.install_staged_create_once(&staging_path, path)?;
-            match outcome {
-                CreateOnceOutcome::Created => {
-                    match self.read_regular_bounded(path, bytes.len())? {
-                        RootedRead::Bytes(actual) if actual == bytes => {}
-                        RootedRead::Missing | RootedRead::Other | RootedRead::Bytes(_) => {
-                            return Err(invalid_data(
-                                "published cache record failed final validation",
-                            ));
-                        }
-                    }
-                }
-                CreateOnceOutcome::Existing
-                    if self.entry_kind(path)? != RootedEntryKind::RegularFile =>
-                {
-                    return Err(invalid_data(
-                        "cache create-once destination is not a regular file",
-                    ));
-                }
-                CreateOnceOutcome::Existing => {}
-            }
-            Ok(outcome)
-        });
-        let _cleanup_result = self.remove_file(&staging_path);
-        publication
+        self.create_once_from_staging(path, bytes, &staging_path)
     }
 
     fn create_relative_symlink_once(
@@ -513,6 +540,17 @@ impl RootedFileSystem for CacheRoot {
     }
 
     fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {
+        let staging_path = staging_path(path, staging)?;
+        self.replace_from_staging(path, bytes, &staging_path)
+    }
+
+    fn replace_from_staging(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        staging_path: &Path,
+    ) -> io::Result<()> {
+        ensure_distinct_staging(path, staging_path)?;
         match self.entry_kind(path)? {
             RootedEntryKind::Missing | RootedEntryKind::RegularFile => {}
             RootedEntryKind::Directory | RootedEntryKind::Other => {
@@ -521,16 +559,15 @@ impl RootedFileSystem for CacheRoot {
                 ));
             }
         }
-        let staging_path = staging_path(path, staging)?;
-        let mut file = self.create_new(&staging_path)?;
+        let mut file = self.create_new(staging_path)?;
         let staged = file.write_all(bytes).and_then(|()| file.sync_all());
         drop(file);
         let replacement = staged
             .and_then(|()| {
                 let (staging_parent, staging_name) =
-                    self.open_parent_and_name(&staging_path, false)?;
+                    self.open_parent_and_name(staging_path, false)?;
                 let (destination_parent, destination_name) =
-                    self.open_parent_and_name(path, false)?;
+                    self.open_parent_and_name(path, true)?;
                 staging_parent.rename(staging_name, &destination_parent, destination_name)
             })
             .and_then(|()| match self.read_regular_bounded(path, bytes.len())? {
@@ -540,7 +577,7 @@ impl RootedFileSystem for CacheRoot {
                 ),
             });
         if replacement.is_err() {
-            let _cleanup_result = self.remove_file(&staging_path);
+            let _cleanup_result = self.remove_file(staging_path);
         }
         replacement
     }
@@ -671,6 +708,16 @@ fn staging_path(path: &Path, staging: &StagingName) -> io::Result<PathBuf> {
         return Err(invalid_input("cache path has no parent"));
     };
     Ok(parent.join(format!(".hf-store-{staging}.tmp")))
+}
+
+fn ensure_distinct_staging(destination: &Path, staging: &Path) -> io::Result<()> {
+    if destination == staging {
+        Err(invalid_input(
+            "cache staging path must differ from its destination",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn finish_staging_cleanup<T>(result: io::Result<T>, cleanup: io::Result<()>) -> io::Result<T> {
@@ -1037,6 +1084,57 @@ mod tests {
                 .join("snapshots/commit/.hf-store-snapshot-copy.tmp")
                 .try_exists()?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_hidden_staging_keeps_temporary_files_out_of_visible_namespaces() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let staging_root = Path::new(".locks/repository/.hf-store-staging");
+        root.ensure_dir(staging_root)?;
+
+        let record = Path::new("models--org--repo/trees/commit.json");
+        let record_staging = staging_root.join("record.entry");
+        let outcome = root.create_once_from_staging(record, b"tree", &record_staging)?;
+        assert_eq!(outcome, CreateOnceOutcome::Created);
+
+        let blob = Path::new("models--org--repo/blobs/object-id");
+        let blob_staging = staging_root.join("blob.entry");
+        root.replace_from_staging(blob, b"blob", &blob_staging)?;
+        let snapshot = Path::new("models--org--repo/snapshots/commit/model.bin");
+        let snapshot_staging = staging_root.join("snapshot.entry");
+        let outcome =
+            root.copy_regular_create_once_from_staging(blob, snapshot, &snapshot_staging)?;
+        assert_eq!(outcome, CreateOnceOutcome::Created);
+
+        let reference = Path::new("models--org--repo/refs/main");
+        let reference_staging = staging_root.join("ref.entry");
+        root.replace_from_staging(reference, b"commit", &reference_staging)?;
+
+        for staging in [
+            record_staging,
+            blob_staging,
+            snapshot_staging,
+            reference_staging,
+        ] {
+            assert!(!fixture.cache.join(staging).try_exists()?);
+        }
+        for visible_parent in [
+            Path::new("models--org--repo/trees"),
+            Path::new("models--org--repo/blobs"),
+            Path::new("models--org--repo/snapshots/commit"),
+            Path::new("models--org--repo/refs"),
+        ] {
+            let entries = fs::read_dir(fixture.cache.join(visible_parent))?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<io::Result<Vec<_>>>()?;
+            assert!(
+                entries
+                    .iter()
+                    .all(|name| !name.to_string_lossy().starts_with(".hf-store-"))
+            );
+        }
         Ok(())
     }
 

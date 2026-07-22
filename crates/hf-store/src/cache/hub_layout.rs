@@ -137,6 +137,10 @@ impl HubCacheLayout {
     pub(super) fn staged_blob(&self, staging: &StagingName) -> PathBuf {
         self.staging_directory().join(format!("{staging}.blob"))
     }
+
+    pub(super) fn staged_file(&self, staging: &StagingName) -> PathBuf {
+        self.staging_directory().join(format!("{staging}.entry"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -251,6 +255,10 @@ mod tests {
         assert_eq!(
             layout.staged_blob(&staging),
             root.join(".locks/models--org--repo/.hf-store-staging/operation-17.blob")
+        );
+        assert_eq!(
+            layout.staged_file(&staging),
+            root.join(".locks/models--org--repo/.hf-store-staging/operation-17.entry")
         );
 
         Ok(())

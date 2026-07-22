@@ -1500,6 +1500,15 @@ mod tests {
     fn competing_processes_converge_on_one_validated_blob() -> Result<(), Box<dyn std::error::Error>>
     {
         let fixture = Fixture::new()?;
+        let digest = BlobDigest::for_bytes(CROSS_PROCESS_PAYLOAD);
+        // Isolate lock and create-once behavior from concurrent directory setup.
+        let blob_path = fixture.kernel.blob_path(&digest);
+        fixture.kernel.ensure_parent(&blob_path)?;
+        let lock_path = fixture.kernel.layout.blob_lock(&digest);
+        fixture.kernel.ensure_parent(&lock_path)?;
+        let lock_relative = fixture.kernel.relative_path(&lock_path)?;
+        drop(fixture.kernel.root.lock_exclusive(lock_relative)?);
+
         let gate_path = fixture.directory.path().join("publisher-gate.lock");
         let gate_file = std::fs::OpenOptions::new()
             .create(true)
@@ -1556,11 +1565,7 @@ mod tests {
         outcomes.sort_unstable();
         assert_eq!(outcomes, [b"published".to_vec(), b"reused".to_vec()]);
 
-        let digest = BlobDigest::for_bytes(CROSS_PROCESS_PAYLOAD);
-        assert_eq!(
-            std::fs::read(fixture.kernel.blob_path(&digest))?,
-            CROSS_PROCESS_PAYLOAD
-        );
+        assert_eq!(std::fs::read(blob_path)?, CROSS_PROCESS_PAYLOAD);
         assert!(fixture.kernel.staging_entries()?.is_empty());
 
         Ok(())
@@ -2423,6 +2428,15 @@ mod tests {
 
         fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {
             self.inner.replace(path, bytes, staging)
+        }
+
+        fn replace_from_staging(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            staging_path: &Path,
+        ) -> io::Result<()> {
+            self.inner.replace_from_staging(path, bytes, staging_path)
         }
 
         fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
