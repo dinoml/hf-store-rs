@@ -45,6 +45,7 @@ mod hub_protocol;
 mod progress;
 mod repo;
 mod repo_path;
+mod report;
 #[cfg(feature = "network")]
 mod reqwest_transport;
 mod revision;
@@ -81,6 +82,8 @@ pub use error::HubOperationError as HubError;
 pub use fetch_plan::{FetchPlan, PlannedFile};
 #[doc(inline)]
 pub use progress::{ProgressEvent, ProgressObserver, ProgressPhase, ReuseDecision};
+#[doc(inline)]
+pub use report::{InspectedFile, InspectionReport, InspectionState, VerificationReport};
 
 #[doc(inline)]
 pub use repo::{RepositoryId, RepositoryKind, RepositorySpec};

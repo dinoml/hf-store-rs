@@ -176,6 +176,33 @@ impl HubOperationError {
         matches!(self.kind.as_ref(), HubOperationErrorKind::Cache(_))
     }
 
+    /// Returns whether required cache content is absent or logically incomplete.
+    #[must_use]
+    pub fn is_cache_incomplete(&self) -> bool {
+        matches!(
+            self.cache_failure(),
+            Some(CacheFailure::Missing | CacheFailure::Incomplete)
+        )
+    }
+
+    /// Returns whether cache content or metadata is corrupt.
+    #[must_use]
+    pub fn is_cache_corrupt(&self) -> bool {
+        self.cache_failure() == Some(CacheFailure::Corrupt)
+    }
+
+    /// Returns whether cache metadata uses an unsupported version.
+    #[must_use]
+    pub fn is_cache_unsupported(&self) -> bool {
+        self.cache_failure() == Some(CacheFailure::UnsupportedVersion)
+    }
+
+    /// Returns whether active coordination prevents a cache operation.
+    #[must_use]
+    pub fn is_cache_busy(&self) -> bool {
+        self.cache_failure() == Some(CacheFailure::Busy)
+    }
+
     /// Returns whether this build has no usable network backend.
     #[must_use]
     pub fn is_backend_unavailable(&self) -> bool {

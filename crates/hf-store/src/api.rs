@@ -16,7 +16,8 @@ use crate::hub_protocol::HubProtocol;
 use crate::progress::ProgressObserver;
 use crate::transport::Transport;
 use crate::{
-    AuthToken, CancellationToken, Endpoint, FetchPlan, RepoPath, RepositorySpec, Revision, Snapshot,
+    AuthToken, CancellationToken, Endpoint, FetchPlan, InspectionReport, RepoPath, RepositorySpec,
+    Revision, Snapshot, VerificationReport,
 };
 
 /// A typed request to resolve and plan one repository revision.
@@ -108,7 +109,8 @@ pub struct FetchOptions {
 
 /// Selects which cache layout owns the returned snapshot.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CacheMode {
     /// Use hf-store's endpoint-namespaced owned cache layout.
     Owned,
@@ -576,6 +578,31 @@ impl OfflineStore {
         ))
     }
 
+    /// Inspects one exact selection without networking or cache mutation.
+    #[must_use]
+    pub fn inspect(
+        &self,
+        repository: &RepositorySpec,
+        revision: &Revision,
+        paths: &[RepoPath],
+    ) -> InspectionReport {
+        match self.open(repository, revision, paths) {
+            Ok(snapshot) => InspectionReport::complete(self.cache_mode, &snapshot),
+            Err(error) => InspectionReport::failed(self.cache_mode, &error),
+        }
+    }
+
+    /// Revalidates one exact selection and returns stable report evidence.
+    #[must_use]
+    pub fn verify(
+        &self,
+        repository: &RepositorySpec,
+        revision: &Revision,
+        paths: &[RepoPath],
+    ) -> VerificationReport {
+        VerificationReport::from_inspection(self.inspect(repository, revision, paths))
+    }
+
     /// Opens and fully revalidates a completed caller-owned local directory.
     ///
     /// The exact immutable commit and selected path set must match the
@@ -785,6 +812,23 @@ mod tests {
         )?;
         assert!(offline_snapshot.was_reused());
         assert_eq!(offline_snapshot.commit(), first.commit());
+        let inspection = offline.inspect(
+            first.repository(),
+            &Revision::parse("main")?,
+            std::slice::from_ref(&path),
+        );
+        assert_eq!(inspection.state(), crate::InspectionState::Complete);
+        assert!(
+            offline
+                .verify(
+                    first.repository(),
+                    &Revision::parse("main")?,
+                    std::slice::from_ref(&path),
+                )
+                .is_valid()
+        );
+        let encoded = serde_json::to_string(&inspection)?;
+        assert!(encoded.contains("\"schema\":\"hf-store.inspection\""));
         assert_eq!(
             std::fs::read(
                 offline_snapshot
