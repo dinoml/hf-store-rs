@@ -540,7 +540,7 @@ impl From<ValidationError> for CompatibleCacheError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{self, Read};
+    use std::io;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -551,11 +551,14 @@ mod tests {
     use super::*;
     use crate::cache::hub_layout::HubCacheLayout;
     use crate::cache::hub_metadata::{HubTree, HubTreeEntry, encode_ref, encode_tree};
+    use crate::cache::local_dir_layout::HubLocalDirLayout;
+    use crate::cache::local_dir_materialization::{ExistingFilePolicy, LocalDirFileMaterializer};
     use crate::cache::metadata::{HubBlobBindingRecord, encode_record};
     use crate::cache::publication::{
         NoPublicationFaults, OsFileSystem, PublicationFaults, PublicationPoint, RandomOperationIds,
         SystemClock,
     };
+    use crate::cache::rooted_fs::{CacheRoot, RootedFileSystem};
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const OTHER_COMMIT: &str = "89abcdef0123456789abcdef0123456789abcdef";
@@ -714,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_snapshot_candidate_reopens_validated_bytes_without_transport()
+    fn compatible_snapshot_candidate_materializes_an_independent_local_file_without_transport()
     -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new()?;
         let path = RepoPath::parse("config.json")?;
@@ -732,9 +735,29 @@ mod tests {
             )?
             .ok_or("compatible cache candidate was not found")?;
         let mut reader = prepared.into_reader();
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-        assert_eq!(bytes, CONFIG_BYTES);
+        let local_root = fixture.directory.path().join("local-dir");
+        fs::create_dir(&local_root)?;
+        let layout = HubLocalDirLayout::new(&local_root, &fixture.endpoint, &fixture.spec)?;
+        let root: Arc<dyn RootedFileSystem> = Arc::new(CacheRoot::open(&local_root)?);
+        let materializer = LocalDirFileMaterializer::from_layout(
+            layout,
+            root,
+            Effects::new(
+                Arc::new(OsFileSystem),
+                Arc::new(RandomOperationIds),
+                Arc::new(SystemClock),
+                Arc::new(NoPublicationFaults),
+            ),
+        );
+        let copied_file =
+            materializer.materialize(&target, reader.as_mut(), ExistingFilePolicy::Reject)?;
+        assert_eq!(fs::read(copied_file.path())?, CONFIG_BYTES);
+
+        fs::write(copied_file.path(), b"user edit")?;
+        assert_eq!(fs::read(snapshot.files()[0].content_path())?, CONFIG_BYTES);
+        if let Some(blob_path) = snapshot.files()[0].blob_path() {
+            assert_eq!(fs::read(blob_path)?, CONFIG_BYTES);
+        }
         Ok(())
     }
 

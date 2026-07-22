@@ -1495,6 +1495,7 @@ mod tests {
             u64::try_from(FIRST.len())?,
             target.digest(),
         )?;
+        let retained_cache = kernel.clone();
         let mut candidates = OwnedBlobCandidates::new(kernel);
 
         let result = report(
@@ -1518,6 +1519,13 @@ mod tests {
             result.destination_bytes_written(),
             u64::try_from(FIRST.len())?
         );
+        fs::write(fixture.destination(target.path()), b"user edit")?;
+        let mut retained_blob = retained_cache
+            .open_blob(&target.digest(), u64::try_from(FIRST.len())?)?
+            .ok_or("owned blob disappeared after local directory edit")?;
+        let mut retained_bytes = Vec::new();
+        retained_blob.read_to_end(&mut retained_bytes)?;
+        assert_eq!(retained_bytes, FIRST);
         Ok(())
     }
 
