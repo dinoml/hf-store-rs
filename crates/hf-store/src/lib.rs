@@ -47,6 +47,7 @@ mod repo_path;
 #[cfg(feature = "network")]
 mod reqwest_transport;
 mod revision;
+mod snapshot;
 mod validation;
 
 #[cfg(test)]
@@ -64,7 +65,7 @@ mod transfer;
 mod transport;
 
 #[doc(inline)]
-pub use api::{FetchRequest, HubStore, HubStoreBuilder};
+pub use api::{CacheMode, FetchOptions, FetchRequest, HubStore, HubStoreBuilder, OfflineStore};
 #[doc(inline)]
 pub use auth::AuthToken;
 #[doc(inline)]
@@ -86,5 +87,7 @@ pub use repo::{RepositoryId, RepositoryKind, RepositorySpec};
 pub use repo_path::RepoPath;
 #[doc(inline)]
 pub use revision::{CommitId, Revision};
+#[doc(inline)]
+pub use snapshot::{Snapshot, SnapshotFile};
 #[doc(inline)]
 pub use validation::ValidationError;

@@ -200,6 +200,19 @@ impl CacheLayout {
             .join("manifest.json")
     }
 
+    pub(super) fn snapshot_file(
+        &self,
+        commit: &CommitId,
+        selection: &SelectionId,
+        path: &crate::RepoPath,
+    ) -> PathBuf {
+        let mut destination = self.snapshot_directory(commit, selection);
+        for component in path.as_str().split('/') {
+            destination.push(component);
+        }
+        destination
+    }
+
     pub(super) fn snapshot_lock(&self, commit: &CommitId, selection: &SelectionId) -> PathBuf {
         self.repository_directory()
             .join("locks")

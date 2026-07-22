@@ -8,6 +8,7 @@ pub struct FetchPlan {
     repository: RepositorySpec,
     requested_revision: Revision,
     commit: CommitId,
+    tree: HubTree,
     selection: RepositorySelection,
     files: Box<[PlannedFile]>,
 }
@@ -45,6 +46,7 @@ impl FetchPlan {
             repository,
             requested_revision,
             commit,
+            tree: tree.clone(),
             selection,
             files,
         })
@@ -84,6 +86,10 @@ impl FetchPlan {
     #[must_use]
     pub fn files(&self) -> &[PlannedFile] {
         &self.files
+    }
+
+    pub(crate) const fn tree(&self) -> &HubTree {
+        &self.tree
     }
 }
 

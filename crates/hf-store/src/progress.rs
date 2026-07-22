@@ -131,10 +131,10 @@ pub trait ProgressObserver: Debug + Send + Sync {
 }
 
 #[derive(Debug)]
-#[cfg(test)]
+#[cfg(any(feature = "network", test))]
 pub(crate) struct NoopProgress;
 
-#[cfg(test)]
+#[cfg(any(feature = "network", test))]
 impl ProgressObserver for NoopProgress {
     fn observe(&self, _event: &ProgressEvent) {}
 }

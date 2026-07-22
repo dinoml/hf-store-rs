@@ -1,4 +1,13 @@
+mod acquisition;
 mod compatible_cache;
+#[cfg(feature = "network")]
+pub(crate) use acquisition::AcquisitionCache;
+pub(crate) use acquisition::{AcquiredSnapshot, AcquiredSnapshotFile, OfflineCache};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CacheView {
+    Owned,
+    Compatible,
+}
 mod filter;
 pub(crate) use filter::{RepositoryFilter, RepositorySelection};
 mod hub_cache;

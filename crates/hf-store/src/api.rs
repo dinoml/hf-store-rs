@@ -1,13 +1,22 @@
 use std::fmt::{self, Debug, Formatter};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "network")]
 use std::sync::Mutex;
 
-use crate::cache::RepositoryFilter;
+#[cfg(feature = "network")]
+use crate::cache::AcquisitionCache;
+use crate::cache::{CacheView, OfflineCache, RepositoryFilter};
+#[cfg(feature = "network")]
+use crate::error::CacheFailure;
 use crate::error::HubOperationError;
 use crate::hub_protocol::HubProtocol;
+#[cfg(feature = "network")]
+use crate::progress::ProgressObserver;
 use crate::transport::Transport;
-use crate::{AuthToken, Endpoint, FetchPlan, RepositorySpec, Revision};
+use crate::{
+    AuthToken, CancellationToken, Endpoint, FetchPlan, RepoPath, RepositorySpec, Revision, Snapshot,
+};
 
 /// A typed request to resolve and plan one repository revision.
 #[derive(Clone, Debug)]
@@ -73,12 +82,99 @@ impl FetchRequest {
     pub const fn revision(&self) -> &Revision {
         &self.revision
     }
+
+    fn filter(&self) -> RepositoryFilter {
+        let allow = self
+            .allow_patterns
+            .as_deref()
+            .map(|patterns| patterns.iter().map(AsRef::as_ref).collect::<Vec<&str>>());
+        let ignore = self
+            .ignore_patterns
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>();
+        RepositoryFilter::new(allow.as_deref(), &ignore)
+    }
+}
+
+/// Per-operation policy for online snapshot acquisition.
+#[derive(Clone)]
+pub struct FetchOptions {
+    cancellation: CancellationToken,
+    progress: Option<Arc<dyn crate::ProgressObserver>>,
+    max_attempts: u32,
+}
+
+/// Selects which cache layout owns the returned snapshot.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheMode {
+    /// Use hf-store's endpoint-namespaced owned cache layout.
+    Owned,
+    /// Share the canonical Hugging Face cache layout with `huggingface_hub`.
+    Compatible,
+}
+
+impl CacheMode {
+    const fn view(self) -> CacheView {
+        match self {
+            Self::Owned => CacheView::Owned,
+            Self::Compatible => CacheView::Compatible,
+        }
+    }
+}
+
+impl FetchOptions {
+    /// Replaces the cooperative cancellation token.
+    #[must_use]
+    pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    /// Installs a synchronous structured progress observer.
+    #[must_use]
+    pub fn progress(mut self, observer: Arc<dyn crate::ProgressObserver>) -> Self {
+        self.progress = Some(observer);
+        self
+    }
+
+    /// Sets the total number of attempts for retryable file failures.
+    #[must_use]
+    pub const fn max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            progress: None,
+            max_attempts: 4,
+        }
+    }
+}
+
+impl Debug for FetchOptions {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FetchOptions")
+            .field("cancellation", &self.cancellation)
+            .field("has_progress", &self.progress.is_some())
+            .field("max_attempts", &self.max_attempts)
+            .finish()
+    }
 }
 
 /// Builder for an online Hub planning service.
 #[derive(Clone, Debug)]
 pub struct HubStoreBuilder {
     endpoint: Endpoint,
+    cache_root: Option<PathBuf>,
+    cache_mode: CacheMode,
+    max_concurrent_downloads: usize,
 }
 
 impl HubStoreBuilder {
@@ -89,11 +185,35 @@ impl HubStoreBuilder {
         self
     }
 
+    /// Selects the explicit shared cache root used by acquisition.
+    #[must_use]
+    pub fn cache_root(mut self, cache_root: impl Into<PathBuf>) -> Self {
+        self.cache_root = Some(cache_root.into());
+        self
+    }
+
+    /// Selects the owned or Python-compatible cache view.
+    #[must_use]
+    pub const fn cache_mode(mut self, cache_mode: CacheMode) -> Self {
+        self.cache_mode = cache_mode;
+        self
+    }
+
+    /// Sets the maximum number of file transfers polled concurrently.
+    #[must_use]
+    pub const fn max_concurrent_downloads(mut self, maximum: usize) -> Self {
+        self.max_concurrent_downloads = maximum;
+        self
+    }
+
     /// Builds a lazy service without constructing an HTTP client.
     #[must_use]
     pub fn build(self) -> HubStore {
         HubStore {
             endpoint: self.endpoint,
+            cache_root: self.cache_root,
+            cache_mode: self.cache_mode,
+            max_concurrent_downloads: self.max_concurrent_downloads,
             #[cfg(feature = "network")]
             transport: Mutex::new(None),
         }
@@ -104,6 +224,9 @@ impl Default for HubStoreBuilder {
     fn default() -> Self {
         Self {
             endpoint: Endpoint::hugging_face(),
+            cache_root: None,
+            cache_mode: CacheMode::Compatible,
+            max_concurrent_downloads: 8,
         }
     }
 }
@@ -115,6 +238,9 @@ impl Default for HubStoreBuilder {
 /// returns a backend-unavailable [`crate::HubError`].
 pub struct HubStore {
     endpoint: Endpoint,
+    cache_root: Option<PathBuf>,
+    cache_mode: CacheMode,
+    max_concurrent_downloads: usize,
     #[cfg(feature = "network")]
     transport: Mutex<Option<Arc<dyn Transport>>>,
 }
@@ -136,16 +262,7 @@ impl HubStore {
     pub async fn plan(&self, request: FetchRequest) -> Result<FetchPlan, HubOperationError> {
         let transport = self.transport()?;
         let protocol = HubProtocol::new(self.endpoint.clone(), transport)?;
-        let allow = request
-            .allow_patterns
-            .as_deref()
-            .map(|patterns| patterns.iter().map(AsRef::as_ref).collect::<Vec<&str>>());
-        let ignore = request
-            .ignore_patterns
-            .iter()
-            .map(AsRef::as_ref)
-            .collect::<Vec<&str>>();
-        let filter = RepositoryFilter::new(allow.as_deref(), &ignore);
+        let filter = request.filter();
         protocol
             .build_plan(
                 &request.repository,
@@ -154,6 +271,139 @@ impl HubStore {
                 request.authorization.as_ref(),
             )
             .await
+    }
+
+    /// Resolves, downloads or reuses, validates, and activates one immutable snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error when cache configuration is missing, planning
+    /// or transfer fails, cancellation is observed, or activation cannot prove
+    /// the complete selected snapshot.
+    #[cfg(feature = "network")]
+    pub async fn fetch(
+        &self,
+        request: FetchRequest,
+        options: FetchOptions,
+    ) -> Result<Snapshot, HubOperationError> {
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let cache_root = self
+            .cache_root
+            .as_ref()
+            .ok_or_else(|| HubOperationError::cache(CacheFailure::Missing))?;
+        if self.max_concurrent_downloads == 0 || options.max_attempts == 0 {
+            return Err(HubOperationError::protocol());
+        }
+        let transport = self.transport()?;
+        let protocol = Arc::new(HubProtocol::new(self.endpoint.clone(), transport)?);
+        let filter = request.filter();
+        let plan = Arc::new(
+            protocol
+                .build_plan(
+                    &request.repository,
+                    &request.revision,
+                    &filter,
+                    request.authorization.as_ref(),
+                )
+                .await?,
+        );
+        let cache = Arc::new(AcquisitionCache::shared(
+            cache_root,
+            &self.endpoint,
+            &request.repository,
+            self.cache_mode.view(),
+        )?);
+        match cache.open_plan(plan.as_ref()) {
+            Ok(snapshot) => {
+                return Ok(Snapshot::from_acquired(
+                    self.endpoint.clone(),
+                    request.repository,
+                    request.revision,
+                    &snapshot,
+                    true,
+                ));
+            }
+            Err(error)
+                if matches!(
+                    error.cache_failure(),
+                    Some(CacheFailure::Missing | CacheFailure::Incomplete)
+                ) => {}
+            Err(error) => return Err(error),
+        }
+
+        let retry_policy = crate::transfer::RetryPolicy::new(
+            options.max_attempts,
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        )
+        .ok_or_else(HubOperationError::protocol)?;
+        let progress: Arc<dyn ProgressObserver> = options
+            .progress
+            .unwrap_or_else(|| Arc::new(crate::progress::NoopProgress));
+        let jobs = plan
+            .files()
+            .iter()
+            .cloned()
+            .map(|file| {
+                let cache = Arc::clone(&cache);
+                let protocol = Arc::clone(&protocol);
+                let plan = Arc::clone(&plan);
+                let authorization = request.authorization.clone();
+                let cancellation = options.cancellation.clone();
+                let progress = Arc::clone(&progress);
+                Box::pin(async move {
+                    let digest = cache
+                        .download_file(
+                            protocol,
+                            plan.as_ref(),
+                            &file,
+                            authorization,
+                            retry_policy,
+                            cancellation,
+                            progress,
+                        )
+                        .await?;
+                    Ok((file.path().clone(), digest))
+                }) as crate::transfer::ScheduledFuture<_>
+            })
+            .collect::<Vec<_>>();
+        let downloaded = crate::transfer::run_bounded(
+            self.max_concurrent_downloads,
+            jobs,
+            &options.cancellation,
+        )
+        .await?;
+        let digests = downloaded.into_iter().collect::<BTreeMap<_, _>>();
+        let acquired = cache.activate(plan.as_ref(), &digests)?;
+        Ok(Snapshot::from_acquired(
+            self.endpoint.clone(),
+            request.repository,
+            request.revision,
+            &acquired,
+            false,
+        ))
+    }
+
+    /// Reports an unavailable network backend in cache-only builds.
+    ///
+    /// # Errors
+    ///
+    /// Always returns a backend-unavailable classified error.
+    #[cfg(not(feature = "network"))]
+    #[allow(
+        clippy::unused_async,
+        reason = "the feature-independent public signature remains awaitable to downstream callers"
+    )]
+    pub async fn fetch(
+        &self,
+        _request: FetchRequest,
+        _options: FetchOptions,
+    ) -> Result<Snapshot, HubOperationError> {
+        Err(HubOperationError::transport(
+            crate::transport::TransportError::unavailable(),
+        ))
     }
 
     #[cfg(feature = "network")]
@@ -189,7 +439,78 @@ impl Debug for HubStore {
         formatter
             .debug_struct("HubStore")
             .field("endpoint", &self.endpoint)
+            .field("has_cache_root", &self.cache_root.is_some())
+            .field("cache_mode", &self.cache_mode)
+            .field("max_concurrent_downloads", &self.max_concurrent_downloads)
             .finish_non_exhaustive()
+    }
+}
+
+/// A transport-free service for exact-selection cache lookup.
+#[derive(Clone, Debug)]
+pub struct OfflineStore {
+    cache_root: PathBuf,
+    endpoint: Endpoint,
+    cache_mode: CacheMode,
+}
+
+impl OfflineStore {
+    /// Creates an offline service from an explicit shared cache root.
+    #[must_use]
+    pub fn new(cache_root: impl Into<PathBuf>) -> Self {
+        Self {
+            cache_root: cache_root.into(),
+            endpoint: Endpoint::hugging_face(),
+            cache_mode: CacheMode::Compatible,
+        }
+    }
+
+    /// Replaces the validated endpoint identity used to namespace cache state.
+    #[must_use]
+    pub fn endpoint(mut self, endpoint: Endpoint) -> Self {
+        self.endpoint = endpoint;
+        self
+    }
+
+    /// Selects the owned or Python-compatible cache view.
+    #[must_use]
+    pub const fn cache_mode(mut self, cache_mode: CacheMode) -> Self {
+        self.cache_mode = cache_mode;
+        self
+    }
+
+    /// Opens and revalidates an exact selected path set without any transport capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified cache error for missing, incomplete, corrupt,
+    /// unsupported, or unsafe local state.
+    pub fn open(
+        &self,
+        repository: &RepositorySpec,
+        revision: &Revision,
+        paths: &[RepoPath],
+    ) -> Result<Snapshot, HubOperationError> {
+        let cache = OfflineCache::shared(
+            &self.cache_root,
+            &self.endpoint,
+            repository,
+            self.cache_mode.view(),
+        )?;
+        let acquired = cache.open(revision, paths)?;
+        Ok(Snapshot::from_acquired(
+            self.endpoint.clone(),
+            repository.clone(),
+            revision.clone(),
+            &acquired,
+            true,
+        ))
+    }
+
+    /// Returns the configured cache root.
+    #[must_use]
+    pub fn cache_root(&self) -> &Path {
+        &self.cache_root
     }
 }
 
@@ -256,6 +577,106 @@ mod tests {
         assert_eq!(plan.commit().as_str(), COMMIT);
         assert_eq!(plan.files()[0].path().as_str(), "config.json");
         assert_eq!(observed?.len(), 2);
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn public_fetch_downloads_then_reuses_a_complete_snapshot_without_file_body_bytes()
+    -> Result<(), Box<dyn Error>> {
+        use crate::cache::BlobDigest;
+        use crate::test_http_fixture::{Exchange, ExpectedRequest, ScriptedHub, ScriptedResponse};
+
+        const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+        let bytes = b"model bytes";
+        let digest = BlobDigest::for_bytes(bytes).to_string();
+        let info = format!(r#"{{"sha":"{COMMIT}"}}"#);
+        let tree = format!(
+            r#"[{{"type":"file","path":"model.bin","oid":"pointer","size":{},"lfs":{{"oid":"{digest}","size":{}}}}}]"#,
+            bytes.len(),
+            bytes.len()
+        );
+        let fixture = ScriptedHub::start([
+            Exchange::new(
+                ExpectedRequest::get("/api/models/owner/repo/revision/main"),
+                ScriptedResponse::new(200, info.clone().into_bytes()),
+            ),
+            Exchange::new(
+                ExpectedRequest::get(&format!(
+                    "/api/models/owner/repo/tree/{COMMIT}?recursive=true&expand=true"
+                )),
+                ScriptedResponse::new(200, tree.clone().into_bytes()),
+            ),
+            Exchange::new(
+                ExpectedRequest::get(&format!("/owner/repo/resolve/{COMMIT}/model.bin")),
+                ScriptedResponse::new(200, bytes.as_slice()).header("etag", "stable-etag"),
+            ),
+            Exchange::new(
+                ExpectedRequest::get("/api/models/owner/repo/revision/main"),
+                ScriptedResponse::new(200, info.into_bytes()),
+            ),
+            Exchange::new(
+                ExpectedRequest::get(&format!(
+                    "/api/models/owner/repo/tree/{COMMIT}?recursive=true&expand=true"
+                )),
+                ScriptedResponse::new(200, tree.into_bytes()),
+            ),
+        ])?;
+        let directory = tempfile::TempDir::new()?;
+        let store = HubStore::builder()
+            .endpoint(Endpoint::parse(fixture.endpoint())?)
+            .cache_root(directory.path())
+            .cache_mode(CacheMode::Owned)
+            .max_concurrent_downloads(2)
+            .build();
+        let request = || {
+            Ok::<_, crate::ValidationError>(FetchRequest::new(
+                RepositorySpec::model(RepositoryId::parse("owner/repo")?),
+                Revision::parse("main")?,
+            ))
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let first = runtime.block_on(store.fetch(request()?, FetchOptions::default()))?;
+        assert!(!first.was_reused());
+        let path = RepoPath::parse("model.bin")?;
+        let file = first.file(&path).ok_or("downloaded file missing")?;
+        assert_eq!(std::fs::read(file.local_path())?, bytes);
+        assert_eq!(file.sha256(), digest);
+
+        let second = runtime.block_on(store.fetch(request()?, FetchOptions::default()))?;
+        assert!(second.was_reused());
+        assert_eq!(second.commit().as_str(), COMMIT);
+        assert_eq!(
+            std::fs::read(
+                second
+                    .file(&path)
+                    .ok_or("reused file missing")?
+                    .local_path()
+            )?,
+            bytes
+        );
+        let offline = OfflineStore::new(directory.path())
+            .endpoint(first.endpoint().clone())
+            .cache_mode(CacheMode::Owned);
+        let offline_snapshot = offline.open(
+            first.repository(),
+            &Revision::parse("main")?,
+            std::slice::from_ref(&path),
+        )?;
+        assert!(offline_snapshot.was_reused());
+        assert_eq!(offline_snapshot.commit(), first.commit());
+        assert_eq!(
+            std::fs::read(
+                offline_snapshot
+                    .file(&path)
+                    .ok_or("offline file missing")?
+                    .local_path()
+            )?,
+            bytes
+        );
+        assert_eq!(fixture.finish()?.len(), 5);
         Ok(())
     }
 

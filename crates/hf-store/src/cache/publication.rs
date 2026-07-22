@@ -327,6 +327,15 @@ pub(super) struct Effects {
 }
 
 impl Effects {
+    pub(super) fn production() -> Self {
+        Self::new(
+            Arc::new(OsFileSystem),
+            Arc::new(RandomOperationIds),
+            Arc::new(SystemClock),
+            Arc::new(NoPublicationFaults),
+        )
+    }
+
     pub(super) fn new(
         file_system: Arc<dyn FileSystem>,
         operation_ids: Arc<dyn OperationIds>,
@@ -370,6 +379,32 @@ pub(super) struct CacheKernel {
 
 pub(super) struct CachePartialSink {
     writer: Box<dyn RootedWrite>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct OwnedSnapshotFile {
+    path: RepoPath,
+    content_path: PathBuf,
+    digest: BlobDigest,
+    size: u64,
+}
+
+impl OwnedSnapshotFile {
+    pub(super) const fn path(&self) -> &RepoPath {
+        &self.path
+    }
+
+    pub(super) fn content_path(&self) -> &Path {
+        &self.content_path
+    }
+
+    pub(super) const fn digest(&self) -> BlobDigest {
+        self.digest
+    }
+
+    pub(super) const fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 impl Debug for CachePartialSink {
@@ -792,6 +827,101 @@ impl CacheKernel {
             return Err(CacheError::conflicting_record());
         }
         Ok(record)
+    }
+
+    pub(super) fn publish_owned_snapshot(
+        &self,
+        commit: &CommitId,
+        selection: &SelectionId,
+        files: &[(RepoPath, BlobDigest, u64)],
+    ) -> Result<Vec<OwnedSnapshotFile>, CacheError> {
+        let lock_path = self.layout.snapshot_lock(commit, selection);
+        self.ensure_parent(&lock_path)?;
+        let _guard = self.root.lock_exclusive(self.relative_path(&lock_path)?)?;
+        let mut records = Vec::with_capacity(files.len());
+        for (path, digest, size) in files {
+            let source_path = self.layout.blob_path(digest);
+            let source = self.relative_path(&source_path)?;
+            let destination_path = self.layout.snapshot_file(commit, selection, path);
+            self.ensure_parent(&destination_path)?;
+            let destination = self.relative_path(&destination_path)?;
+            let staging = self.next_staging_name()?;
+            let outcome = self
+                .root
+                .copy_regular_create_once(source, destination, &staging)?;
+            validate_existing_blob(self.root.as_ref(), destination, *size, *digest)?;
+            if outcome == CreateOnceOutcome::Created {
+                self.sync_parent(&destination_path)?;
+            }
+            records.push(SnapshotFileRecord::new(path, *digest, *size, None));
+        }
+        let manifest = SnapshotManifestRecord::new(commit, selection, records)?;
+        let encoded = encode_record_bounded(&manifest, MAX_MANIFEST_RECORD_BYTES)?;
+        let destination = self.layout.snapshot_manifest(commit, selection);
+        match self.root.entry_kind(self.relative_path(&destination)?)? {
+            RootedEntryKind::Missing => self.publish_encoded_create_once(
+                &destination,
+                &manifest,
+                &encoded,
+                MAX_MANIFEST_RECORD_BYTES,
+            )?,
+            RootedEntryKind::RegularFile => {
+                if self.read_snapshot_manifest(commit, selection)? != manifest {
+                    return Err(CacheError::conflicting_record());
+                }
+            }
+            RootedEntryKind::Directory | RootedEntryKind::Other => {
+                return Err(CacheError::conflicting_record());
+            }
+        }
+        self.open_owned_snapshot(
+            &Revision::parse(commit.as_str())?,
+            files
+                .iter()
+                .map(|file| file.0.clone())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+    }
+
+    pub(super) fn open_owned_snapshot(
+        &self,
+        revision: &Revision,
+        paths: &[RepoPath],
+    ) -> Result<Vec<OwnedSnapshotFile>, CacheError> {
+        let commit = match CommitId::parse(revision.as_str()) {
+            Ok(commit) => commit,
+            Err(_symbolic) => self.read_ref(revision)?,
+        };
+        let mut paths = paths.to_vec();
+        paths.sort_unstable();
+        paths.dedup();
+        let selection = SelectionId::derive(&paths)?;
+        let manifest = self.read_snapshot_manifest(&commit, &selection)?;
+        if manifest.files().len() != paths.len() {
+            return Err(CacheError::conflicting_record());
+        }
+        let mut files = Vec::with_capacity(paths.len());
+        for (path, record) in paths.iter().zip(manifest.files()) {
+            if record.path() != path.as_str() || record.hub_blob_key()?.is_some() {
+                return Err(CacheError::conflicting_record());
+            }
+            let digest = record.digest()?;
+            let size = record.size();
+            let content_path = self.layout.snapshot_file(&commit, &selection, path);
+            let content = self.relative_path(&content_path)?;
+            validate_existing_blob(self.root.as_ref(), content, size, digest)?;
+            let blob_path = self.layout.blob_path(&digest);
+            let blob = self.relative_path(&blob_path)?;
+            validate_existing_blob(self.root.as_ref(), blob, size, digest)?;
+            files.push(OwnedSnapshotFile {
+                path: path.clone(),
+                content_path,
+                digest,
+                size,
+            });
+        }
+        Ok(files)
     }
 
     pub(super) fn new_partial_record(
