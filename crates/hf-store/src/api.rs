@@ -646,7 +646,22 @@ impl OfflineStore {
             repository,
             self.cache_mode.view(),
         )?;
-        let candidates = cache.plan_partial_gc(now, policy.partial_minimum_age_millis())?;
+        let mut candidates = match policy.partial_minimum_age_millis() {
+            Some(minimum_age) => cache
+                .plan_partial_gc(now, minimum_age)?
+                .into_iter()
+                .map(crate::cache::GcObservation::Partial)
+                .collect(),
+            None => Vec::new(),
+        };
+        if let Some(minimum_age) = policy.snapshot_minimum_age_millis() {
+            candidates.extend(cache.plan_snapshot_gc(
+                now,
+                minimum_age,
+                policy.snapshot_keep_floor(),
+                policy.retained_commits(),
+            )?);
+        }
         GcPlan::new(
             self.cache_mode,
             &self.endpoint,
@@ -687,12 +702,9 @@ impl OfflineStore {
         let mut skipped = Vec::new();
         let mut bytes = 0_u64;
         for public in plan.candidates() {
-            let candidate = public.partial_identity()?;
-            if cache.execute_partial_gc(
-                &candidate,
-                now,
-                plan.policy().partial_minimum_age_millis(),
-            )? {
+            let candidate = public.observation()?;
+            let removed_candidate = cache.execute_gc_observation(&candidate, now, plan.policy())?;
+            if removed_candidate {
                 removed.push(public.id().into());
                 bytes = bytes.saturating_add(public.logical_bytes());
             } else {

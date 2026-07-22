@@ -1,4 +1,5 @@
 use std::backtrace::Backtrace;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 #[cfg(test)]
@@ -21,17 +22,17 @@ use super::hub_layout::{HubBlobKey, HubCacheLayout};
 use super::key::{BlobDigest, OriginKey, RepositoryKey, SelectionId};
 use super::layout::CacheLayout;
 use super::metadata::{
-    CacheRecord, FormatRecord, HubBlobBindingRecord, MetadataError, OriginRecord,
-    PartialGcTombstoneRecord, PartialTransferRecord, RefRecord, RepositoryRecord,
-    SnapshotFileRecord, SnapshotManifestRecord, decode_record, encode_record,
-};
-use super::rooted_fs::{
-    CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockGuard,
-    RootedRegularFile, RootedWrite, StagingName, is_reparse_point, is_unsafe_cache_path_error,
-    unsafe_cache_path,
+    CacheRecord, FormatRecord, GcTombstoneKind, GcTombstoneRecord, HubBlobBindingRecord,
+    MetadataError, OriginRecord, PartialGcTombstoneRecord, PartialTransferRecord, RefRecord,
+    RepositoryRecord, SnapshotFileRecord, SnapshotManifestRecord, decode_record, encode_record,
 };
 #[cfg(test)]
-use super::rooted_fs::{RootedLockAttempt, RootedRead};
+use super::rooted_fs::RootedRead;
+use super::rooted_fs::{
+    CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockAttempt,
+    RootedLockGuard, RootedRegularFile, RootedWrite, StagingName, is_reparse_point,
+    is_unsafe_cache_path_error, unsafe_cache_path,
+};
 use super::sanitized_io::SanitizedIo;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -427,6 +428,175 @@ pub(crate) struct PartialGcCandidate {
     updated_unix_millis: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SnapshotGcCandidate {
+    key: Box<str>,
+    commit: CommitId,
+    selection_id: Box<str>,
+    fingerprint: BlobDigest,
+    logical_bytes: u64,
+    modified_unix_millis: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BlobGcCandidate {
+    key: Box<str>,
+    digest: BlobDigest,
+    fingerprint: BlobDigest,
+    logical_bytes: u64,
+    modified_unix_millis: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GcObservation {
+    Partial(PartialGcCandidate),
+    Snapshot(SnapshotGcCandidate),
+    Blob(BlobGcCandidate),
+}
+
+#[derive(Debug)]
+struct ValidatedGcSnapshot {
+    candidate: SnapshotGcCandidate,
+    commit: CommitId,
+    key: Box<str>,
+    digests: BTreeSet<BlobDigest>,
+    modified_unix_millis: u64,
+}
+
+impl GcObservation {
+    pub(crate) fn snapshot_from_plan(
+        key: Box<str>,
+        commit: &str,
+        selection_id: &str,
+        fingerprint: BlobDigest,
+        logical_bytes: u64,
+        modified_unix_millis: u64,
+    ) -> Result<Self, crate::HubError> {
+        let commit = CommitId::parse(commit).map_err(crate::HubError::validation)?;
+        validate_fixed_digest(selection_id)?;
+        if key.as_ref() != snapshot_gc_key(&commit, selection_id).as_ref() {
+            return Err(crate::HubError::protocol());
+        }
+        Ok(Self::Snapshot(SnapshotGcCandidate {
+            key,
+            commit,
+            selection_id: selection_id.into(),
+            fingerprint,
+            logical_bytes,
+            modified_unix_millis,
+        }))
+    }
+
+    pub(crate) fn blob_from_plan(
+        key: Box<str>,
+        fingerprint: BlobDigest,
+        logical_bytes: u64,
+        modified_unix_millis: u64,
+    ) -> Result<Self, crate::HubError> {
+        let digest = BlobDigest::parse(&key).map_err(crate::HubError::validation)?;
+        Ok(Self::Blob(BlobGcCandidate {
+            key,
+            digest,
+            fingerprint,
+            logical_bytes,
+            modified_unix_millis,
+        }))
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        match self {
+            Self::Partial(candidate) => candidate.key(),
+            Self::Snapshot(candidate) => &candidate.key,
+            Self::Blob(candidate) => &candidate.key,
+        }
+    }
+
+    pub(crate) const fn size(&self) -> u64 {
+        match self {
+            Self::Partial(candidate) => candidate.size(),
+            Self::Snapshot(candidate) => candidate.logical_bytes,
+            Self::Blob(candidate) => candidate.logical_bytes,
+        }
+    }
+
+    pub(crate) const fn updated_unix_millis(&self) -> u64 {
+        match self {
+            Self::Partial(candidate) => candidate.updated_unix_millis(),
+            Self::Snapshot(candidate) => candidate.modified_unix_millis,
+            Self::Blob(candidate) => candidate.modified_unix_millis,
+        }
+    }
+
+    pub(crate) const fn commit(&self) -> Option<&CommitId> {
+        match self {
+            Self::Partial(candidate) => Some(candidate.commit()),
+            Self::Snapshot(candidate) => Some(&candidate.commit),
+            Self::Blob(_) => None,
+        }
+    }
+
+    pub(crate) fn selection_id(&self) -> Option<&str> {
+        match self {
+            Self::Snapshot(candidate) => Some(&candidate.selection_id),
+            Self::Partial(_) | Self::Blob(_) => None,
+        }
+    }
+
+    pub(crate) const fn path(&self) -> Option<&RepoPath> {
+        match self {
+            Self::Partial(candidate) => Some(candidate.path()),
+            Self::Snapshot(_) | Self::Blob(_) => None,
+        }
+    }
+
+    pub(crate) const fn fingerprint(&self) -> BlobDigest {
+        match self {
+            Self::Partial(candidate) => candidate.record_digest(),
+            Self::Snapshot(candidate) => candidate.fingerprint,
+            Self::Blob(candidate) => candidate.fingerprint,
+        }
+    }
+}
+
+fn validate_fixed_digest(value: &str) -> Result<(), crate::HubError> {
+    BlobDigest::parse(value)
+        .map(|_digest| ())
+        .map_err(crate::HubError::validation)
+}
+
+fn snapshot_gc_key(commit: &CommitId, selection_id: &str) -> Box<str> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hf-store-gc-snapshot\0");
+    hasher.update(commit.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(selection_id.as_bytes());
+    format!("{:x}", hasher.finalize()).into()
+}
+
+const fn gc_observation_rank(observation: &GcObservation) -> u8 {
+    match observation {
+        GcObservation::Partial(_) => 0,
+        GcObservation::Snapshot(_) => 1,
+        GcObservation::Blob(_) => 2,
+    }
+}
+
+fn gc_observation_matches(left: &GcObservation, right: &GcObservation) -> bool {
+    gc_observation_rank(left) == gc_observation_rank(right)
+        && left.key() == right.key()
+        && left.size() == right.size()
+        && left.updated_unix_millis() == right.updated_unix_millis()
+        && left.fingerprint() == right.fingerprint()
+}
+
+fn unix_millis_from_system_time(time: SystemTime) -> Result<u64, CacheError> {
+    let millis = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_before_epoch| CacheError::conflicting_record())?
+        .as_millis();
+    u64::try_from(millis).map_err(|_overflow| CacheError::conflicting_record())
+}
+
 impl PartialGcCandidate {
     pub(crate) fn from_observation(
         key: Box<str>,
@@ -516,6 +686,456 @@ impl crate::transfer::PartialSink for CachePartialSink {
 }
 
 impl CacheKernel {
+    pub(super) fn plan_snapshot_gc(
+        &self,
+        now_unix_millis: u64,
+        minimum_age_millis: u64,
+        keep_floor: usize,
+        retained_commits: &[Box<str>],
+    ) -> Result<Vec<GcObservation>, CacheError> {
+        let mut roots = retained_commits
+            .iter()
+            .map(CommitId::parse)
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        self.scan_ref_roots(&mut roots)?;
+        let mut snapshots = self.scan_owned_snapshots()?;
+        snapshots.sort_unstable_by(|left, right| {
+            right
+                .modified_unix_millis
+                .cmp(&left.modified_unix_millis)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+
+        let mut retained_digests = BTreeSet::new();
+        let mut candidates = Vec::new();
+        let mut detached_seen = 0_usize;
+        for snapshot in snapshots {
+            let rooted = roots.contains(&snapshot.commit);
+            let kept_by_floor = if rooted {
+                false
+            } else {
+                detached_seen = detached_seen.saturating_add(1);
+                detached_seen <= keep_floor
+            };
+            let old_enough =
+                now_unix_millis.saturating_sub(snapshot.modified_unix_millis) >= minimum_age_millis;
+            if rooted || kept_by_floor || !old_enough {
+                retained_digests.extend(snapshot.digests.iter().copied());
+            } else {
+                candidates.push(GcObservation::Snapshot(snapshot.candidate));
+            }
+        }
+
+        for blob in self.scan_owned_blobs()? {
+            if !retained_digests.contains(&blob.digest)
+                && now_unix_millis.saturating_sub(blob.modified_unix_millis) >= minimum_age_millis
+            {
+                candidates.push(GcObservation::Blob(blob));
+            }
+        }
+        candidates.sort_unstable_by(|left, right| {
+            gc_observation_rank(left)
+                .cmp(&gc_observation_rank(right))
+                .then_with(|| left.key().cmp(right.key()))
+        });
+        Ok(candidates)
+    }
+
+    fn scan_ref_roots(&self, roots: &mut BTreeSet<CommitId>) -> Result<(), CacheError> {
+        let directory = self
+            .relative_path(&self.layout.repository_directory().join("refs"))?
+            .to_path_buf();
+        let entries = match self.root.read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for path in entries {
+            if self.root.entry_kind(&path)? != RootedEntryKind::RegularFile {
+                return Err(CacheError::conflicting_record());
+            }
+            let Some(bytes) = self
+                .root
+                .read_regular_bounded(&path, MAX_SMALL_RECORD_BYTES)?
+                .bytes()
+            else {
+                return Err(CacheError::conflicting_record());
+            };
+            let record = decode_record::<RefRecord>(&bytes)?;
+            roots.insert(CommitId::parse(record.commit())?);
+        }
+        Ok(())
+    }
+
+    fn scan_owned_snapshots(&self) -> Result<Vec<ValidatedGcSnapshot>, CacheError> {
+        let directory = self
+            .relative_path(&self.layout.repository_directory().join("snapshots"))?
+            .to_path_buf();
+        let entries = match self.root.read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        entries
+            .into_iter()
+            .map(|path| self.validate_gc_snapshot(&path))
+            .collect()
+    }
+
+    fn validate_gc_snapshot(&self, directory: &Path) -> Result<ValidatedGcSnapshot, CacheError> {
+        if self.root.entry_kind(directory)? != RootedEntryKind::Directory {
+            return Err(CacheError::conflicting_record());
+        }
+        let Some(name) = directory.file_name().and_then(std::ffi::OsStr::to_str) else {
+            return Err(CacheError::conflicting_record());
+        };
+        let Some((commit_text, selection_text)) = name.split_once('-') else {
+            return Err(CacheError::conflicting_record());
+        };
+        let commit = CommitId::parse(commit_text)?;
+        let selection = SelectionId::parse(selection_text)?;
+        let manifest_path = directory.join("manifest.json");
+        let RootedRegularFile::File {
+            mut reader,
+            size: manifest_size,
+            modified,
+        } = self.root.open_regular(&manifest_path)?
+        else {
+            return Err(CacheError::conflicting_record());
+        };
+        if manifest_size > u64::try_from(MAX_MANIFEST_RECORD_BYTES).map_err(io::Error::other)? {
+            return Err(CacheError::conflicting_record());
+        }
+        let mut manifest_bytes = Vec::new();
+        reader
+            .by_ref()
+            .take(manifest_size.saturating_add(1))
+            .read_to_end(&mut manifest_bytes)?;
+        if u64::try_from(manifest_bytes.len()).map_err(io::Error::other)? != manifest_size {
+            return Err(CacheError::conflicting_record());
+        }
+        let manifest = decode_record::<SnapshotManifestRecord>(&manifest_bytes)?;
+        if manifest.commit() != commit.as_str() || manifest.selection_id() != selection.to_string()
+        {
+            return Err(CacheError::conflicting_record());
+        }
+        let mut paths = BTreeSet::from([manifest_path.clone()]);
+        let mut digests = BTreeSet::new();
+        let mut logical_bytes = manifest_size;
+        let mut newest = unix_millis_from_system_time(modified)?;
+        let mut fingerprint = Sha256::new();
+        fingerprint.update(&manifest_bytes);
+        for file in manifest.files() {
+            let path = RepoPath::parse(file.path())?;
+            let digest = file.digest()?;
+            if file.hub_blob_key()?.is_some() {
+                return Err(CacheError::conflicting_record());
+            }
+            let snapshot_path = self
+                .relative_path(&self.layout.snapshot_file(&commit, &selection, &path))?
+                .to_path_buf();
+            let RootedRegularFile::File { modified, .. } =
+                self.root.open_regular(&snapshot_path)?
+            else {
+                return Err(CacheError::conflicting_record());
+            };
+            validate_existing_blob(self.root.as_ref(), &snapshot_path, file.size(), digest)?;
+            let absolute_blob_path = self.layout.blob_path(&digest);
+            let blob_path = self.relative_path(&absolute_blob_path)?;
+            validate_existing_blob(self.root.as_ref(), blob_path, file.size(), digest)?;
+            newest = newest.max(unix_millis_from_system_time(modified)?);
+            logical_bytes = logical_bytes.saturating_add(file.size());
+            fingerprint.update(path.as_str().as_bytes());
+            fingerprint.update(digest.to_string().as_bytes());
+            fingerprint.update(file.size().to_be_bytes());
+            paths.insert(snapshot_path);
+            digests.insert(digest);
+        }
+        let actual_paths = self.collect_snapshot_files(directory)?;
+        if actual_paths != paths {
+            return Err(CacheError::conflicting_record());
+        }
+        for path in &actual_paths {
+            fingerprint.update(path.to_string_lossy().as_bytes());
+        }
+        let fingerprint = BlobDigest::from_bytes(fingerprint.finalize().into());
+        Ok(ValidatedGcSnapshot {
+            candidate: SnapshotGcCandidate {
+                key: snapshot_gc_key(&commit, selection_text),
+                commit: commit.clone(),
+                selection_id: selection_text.into(),
+                fingerprint,
+                logical_bytes,
+                modified_unix_millis: newest,
+            },
+            commit,
+            key: snapshot_gc_key(&CommitId::parse(commit_text)?, selection_text),
+            digests,
+            modified_unix_millis: newest,
+        })
+    }
+
+    fn collect_snapshot_files(&self, directory: &Path) -> Result<BTreeSet<PathBuf>, CacheError> {
+        let mut pending = vec![directory.to_path_buf()];
+        let mut files = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            for child in self.root.read_dir(&current)? {
+                match self.root.entry_kind(&child)? {
+                    RootedEntryKind::Directory => pending.push(child),
+                    RootedEntryKind::RegularFile => {
+                        files.insert(child);
+                    }
+                    RootedEntryKind::Missing | RootedEntryKind::Other => {
+                        return Err(CacheError::conflicting_record());
+                    }
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    fn scan_owned_blobs(&self) -> Result<Vec<BlobGcCandidate>, CacheError> {
+        let root = self
+            .relative_path(&self.layout.repository_directory().join("blobs/sha256"))?
+            .to_path_buf();
+        let prefixes = match self.root.read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut blobs = Vec::new();
+        for prefix_path in prefixes {
+            if self.root.entry_kind(&prefix_path)? != RootedEntryKind::Directory {
+                return Err(CacheError::conflicting_record());
+            }
+            let Some(prefix) = prefix_path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                return Err(CacheError::conflicting_record());
+            };
+            for path in self.root.read_dir(&prefix_path)? {
+                let Some(suffix) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+                    return Err(CacheError::conflicting_record());
+                };
+                let digest = BlobDigest::parse(&format!("{prefix}{suffix}"))?;
+                let RootedRegularFile::File { size, modified, .. } =
+                    self.root.open_regular(&path)?
+                else {
+                    return Err(CacheError::conflicting_record());
+                };
+                validate_existing_blob(self.root.as_ref(), &path, size, digest)?;
+                let modified = unix_millis_from_system_time(modified)?;
+                let mut hasher = Sha256::new();
+                hasher.update(digest.to_string().as_bytes());
+                hasher.update(size.to_be_bytes());
+                hasher.update(modified.to_be_bytes());
+                blobs.push(BlobGcCandidate {
+                    key: digest.to_string().into(),
+                    digest,
+                    fingerprint: BlobDigest::from_bytes(hasher.finalize().into()),
+                    logical_bytes: size,
+                    modified_unix_millis: modified,
+                });
+            }
+        }
+        Ok(blobs)
+    }
+
+    pub(super) fn execute_snapshot_gc(
+        &self,
+        candidate: &SnapshotGcCandidate,
+        now_unix_millis: u64,
+        minimum_age_millis: u64,
+        keep_floor: usize,
+        retained_commits: &[Box<str>],
+    ) -> Result<bool, CacheError> {
+        let maintenance = self.layout.maintenance_lock();
+        self.ensure_parent(&maintenance)?;
+        let _maintenance_guard = self
+            .root
+            .lock_exclusive(self.relative_path(&maintenance)?)?;
+        let selection = SelectionId::parse(&candidate.selection_id)?;
+        let snapshot_lock = self.layout.snapshot_lock(&candidate.commit, &selection);
+        self.ensure_parent(&snapshot_lock)?;
+        let _snapshot_guard = match self
+            .root
+            .try_lock_exclusive(self.relative_path(&snapshot_lock)?)?
+        {
+            RootedLockAttempt::Acquired(guard) => guard,
+            RootedLockAttempt::Contended => return Ok(false),
+        };
+        let _lease_guard =
+            match self.try_snapshot_maintenance_lease(&candidate.commit, &selection)? {
+                RootedLockAttempt::Acquired(guard) => guard,
+                RootedLockAttempt::Contended => return Ok(false),
+            };
+        let fresh = self.plan_snapshot_gc(
+            now_unix_millis,
+            minimum_age_millis,
+            keep_floor,
+            retained_commits,
+        )?;
+        if !fresh.iter().any(|observation| {
+            matches!(observation, GcObservation::Snapshot(_))
+                && gc_observation_matches(observation, &GcObservation::Snapshot(candidate.clone()))
+        }) {
+            return Ok(false);
+        }
+        let source = self
+            .relative_path(
+                &self
+                    .layout
+                    .snapshot_directory(&candidate.commit, &selection),
+            )?
+            .to_path_buf();
+        self.quarantine_directory(
+            &source,
+            GcTombstoneKind::Snapshot,
+            &candidate.key,
+            candidate.fingerprint,
+            candidate.logical_bytes,
+            candidate.modified_unix_millis,
+        )?;
+        Ok(true)
+    }
+
+    pub(super) fn execute_blob_gc(
+        &self,
+        candidate: &BlobGcCandidate,
+        now_unix_millis: u64,
+        minimum_age_millis: u64,
+        keep_floor: usize,
+        retained_commits: &[Box<str>],
+    ) -> Result<bool, CacheError> {
+        let maintenance = self.layout.maintenance_lock();
+        self.ensure_parent(&maintenance)?;
+        let _maintenance_guard = self
+            .root
+            .lock_exclusive(self.relative_path(&maintenance)?)?;
+        let blob_lock = self.layout.blob_lock(&candidate.digest);
+        self.ensure_parent(&blob_lock)?;
+        let _blob_guard = match self
+            .root
+            .try_lock_exclusive(self.relative_path(&blob_lock)?)?
+        {
+            RootedLockAttempt::Acquired(guard) => guard,
+            RootedLockAttempt::Contended => return Ok(false),
+        };
+        let fresh = self.plan_snapshot_gc(
+            now_unix_millis,
+            minimum_age_millis,
+            keep_floor,
+            retained_commits,
+        )?;
+        if !fresh.iter().any(|observation| {
+            matches!(observation, GcObservation::Blob(_))
+                && gc_observation_matches(observation, &GcObservation::Blob(candidate.clone()))
+        }) {
+            return Ok(false);
+        }
+        let source = self
+            .relative_path(&self.layout.blob_path(&candidate.digest))?
+            .to_path_buf();
+        self.quarantine_file(
+            &source,
+            GcTombstoneKind::Blob,
+            &candidate.key,
+            candidate.fingerprint,
+            candidate.logical_bytes,
+            candidate.modified_unix_millis,
+        )?;
+        Ok(true)
+    }
+
+    fn quarantine_directory(
+        &self,
+        source: &Path,
+        kind: GcTombstoneKind,
+        key: &str,
+        fingerprint: BlobDigest,
+        logical_bytes: u64,
+        observed_unix_millis: u64,
+    ) -> Result<(), CacheError> {
+        let (tombstone, payload) = self.prepare_gc_quarantine(
+            kind,
+            key,
+            fingerprint,
+            logical_bytes,
+            observed_unix_millis,
+            "directory",
+        )?;
+        self.root.rename_entry(source, &payload)?;
+        if self.remove_tree_nofollow(&payload).is_ok() {
+            let _cleanup_result = self.root.remove_file(&tombstone);
+        }
+        Ok(())
+    }
+
+    fn quarantine_file(
+        &self,
+        source: &Path,
+        kind: GcTombstoneKind,
+        key: &str,
+        fingerprint: BlobDigest,
+        logical_bytes: u64,
+        observed_unix_millis: u64,
+    ) -> Result<(), CacheError> {
+        let (tombstone, payload) = self.prepare_gc_quarantine(
+            kind,
+            key,
+            fingerprint,
+            logical_bytes,
+            observed_unix_millis,
+            "file",
+        )?;
+        self.root.rename_entry(source, &payload)?;
+        if self.root.remove_file(&payload).is_ok() {
+            let _cleanup_result = self.root.remove_file(&tombstone);
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the quarantine identity and observation are intentionally explicit"
+    )]
+    fn prepare_gc_quarantine(
+        &self,
+        kind: GcTombstoneKind,
+        key: &str,
+        fingerprint: BlobDigest,
+        logical_bytes: u64,
+        observed_unix_millis: u64,
+        payload_suffix: &str,
+    ) -> Result<(PathBuf, PathBuf), CacheError> {
+        let trash = self.layout.trash_directory();
+        self.root.ensure_dir(self.relative_path(&trash)?)?;
+        let operation = self.effects.operation_ids.next()?;
+        let tombstone =
+            GcTombstoneRecord::new(kind, key, fingerprint, logical_bytes, observed_unix_millis)?;
+        let tombstone_path = self
+            .relative_path(&trash.join(format!("gc-{operation}.tombstone.json")))?
+            .to_path_buf();
+        let payload = self
+            .relative_path(&trash.join(format!("gc-{operation}.{payload_suffix}")))?
+            .to_path_buf();
+        let mut writer = self.root.create_new(&tombstone_path)?;
+        writer.write_all(&encode_record(&tombstone)?)?;
+        writer.sync_all()?;
+        Ok((tombstone_path, payload))
+    }
+
+    fn remove_tree_nofollow(&self, directory: &Path) -> Result<(), CacheError> {
+        for child in self.root.read_dir(directory)? {
+            match self.root.entry_kind(&child)? {
+                RootedEntryKind::Directory => self.remove_tree_nofollow(&child)?,
+                RootedEntryKind::RegularFile => self.root.remove_file(&child)?,
+                RootedEntryKind::Missing => {}
+                RootedEntryKind::Other => return Err(CacheError::conflicting_record()),
+            }
+        }
+        self.root.remove_dir(directory)?;
+        Ok(())
+    }
+
     pub(super) fn plan_partial_gc(
         &self,
         now_unix_millis: u64,
@@ -744,8 +1364,18 @@ impl CacheKernel {
                         .read_regular_bounded(path, MAX_SMALL_RECORD_BYTES)?,
                 )
             }
-            ("trash", Some(name)) if name.ends_with(".tombstone.json") => {
+            ("trash", Some(name))
+                if name.starts_with("partial-") && name.ends_with(".tombstone.json") =>
+            {
                 Self::decode_inventory::<PartialGcTombstoneRecord>(
+                    self.root
+                        .read_regular_bounded(path, MAX_SMALL_RECORD_BYTES)?,
+                )
+            }
+            ("trash", Some(name))
+                if name.starts_with("gc-") && name.ends_with(".tombstone.json") =>
+            {
+                Self::decode_inventory::<GcTombstoneRecord>(
                     self.root
                         .read_regular_bounded(path, MAX_SMALL_RECORD_BYTES)?,
                 )
@@ -3070,6 +3700,83 @@ mod tests {
         assert!(fixture.kernel.execute_partial_gc(&planned[0], now, 50)?);
         assert!(!fixture.kernel.partial_data_path(&commit, &path)?.exists());
         assert!(fixture.kernel.plan_partial_gc(now, 50)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_gc_retains_ref_roots_and_schedules_detached_snapshot_before_blob()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("weights/model.bin")?;
+        let first_commit = CommitId::parse(FIRST_COMMIT)?;
+        let second_commit = CommitId::parse(SECOND_COMMIT)?;
+        let selection = SelectionId::derive(std::slice::from_ref(&path))?;
+        let first_bytes = b"retained snapshot bytes";
+        let second_bytes = b"detached snapshot bytes";
+        let first_digest = BlobDigest::for_bytes(first_bytes);
+        let second_digest = BlobDigest::for_bytes(second_bytes);
+        fixture.kernel.publish_blob(
+            Cursor::new(first_bytes),
+            u64::try_from(first_bytes.len())?,
+            first_digest,
+        )?;
+        fixture.kernel.publish_blob(
+            Cursor::new(second_bytes),
+            u64::try_from(second_bytes.len())?,
+            second_digest,
+        )?;
+        drop(fixture.kernel.publish_owned_snapshot(
+            &first_commit,
+            &selection,
+            &[(
+                path.clone(),
+                first_digest,
+                u64::try_from(first_bytes.len())?,
+            )],
+        )?);
+        drop(fixture.kernel.publish_owned_snapshot(
+            &second_commit,
+            &selection,
+            &[(path, second_digest, u64::try_from(second_bytes.len())?)],
+        )?);
+        fixture
+            .kernel
+            .write_ref(&Revision::parse("main")?, &first_commit)?;
+
+        let candidates = fixture.kernel.plan_snapshot_gc(u64::MAX, 0, 0, &[])?;
+        assert_eq!(candidates.len(), 2);
+        assert!(matches!(candidates[0], GcObservation::Snapshot(_)));
+        assert!(matches!(candidates[1], GcObservation::Blob(_)));
+        assert_eq!(candidates[1].key(), second_digest.to_string());
+
+        let leased = fixture.kernel.open_owned_snapshot(
+            &Revision::parse(second_commit.as_str())?,
+            &[RepoPath::parse("weights/model.bin")?],
+        )?;
+        let GcObservation::Snapshot(snapshot_candidate) = &candidates[0] else {
+            return Err("first GC candidate was not a snapshot".into());
+        };
+        assert!(
+            !fixture
+                .kernel
+                .execute_snapshot_gc(snapshot_candidate, u64::MAX, 0, 0, &[],)?
+        );
+        drop(leased);
+        assert!(
+            fixture
+                .kernel
+                .execute_snapshot_gc(snapshot_candidate, u64::MAX, 0, 0, &[],)?
+        );
+        let GcObservation::Blob(blob_candidate) = &candidates[1] else {
+            return Err("second GC candidate was not a blob".into());
+        };
+        assert!(
+            fixture
+                .kernel
+                .execute_blob_gc(blob_candidate, u64::MAX, 0, 0, &[])?
+        );
+        assert!(fixture.kernel.layout.blob_path(&first_digest).is_file());
+        assert!(!fixture.kernel.layout.blob_path(&second_digest).exists());
         Ok(())
     }
 

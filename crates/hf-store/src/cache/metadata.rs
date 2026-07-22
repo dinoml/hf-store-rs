@@ -470,6 +470,54 @@ impl CacheRecord for PartialGcTombstoneRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum GcTombstoneKind {
+    Snapshot,
+    Blob,
+}
+
+/// Complete intent record written before an immutable object enters trash.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GcTombstoneRecord {
+    kind: GcTombstoneKind,
+    candidate_id: String,
+    fingerprint_sha256: String,
+    logical_bytes: u64,
+    observed_unix_millis: u64,
+}
+
+impl GcTombstoneRecord {
+    pub(super) fn new(
+        kind: GcTombstoneKind,
+        candidate_id: &str,
+        fingerprint: BlobDigest,
+        logical_bytes: u64,
+        observed_unix_millis: u64,
+    ) -> Result<Self, ValidationError> {
+        let record = Self {
+            kind,
+            candidate_id: candidate_id.to_owned(),
+            fingerprint_sha256: fingerprint.to_string(),
+            logical_bytes,
+            observed_unix_millis,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+impl CacheRecord for GcTombstoneRecord {
+    const KIND: &'static str = "gc_tombstone";
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_sha256_hex(&self.candidate_id, "GC candidate identifier")?;
+        let _fingerprint = BlobDigest::parse(&self.fingerprint_sha256)?;
+        Ok(())
+    }
+}
+
 impl PartialTransferRecord {
     #[allow(
         clippy::too_many_arguments,

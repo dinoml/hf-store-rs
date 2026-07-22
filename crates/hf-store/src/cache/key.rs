@@ -105,6 +105,10 @@ impl Display for RevisionKey {
 pub struct SelectionId(CacheKey);
 
 impl SelectionId {
+    pub(crate) fn parse(value: &str) -> Result<Self, ValidationError> {
+        BlobDigest::parse(value).map(|digest| Self(CacheKey(digest.0)))
+    }
+
     pub(crate) fn derive(paths: &[RepoPath]) -> Result<Self, ValidationError> {
         let mut exact = paths.iter().map(RepoPath::as_str).collect::<Vec<_>>();
         exact.sort_unstable();

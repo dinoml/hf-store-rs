@@ -328,6 +328,26 @@ impl OfflineCache {
         }
     }
 
+    pub(crate) fn plan_snapshot_gc(
+        &self,
+        now_unix_millis: u64,
+        minimum_age_millis: u64,
+        keep_floor: usize,
+        retained_commits: &[Box<str>],
+    ) -> Result<Vec<super::publication::GcObservation>, HubOperationError> {
+        match &self.backend {
+            OfflineBackend::Owned(cache) => cache
+                .plan_snapshot_gc(
+                    now_unix_millis,
+                    minimum_age_millis,
+                    keep_floor,
+                    retained_commits,
+                )
+                .map_err(map_cache_error),
+            OfflineBackend::Compatible(_) => Ok(Vec::new()),
+        }
+    }
+
     pub(crate) fn execute_partial_gc(
         &self,
         candidate: &super::publication::PartialGcCandidate,
@@ -339,6 +359,53 @@ impl OfflineCache {
                 .execute_partial_gc(candidate, now_unix_millis, minimum_age_millis)
                 .map_err(map_cache_error),
             OfflineBackend::Compatible(_) => Ok(false),
+        }
+    }
+
+    pub(crate) fn execute_gc_observation(
+        &self,
+        candidate: &super::publication::GcObservation,
+        now_unix_millis: u64,
+        policy: &crate::GcPolicy,
+    ) -> Result<bool, HubOperationError> {
+        match (&self.backend, candidate) {
+            (OfflineBackend::Owned(cache), super::publication::GcObservation::Partial(value)) => {
+                let Some(minimum_age) = policy.partial_minimum_age_millis() else {
+                    return Ok(false);
+                };
+                cache
+                    .execute_partial_gc(value, now_unix_millis, minimum_age)
+                    .map_err(map_cache_error)
+            }
+            (OfflineBackend::Owned(cache), super::publication::GcObservation::Snapshot(value)) => {
+                let Some(minimum_age) = policy.snapshot_minimum_age_millis() else {
+                    return Ok(false);
+                };
+                cache
+                    .execute_snapshot_gc(
+                        value,
+                        now_unix_millis,
+                        minimum_age,
+                        policy.snapshot_keep_floor(),
+                        policy.retained_commits(),
+                    )
+                    .map_err(map_cache_error)
+            }
+            (OfflineBackend::Owned(cache), super::publication::GcObservation::Blob(value)) => {
+                let Some(minimum_age) = policy.snapshot_minimum_age_millis() else {
+                    return Ok(false);
+                };
+                cache
+                    .execute_blob_gc(
+                        value,
+                        now_unix_millis,
+                        minimum_age,
+                        policy.snapshot_keep_floor(),
+                        policy.retained_commits(),
+                    )
+                    .map_err(map_cache_error)
+            }
+            (OfflineBackend::Compatible(_), _) => Ok(false),
         }
     }
     pub(crate) fn inventory_entries(&self) -> Result<Vec<InventoryRecord>, HubOperationError> {

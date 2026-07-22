@@ -3,16 +3,19 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::cache::{BlobDigest, PartialGcCandidate};
+use crate::cache::{BlobDigest, GcObservation, PartialGcCandidate};
 use crate::{CacheMode, CommitId, Endpoint, HubError, RepoPath, RepositorySpec};
 
 const PLAN_SCHEMA: &str = "hf-store.gc.plan";
 const PLAN_VERSION: u32 = 1;
 
 /// Explicit retention policy for a garbage-collection plan.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GcPolicy {
-    partial_minimum_age_millis: u64,
+    partial_minimum_age_millis: Option<u64>,
+    snapshot_minimum_age_millis: Option<u64>,
+    snapshot_keep_floor: usize,
+    retained_commits: Box<[Box<str>]>,
 }
 
 impl GcPolicy {
@@ -21,25 +24,91 @@ impl GcPolicy {
     /// Returns `None` when the duration cannot be represented in milliseconds.
     #[must_use]
     pub fn expired_partials(minimum_age: Duration) -> Option<Self> {
-        Some(Self {
-            partial_minimum_age_millis: minimum_age.as_millis().try_into().ok()?,
-        })
+        Self::report_only().with_expired_partials(minimum_age)
     }
 
-    /// Returns the minimum age for partial-transfer candidates.
+    /// Creates a non-destructive policy that reports reachability without candidates.
     #[must_use]
-    pub const fn partial_minimum_age_millis(self) -> u64 {
+    pub fn report_only() -> Self {
+        Self {
+            partial_minimum_age_millis: None,
+            snapshot_minimum_age_millis: None,
+            snapshot_keep_floor: 0,
+            retained_commits: Box::new([]),
+        }
+    }
+
+    /// Enables collection of identity-valid abandoned partial transfers.
+    ///
+    /// Returns `None` when the duration cannot be represented in milliseconds.
+    #[must_use]
+    pub fn with_expired_partials(mut self, minimum_age: Duration) -> Option<Self> {
+        self.partial_minimum_age_millis = Some(minimum_age.as_millis().try_into().ok()?);
+        Some(self)
+    }
+
+    /// Enables collection of unreferenced immutable snapshots after a grace period.
+    ///
+    /// The newest `keep_floor` snapshots remain retained even when detached. Returns
+    /// `None` when the duration cannot be represented in milliseconds.
+    #[must_use]
+    pub fn with_unreferenced_snapshots(
+        mut self,
+        minimum_age: Duration,
+        keep_floor: usize,
+    ) -> Option<Self> {
+        self.snapshot_minimum_age_millis = Some(minimum_age.as_millis().try_into().ok()?);
+        self.snapshot_keep_floor = keep_floor;
+        Some(self)
+    }
+
+    /// Adds an immutable commit root retained independently of mutable refs.
+    #[must_use]
+    pub fn retain_commit(mut self, commit: &CommitId) -> Self {
+        let mut retained = self.retained_commits.into_vec();
+        retained.push(commit.as_str().into());
+        retained.sort_unstable();
+        retained.dedup();
+        self.retained_commits = retained.into_boxed_slice();
+        self
+    }
+
+    /// Returns the configured grace period for partial transfers.
+    #[must_use]
+    pub const fn partial_minimum_age_millis(&self) -> Option<u64> {
         self.partial_minimum_age_millis
+    }
+
+    /// Returns the configured grace period for detached snapshots.
+    #[must_use]
+    pub const fn snapshot_minimum_age_millis(&self) -> Option<u64> {
+        self.snapshot_minimum_age_millis
+    }
+
+    /// Returns the per-repository detached-snapshot keep floor.
+    #[must_use]
+    pub const fn snapshot_keep_floor(&self) -> usize {
+        self.snapshot_keep_floor
+    }
+
+    /// Returns explicit immutable commit roots in canonical order.
+    #[must_use]
+    pub fn retained_commits(&self) -> &[Box<str>] {
+        &self.retained_commits
     }
 }
 
 /// Kind of object scheduled by a version-one GC plan.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum GcCandidateKind {
     /// An identity-valid partial record and payload pair.
     PartialTransfer,
+    /// A complete detached immutable snapshot deletion unit.
+    Snapshot,
+    /// A validated blob unreachable after the planned snapshot removals.
+    Blob,
 }
 
 /// One immutable candidate observation in a [`GcPlan`].
@@ -49,9 +118,10 @@ pub struct GcCandidate {
     kind: GcCandidateKind,
     logical_bytes: u64,
     updated_unix_millis: u64,
-    commit: Box<str>,
-    repository_path: Box<str>,
-    record_sha256: Box<str>,
+    commit: Option<Box<str>>,
+    selection_id: Option<Box<str>>,
+    repository_path: Option<Box<str>>,
+    fingerprint_sha256: Box<str>,
 }
 
 impl GcCandidate {
@@ -79,27 +149,95 @@ impl GcCandidate {
         self.updated_unix_millis
     }
 
-    pub(crate) fn partial_identity(&self) -> Result<PartialGcCandidate, HubError> {
-        if self.kind != GcCandidateKind::PartialTransfer
-            || self.id.len() != 64
-            || !self
-                .id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
+    /// Returns the immutable commit for a partial or snapshot candidate.
+    #[must_use]
+    pub fn commit(&self) -> Option<&str> {
+        self.commit.as_deref()
+    }
+
+    /// Returns the selection identity for a snapshot candidate.
+    #[must_use]
+    pub fn selection_id(&self) -> Option<&str> {
+        self.selection_id.as_deref()
+    }
+
+    pub(crate) fn observation(&self) -> Result<GcObservation, HubError> {
+        if !is_sha256(&self.id) || !is_sha256(&self.fingerprint_sha256) {
             return Err(HubError::protocol());
         }
-        let commit = CommitId::parse(&self.commit).map_err(HubError::validation)?;
-        let path = RepoPath::parse(&self.repository_path).map_err(HubError::validation)?;
-        let record_digest = BlobDigest::parse(&self.record_sha256).map_err(HubError::validation)?;
-        Ok(PartialGcCandidate::from_observation(
-            self.id.clone(),
-            commit,
-            path,
-            record_digest,
-            self.logical_bytes,
-            self.updated_unix_millis,
-        ))
+        let fingerprint =
+            BlobDigest::parse(&self.fingerprint_sha256).map_err(HubError::validation)?;
+        match self.kind {
+            GcCandidateKind::PartialTransfer => {
+                let commit = parse_commit(self.commit.as_deref())?;
+                let path = self
+                    .repository_path
+                    .as_deref()
+                    .ok_or_else(HubError::protocol)
+                    .and_then(|value| RepoPath::parse(value).map_err(HubError::validation))?;
+                if self.selection_id.is_some() {
+                    return Err(HubError::protocol());
+                }
+                Ok(GcObservation::Partial(
+                    PartialGcCandidate::from_observation(
+                        self.id.clone(),
+                        commit,
+                        path,
+                        fingerprint,
+                        self.logical_bytes,
+                        self.updated_unix_millis,
+                    ),
+                ))
+            }
+            GcCandidateKind::Snapshot => {
+                if self.repository_path.is_some() {
+                    return Err(HubError::protocol());
+                }
+                GcObservation::snapshot_from_plan(
+                    self.id.clone(),
+                    self.commit.as_deref().ok_or_else(HubError::protocol)?,
+                    self.selection_id
+                        .as_deref()
+                        .ok_or_else(HubError::protocol)?,
+                    fingerprint,
+                    self.logical_bytes,
+                    self.updated_unix_millis,
+                )
+            }
+            GcCandidateKind::Blob => {
+                if self.commit.is_some()
+                    || self.selection_id.is_some()
+                    || self.repository_path.is_some()
+                {
+                    return Err(HubError::protocol());
+                }
+                GcObservation::blob_from_plan(
+                    self.id.clone(),
+                    fingerprint,
+                    self.logical_bytes,
+                    self.updated_unix_millis,
+                )
+            }
+        }
+    }
+}
+
+impl From<&GcObservation> for GcCandidate {
+    fn from(candidate: &GcObservation) -> Self {
+        Self {
+            id: candidate.key().into(),
+            kind: match candidate {
+                GcObservation::Partial(_) => GcCandidateKind::PartialTransfer,
+                GcObservation::Snapshot(_) => GcCandidateKind::Snapshot,
+                GcObservation::Blob(_) => GcCandidateKind::Blob,
+            },
+            logical_bytes: candidate.size(),
+            updated_unix_millis: candidate.updated_unix_millis(),
+            commit: candidate.commit().map(|value| value.as_str().into()),
+            selection_id: candidate.selection_id().map(Into::into),
+            repository_path: candidate.path().map(|value| value.as_str().into()),
+            fingerprint_sha256: candidate.fingerprint().to_string().into(),
+        }
     }
 }
 
@@ -125,21 +263,10 @@ impl GcPlan {
         repository: &RepositorySpec,
         planned_unix_millis: u64,
         policy: GcPolicy,
-        internal: &[PartialGcCandidate],
+        internal: &[GcObservation],
     ) -> Result<Self, HubError> {
-        let candidates = internal
-            .iter()
-            .map(|candidate| GcCandidate {
-                id: candidate.key().into(),
-                kind: GcCandidateKind::PartialTransfer,
-                logical_bytes: candidate.size(),
-                updated_unix_millis: candidate.updated_unix_millis(),
-                commit: candidate.commit().as_str().into(),
-                repository_path: candidate.path().as_str().into(),
-                record_sha256: candidate.record_digest().to_string().into(),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let mut candidates = internal.iter().map(GcCandidate::from).collect::<Vec<_>>();
+        candidates.sort_unstable_by(|left, right| candidate_key(left).cmp(&candidate_key(right)));
         let repository_identity =
             format!("{}:{}", repository.kind(), repository.id()).into_boxed_str();
         let mut plan = Self {
@@ -152,7 +279,7 @@ impl GcPlan {
             planned_unix_millis,
             policy,
             compatible_deletion_blocked: cache_mode == CacheMode::Compatible,
-            candidates,
+            candidates: candidates.into_boxed_slice(),
         };
         plan.plan_id = plan.computed_id()?;
         plan.validate()?;
@@ -162,8 +289,8 @@ impl GcPlan {
     /// Decodes and validates a version-one executable plan.
     ///
     /// Unknown JSON fields are ignored for forward-compatible additions. The
-    /// schema, version, fixed-size identities, canonical ordering, and plan
-    /// digest must all validate before execution can use the value.
+    /// schema, version, identities, canonical ordering, and plan digest must
+    /// all validate before execution can use the value.
     ///
     /// # Errors
     ///
@@ -201,13 +328,13 @@ impl GcPlan {
         &self.plan_id
     }
 
-    /// Returns candidates in stable object-identity order.
+    /// Returns candidates in stable deletion-class and object-identity order.
     #[must_use]
     pub fn candidates(&self) -> &[GcCandidate] {
         &self.candidates
     }
 
-    /// Returns whether compatible-cache deletion is conservatively blocked.
+    /// Returns whether Python-visible compatible-cache deletion is blocked.
     #[must_use]
     pub const fn compatible_deletion_blocked(&self) -> bool {
         self.compatible_deletion_blocked
@@ -221,8 +348,8 @@ impl GcPlan {
 
     /// Returns the complete explicit retention policy.
     #[must_use]
-    pub const fn policy(&self) -> GcPolicy {
-        self.policy
+    pub const fn policy(&self) -> &GcPolicy {
+        &self.policy
     }
 
     /// Returns the plan-time wall-clock instant in Unix milliseconds.
@@ -234,7 +361,7 @@ impl GcPlan {
     fn validate(&self) -> Result<(), HubError> {
         if self.schema.as_ref() != PLAN_SCHEMA
             || self.version != PLAN_VERSION
-            || self.plan_id.len() != 64
+            || !is_sha256(&self.plan_id)
             || self.compatible_deletion_blocked != (self.cache_mode == CacheMode::Compatible)
             || Endpoint::parse(&self.endpoint)
                 .map_err(HubError::validation)?
@@ -244,15 +371,16 @@ impl GcPlan {
         {
             return Err(HubError::protocol());
         }
+        validate_policy(&self.policy)?;
         let mut previous = None;
         for candidate in &self.candidates {
-            let identity = candidate.partial_identity()?;
+            let identity = candidate.observation()?;
             if identity.key() != candidate.id()
-                || previous.is_some_and(|value: &str| value >= candidate.id())
+                || previous.is_some_and(|value| value >= candidate_key(candidate))
             {
                 return Err(HubError::protocol());
             }
-            previous = Some(candidate.id());
+            previous = Some(candidate_key(candidate));
         }
         Ok(())
     }
@@ -265,7 +393,7 @@ impl GcPlan {
             self.endpoint.as_ref(),
             self.repository.as_ref(),
             self.planned_unix_millis,
-            self.policy,
+            &self.policy,
             self.compatible_deletion_blocked,
             &self.candidates,
         ))
@@ -335,6 +463,37 @@ impl GcExecutionReport {
     }
 }
 
+fn parse_commit(value: Option<&str>) -> Result<CommitId, HubError> {
+    value
+        .ok_or_else(HubError::protocol)
+        .and_then(|value| CommitId::parse(value).map_err(HubError::validation))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn candidate_key(candidate: &GcCandidate) -> (GcCandidateKind, &str) {
+    (candidate.kind, candidate.id())
+}
+
+fn validate_policy(policy: &GcPolicy) -> Result<(), HubError> {
+    let mut previous = None;
+    for commit in &policy.retained_commits {
+        let parsed = CommitId::parse(commit).map_err(HubError::validation)?;
+        if parsed.as_str() != commit.as_ref()
+            || previous.is_some_and(|value: &str| value >= commit.as_ref())
+        {
+            return Err(HubError::protocol());
+        }
+        previous = Some(commit.as_ref());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,7 +516,7 @@ mod tests {
             &repository,
             200,
             GcPolicy::expired_partials(Duration::from_millis(50)).ok_or("duration did not fit")?,
-            &[candidate],
+            &[GcObservation::Partial(candidate)],
         )?;
         let encoded = plan.to_json()?;
         let decoded = GcPlan::from_json(&encoded)?;

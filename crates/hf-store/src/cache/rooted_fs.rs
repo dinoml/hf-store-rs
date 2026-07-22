@@ -179,6 +179,12 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         ))
     }
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn remove_dir(&self, _path: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory removal is unsupported by this filesystem adapter",
+        ))
+    }
     fn rename_entry(&self, _source: &Path, _destination: &Path) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -631,6 +637,11 @@ impl RootedFileSystem for CacheRoot {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let (parent, name) = self.open_parent_and_name(path, false)?;
         parent.remove_file(name)
+    }
+
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        let (parent, name) = self.open_parent_and_name(path, false)?;
+        parent.remove_dir(name)
     }
 
     fn rename_entry(&self, source: &Path, destination: &Path) -> io::Result<()> {
