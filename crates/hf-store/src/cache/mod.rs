@@ -1,3 +1,4 @@
+mod compatible_cache;
 mod filter;
 mod hub_cache;
 mod hub_layout;
