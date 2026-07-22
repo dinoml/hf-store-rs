@@ -8,6 +8,8 @@ mod layout;
 mod local_dir_layout;
 mod metadata;
 mod publication;
+#[cfg(test)]
+mod python_cache_conformance;
 mod rooted_fs;
 mod sanitized_io;
 mod standard_cache;

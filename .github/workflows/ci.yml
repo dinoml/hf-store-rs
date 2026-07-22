@@ -104,6 +104,9 @@ jobs:
           cache: pip
           cache-dependency-path: .conformance/huggingface_hub/pyproject.toml
 
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
       - name: Install pinned huggingface_hub checkout
         run: python -m pip install --disable-pip-version-check --editable .conformance/huggingface_hub
 
@@ -132,6 +135,14 @@ jobs:
           python conformance/python/cache_conformance.py
           --reference-root .conformance/huggingface_hub
           --inventory "${RUNNER_TEMP}/hf-store-python-conformance/inventory.json"
+
+      - name: Reuse Python-written cache through the Rust library path
+        env:
+          HF_STORE_PYTHON_CONFORMANCE_INVENTORY: ${{ runner.temp }}/hf-store-python-conformance/inventory.json
+        run: >-
+          cargo +stable test -p hf-store --lib
+          cache::python_cache_conformance::python_written_cache_reuses_every_repository_without_source
+          --locked -- --ignored --exact
 
   rust-python-cache-conformance:
     name: Rust writer / Python reader (${{ matrix.os }})
