@@ -8,6 +8,7 @@ mod layout;
 mod local_dir_bookkeeping;
 mod local_dir_layout;
 mod local_dir_materialization;
+mod local_dir_reconciliation;
 mod metadata;
 mod publication;
 #[cfg(test)]
