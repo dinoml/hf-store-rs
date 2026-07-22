@@ -1,18 +1,24 @@
 use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, Read};
-use std::path::Path;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::validation::ValidationError;
 use crate::{CommitId, Endpoint, RepoPath, RepositorySpec};
 
-use super::hub_metadata::{HubTree, LocalDownloadMetadata, decode_local_download, decode_tree};
+use super::hub_metadata::{
+    HubMetadataError, HubTree, LocalDownloadMetadata, decode_local_download, decode_tree,
+    encode_local_download, encode_tree,
+};
 use super::local_dir_layout::HubLocalDirLayout;
-use super::publication::FileSystem;
-use super::rooted_fs::{RootedFileSystem, RootedRegularFile, is_unsafe_cache_path_error};
+use super::publication::{Effects, FileSystem, PublicationPoint};
+use super::rooted_fs::{
+    CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedRead, RootedRegularFile,
+    is_unsafe_cache_path_error, staging_path,
+};
 use super::sanitized_io::SanitizedIo;
 
 const MAX_LOCAL_DOWNLOAD_METADATA_BYTES: usize = 64 * 1024;
@@ -146,6 +152,382 @@ impl LocalDirHintReader {
 
     fn relative<'a>(&self, path: &'a Path) -> Result<&'a Path, LocalDirBookkeepingError> {
         self.layout.capability_relative(path).map_err(Into::into)
+    }
+}
+
+/// Publishes Python-compatible local-directory bookkeeping after repository files.
+#[derive(Clone)]
+pub(super) struct LocalDirBookkeepingWriter {
+    layout: HubLocalDirLayout,
+    root: Arc<dyn RootedFileSystem>,
+    effects: Effects,
+}
+
+impl LocalDirBookkeepingWriter {
+    pub(super) const fn from_layout(
+        layout: HubLocalDirLayout,
+        root: Arc<dyn RootedFileSystem>,
+        effects: Effects,
+    ) -> Self {
+        Self {
+            layout,
+            root,
+            effects,
+        }
+    }
+
+    /// Replaces a mutable per-file hint only while its destination is present.
+    pub(super) fn write_file_hint(
+        &self,
+        path: &RepoPath,
+        commit: &CommitId,
+        etag: &str,
+    ) -> Result<(), LocalDirBookkeepingWriteError> {
+        let destination = self.layout.file_path(path)?;
+        let destination_relative = self.relative(&destination)?.to_path_buf();
+        let metadata = self.layout.download_metadata_path(path)?;
+        let metadata_relative = self.relative(&metadata)?.to_path_buf();
+        let lock = self.layout.lock_path(path)?;
+        let lock_relative = self.relative(&lock)?;
+        let _guard = self.root.lock_exclusive(lock_relative)?;
+
+        if !matches!(
+            self.root.open_regular(&destination_relative)?,
+            RootedRegularFile::File { .. }
+        ) {
+            return Err(LocalDirBookkeepingWriteError::conflict(false));
+        }
+        match self.root.entry_kind(&metadata_relative)? {
+            RootedEntryKind::Missing | RootedEntryKind::RegularFile => {}
+            RootedEntryKind::Directory | RootedEntryKind::Other => {
+                return Err(LocalDirBookkeepingWriteError::conflict(false));
+            }
+        }
+
+        let timestamp = Duration::from_millis(self.effects.now_unix_millis()?).as_secs_f64();
+        let record = LocalDownloadMetadata::new(commit.clone(), etag, timestamp)?;
+        let bytes = encode_local_download(&record);
+        self.replace_record(&metadata_relative, &bytes)
+    }
+
+    /// Creates an immutable per-commit tree hint, or reuses identical bytes.
+    pub(super) fn write_tree_hint(
+        &self,
+        commit: &CommitId,
+        tree: &HubTree,
+    ) -> Result<LocalDirTreeWrite, LocalDirBookkeepingWriteError> {
+        let destination = self.layout.tree_path(commit);
+        let relative = self.relative(&destination)?.to_path_buf();
+        let bytes = encode_tree(tree)?;
+
+        match self.read_expected(&relative, &bytes)? {
+            ExpectedRecord::Identical => return Ok(LocalDirTreeWrite::Reused),
+            ExpectedRecord::Missing => {}
+            ExpectedRecord::Conflict => {
+                return Err(LocalDirBookkeepingWriteError::conflict(false));
+            }
+        }
+
+        let staging = staging_path(&relative, &self.effects.next_staging_name()?)?;
+        let mut cleanup = BookkeepingStagingCleanup::new(self.root.as_ref(), staging.clone());
+        self.stage_record(&staging, &bytes, &mut cleanup)?;
+        self.check_fault(PublicationPoint::BeforeBlobPublish, false)?;
+        let outcome = self
+            .root
+            .install_staged_create_once(&staging, &relative)
+            .map_err(|source| LocalDirBookkeepingWriteError::io(&source, true))?;
+        if outcome == CreateOnceOutcome::Created {
+            cleanup.deactivate();
+        }
+        self.check_fault(PublicationPoint::AfterBlobPublish, true)?;
+        match self.read_expected(&relative, &bytes) {
+            Ok(ExpectedRecord::Identical) => {}
+            Ok(ExpectedRecord::Missing | ExpectedRecord::Conflict) => {
+                return Err(LocalDirBookkeepingWriteError::final_validation());
+            }
+            Err(source) => return Err(source.with_may_have_published()),
+        }
+        self.sync_parent(&relative)
+            .map_err(|source| LocalDirBookkeepingWriteError::io(&source, true))?;
+        Ok(match outcome {
+            CreateOnceOutcome::Created => LocalDirTreeWrite::Published,
+            CreateOnceOutcome::Existing => LocalDirTreeWrite::Reused,
+        })
+    }
+
+    fn replace_record(
+        &self,
+        destination: &Path,
+        bytes: &[u8],
+    ) -> Result<(), LocalDirBookkeepingWriteError> {
+        let staging = staging_path(destination, &self.effects.next_staging_name()?)?;
+        let mut cleanup = BookkeepingStagingCleanup::new(self.root.as_ref(), staging.clone());
+        self.stage_record(&staging, bytes, &mut cleanup)?;
+        self.check_fault(PublicationPoint::BeforeAtomicReplace, false)?;
+        self.root
+            .install_staged_replace(&staging, destination)
+            .map_err(|source| LocalDirBookkeepingWriteError::io(&source, true))?;
+        cleanup.deactivate();
+        self.check_fault(PublicationPoint::AfterAtomicReplace, true)?;
+        match self.read_expected(destination, bytes) {
+            Ok(ExpectedRecord::Identical) => {}
+            Ok(ExpectedRecord::Missing | ExpectedRecord::Conflict) => {
+                return Err(LocalDirBookkeepingWriteError::final_validation());
+            }
+            Err(source) => return Err(source.with_may_have_published()),
+        }
+        self.sync_parent(destination)
+            .map_err(|source| LocalDirBookkeepingWriteError::io(&source, true))
+    }
+
+    fn stage_record(
+        &self,
+        staging: &Path,
+        bytes: &[u8],
+        cleanup: &mut BookkeepingStagingCleanup<'_>,
+    ) -> Result<(), LocalDirBookkeepingWriteError> {
+        let parent = staging.parent().ok_or_else(|| {
+            LocalDirBookkeepingWriteError::io(
+                &io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bookkeeping path has no parent",
+                ),
+                false,
+            )
+        })?;
+        self.root.ensure_dir(parent)?;
+        let mut writer = self.root.create_new(staging)?;
+        cleanup.activate();
+        self.check_fault(PublicationPoint::AfterStagingCreate, false)?;
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        writer.sync_all()?;
+        drop(writer);
+        self.check_fault(PublicationPoint::AfterStagingSync, false)
+    }
+
+    fn read_expected(
+        &self,
+        path: &Path,
+        expected: &[u8],
+    ) -> Result<ExpectedRecord, LocalDirBookkeepingWriteError> {
+        match self.root.read_regular_bounded(path, expected.len())? {
+            RootedRead::Missing => Ok(ExpectedRecord::Missing),
+            RootedRead::Bytes(bytes) if bytes == expected => Ok(ExpectedRecord::Identical),
+            RootedRead::Other | RootedRead::Bytes(_) => Ok(ExpectedRecord::Conflict),
+        }
+    }
+
+    fn sync_parent(&self, destination: &Path) -> io::Result<()> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| io::Error::other("bookkeeping destination has no parent"))?;
+        self.root.sync_directory(parent)
+    }
+
+    fn check_fault(
+        &self,
+        point: PublicationPoint,
+        may_have_published: bool,
+    ) -> Result<(), LocalDirBookkeepingWriteError> {
+        self.effects
+            .check_publication_fault(point)
+            .map_err(|source| LocalDirBookkeepingWriteError::io(&source, may_have_published))
+    }
+
+    fn relative<'a>(&self, path: &'a Path) -> Result<&'a Path, LocalDirBookkeepingWriteError> {
+        self.layout.capability_relative(path).map_err(Into::into)
+    }
+}
+
+impl fmt::Debug for LocalDirBookkeepingWriter {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalDirBookkeepingWriter")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LocalDirTreeWrite {
+    Published,
+    Reused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedRecord {
+    Missing,
+    Identical,
+    Conflict,
+}
+
+struct BookkeepingStagingCleanup<'a> {
+    root: &'a dyn RootedFileSystem,
+    path: PathBuf,
+    active: bool,
+}
+
+impl<'a> BookkeepingStagingCleanup<'a> {
+    fn new(root: &'a dyn RootedFileSystem, path: PathBuf) -> Self {
+        Self {
+            root,
+            path,
+            active: false,
+        }
+    }
+
+    const fn activate(&mut self) {
+        self.active = true;
+    }
+
+    const fn deactivate(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for BookkeepingStagingCleanup<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _cleanup_result = self.root.remove_file(&self.path);
+        }
+    }
+}
+
+pub(super) struct LocalDirBookkeepingWriteError {
+    kind: Box<LocalDirBookkeepingWriteErrorKind>,
+    may_have_published: bool,
+    backtrace: Backtrace,
+}
+
+enum LocalDirBookkeepingWriteErrorKind {
+    Io(SanitizedIo),
+    UnsafeFileSystem(SanitizedIo),
+    Validation(ValidationError),
+    Metadata(HubMetadataError),
+    Conflict,
+    FinalValidation,
+}
+
+impl LocalDirBookkeepingWriteError {
+    fn new(kind: LocalDirBookkeepingWriteErrorKind, may_have_published: bool) -> Self {
+        Self {
+            kind: Box::new(kind),
+            may_have_published,
+            backtrace: Backtrace::capture(),
+        }
+    }
+
+    fn io(source: &io::Error, may_have_published: bool) -> Self {
+        let kind = if is_unsafe_cache_path_error(source) {
+            LocalDirBookkeepingWriteErrorKind::UnsafeFileSystem(SanitizedIo::new(source))
+        } else {
+            LocalDirBookkeepingWriteErrorKind::Io(SanitizedIo::new(source))
+        };
+        Self::new(kind, may_have_published)
+    }
+
+    fn conflict(may_have_published: bool) -> Self {
+        Self::new(
+            LocalDirBookkeepingWriteErrorKind::Conflict,
+            may_have_published,
+        )
+    }
+
+    fn final_validation() -> Self {
+        Self::new(LocalDirBookkeepingWriteErrorKind::FinalValidation, true)
+    }
+
+    fn with_may_have_published(mut self) -> Self {
+        self.may_have_published = true;
+        self
+    }
+
+    pub(super) fn is_conflict(&self) -> bool {
+        matches!(
+            self.kind.as_ref(),
+            LocalDirBookkeepingWriteErrorKind::Conflict
+        )
+    }
+
+    pub(super) const fn may_have_published(&self) -> bool {
+        self.may_have_published
+    }
+
+    pub(super) fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
+    }
+}
+
+impl fmt::Debug for LocalDirBookkeepingWriteError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind.as_ref() {
+            LocalDirBookkeepingWriteErrorKind::Io(_) => "Io",
+            LocalDirBookkeepingWriteErrorKind::UnsafeFileSystem(_) => "UnsafeFileSystem",
+            LocalDirBookkeepingWriteErrorKind::Validation(_) => "Validation",
+            LocalDirBookkeepingWriteErrorKind::Metadata(_) => "Metadata",
+            LocalDirBookkeepingWriteErrorKind::Conflict => "Conflict",
+            LocalDirBookkeepingWriteErrorKind::FinalValidation => "FinalValidation",
+        };
+        formatter
+            .debug_struct("LocalDirBookkeepingWriteError")
+            .field("kind", &kind)
+            .field("may_have_published", &self.may_have_published)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Display for LocalDirBookkeepingWriteError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let message = match self.kind.as_ref() {
+            LocalDirBookkeepingWriteErrorKind::Io(_) => "local-dir bookkeeping publication failed",
+            LocalDirBookkeepingWriteErrorKind::UnsafeFileSystem(_) => {
+                "local-dir bookkeeping publication path is unsafe"
+            }
+            LocalDirBookkeepingWriteErrorKind::Validation(_) => {
+                "local-dir bookkeeping publication validation failed"
+            }
+            LocalDirBookkeepingWriteErrorKind::Metadata(_) => {
+                "local-dir bookkeeping record could not be encoded"
+            }
+            LocalDirBookkeepingWriteErrorKind::Conflict => {
+                "local-dir bookkeeping publication conflicts with existing state"
+            }
+            LocalDirBookkeepingWriteErrorKind::FinalValidation => {
+                "local-dir bookkeeping record failed validation after publication"
+            }
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for LocalDirBookkeepingWriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self.kind.as_ref() {
+            LocalDirBookkeepingWriteErrorKind::Validation(source) => Some(source),
+            LocalDirBookkeepingWriteErrorKind::Io(_)
+            | LocalDirBookkeepingWriteErrorKind::UnsafeFileSystem(_)
+            | LocalDirBookkeepingWriteErrorKind::Metadata(_)
+            | LocalDirBookkeepingWriteErrorKind::Conflict
+            | LocalDirBookkeepingWriteErrorKind::FinalValidation => None,
+        }
+    }
+}
+
+impl From<io::Error> for LocalDirBookkeepingWriteError {
+    fn from(source: io::Error) -> Self {
+        Self::io(&source, false)
+    }
+}
+
+impl From<ValidationError> for LocalDirBookkeepingWriteError {
+    fn from(source: ValidationError) -> Self {
+        Self::new(LocalDirBookkeepingWriteErrorKind::Validation(source), false)
+    }
+}
+
+impl From<HubMetadataError> for LocalDirBookkeepingWriteError {
+    fn from(source: HubMetadataError) -> Self {
+        Self::new(LocalDirBookkeepingWriteErrorKind::Metadata(source), false)
     }
 }
 
@@ -313,7 +695,7 @@ impl From<ValidationError> for LocalDirBookkeepingError {
 mod tests {
     use std::error::Error;
     use std::fmt::{self, Debug, Display, Formatter};
-    use std::fs::{self, FileTimes, OpenOptions};
+    use std::fs::{self, File, FileTimes, OpenOptions};
     use std::io::{self, Read};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -323,17 +705,21 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::cache::hub_metadata::{
-        HubTree, HubTreeEntry, LocalDownloadMetadata, encode_local_download, encode_tree,
+        HubTree, HubTreeEntry, LocalDownloadMetadata, decode_tree, encode_local_download,
+        encode_tree,
     };
     use crate::cache::local_dir_layout::HubLocalDirLayout;
-    use crate::cache::publication::{CacheAuthority, FileSystem, OsFileSystem};
+    use crate::cache::publication::{
+        CacheAuthority, Effects, FaultController, FileSystem, FixedClock, NoPublicationFaults,
+        OsFileSystem, PublicationPoint, SequenceOperationIds,
+    };
     use crate::cache::rooted_fs::{
         CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockAttempt,
         RootedLockGuard, RootedRead, RootedRegularFile, RootedWrite, StagingName,
     };
     use crate::{CommitId, Endpoint, RepoPath, RepositoryId, RepositorySpec};
 
-    use super::LocalDirHintReader;
+    use super::{LocalDirBookkeepingWriter, LocalDirHintReader, LocalDirTreeWrite};
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const ETAG: &str = "9e107d9d372bb6826bd81d3542a419d6";
@@ -684,6 +1070,30 @@ mod tests {
     }
 
     #[test]
+    fn writer_errors_and_debug_omit_untrusted_values() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("config.json")?;
+        let commit = CommitId::parse(COMMIT)?;
+        fixture.write_content(&path, b"destination")?;
+        let writer = fixture.writer(writer_effects(1_720_000_000_250))?;
+        let invalid_etag = format!("{UNTRUSTED_ETAG_SENTINEL}\nsecond-line");
+
+        let error = writer
+            .write_file_hint(&path, &commit, &invalid_etag)
+            .expect_err("accepted an unsafe multiline ETag");
+        for rendered in [
+            format!("{error}"),
+            format!("{error:?}"),
+            format!("{writer:?}"),
+        ] {
+            assert!(!rendered.contains(UNTRUSTED_ETAG_SENTINEL));
+            assert!(!rendered.contains(UNTRUSTED_PATH_SENTINEL));
+        }
+        assert!(error.source().is_none());
+        Ok(())
+    }
+
+    #[test]
     fn successful_hint_debug_omits_untrusted_metadata_and_tree_values() -> Result<(), Box<dyn Error>>
     {
         let fixture = Fixture::new()?;
@@ -779,6 +1189,117 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn writer_emits_pinned_python_metadata_only_after_destination_exists()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let path = RepoPath::parse("config/fixture.json")?;
+        let commit = CommitId::parse(PINNED_COMMIT)?;
+        let writer = fixture.writer(writer_effects(1_720_000_000_250))?;
+
+        let missing = writer
+            .write_file_hint(&path, &commit, PINNED_ETAG)
+            .expect_err("metadata was written before its destination existed");
+        assert!(missing.is_conflict());
+        assert!(!fixture.layout.download_metadata_path(&path)?.try_exists()?);
+
+        fixture.write_content(&path, PINNED_CONTENT)?;
+        let pinned_time = UNIX_EPOCH + Duration::from_secs_f64(PINNED_TIMESTAMP);
+        File::options()
+            .write(true)
+            .open(fixture.layout.file_path(&path)?)?
+            .set_times(FileTimes::new().set_modified(pinned_time))?;
+        writer.write_file_hint(&path, &commit, PINNED_ETAG)?;
+        assert_eq!(
+            fs::read(fixture.layout.download_metadata_path(&path)?)?,
+            PINNED_METADATA
+        );
+        let hint = fixture
+            .reader
+            .file_hint(&path)?
+            .ok_or("writer output was not accepted by the hint reader")?;
+        assert_eq!(hint.commit(), &commit);
+        assert_eq!(hint.etag(), PINNED_ETAG);
+        assert_eq!(hint.timestamp().to_bits(), PINNED_TIMESTAMP.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn writer_emits_pinned_python_tree_and_reuses_identical_bytes() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let commit = CommitId::parse(PINNED_COMMIT)?;
+        let tree = decode_tree(PINNED_TREE)?;
+        let writer = fixture.writer(writer_effects(1_720_000_000_250))?;
+
+        assert_eq!(
+            writer.write_tree_hint(&commit, &tree)?,
+            LocalDirTreeWrite::Published
+        );
+        assert_eq!(
+            writer.write_tree_hint(&commit, &tree)?,
+            LocalDirTreeWrite::Reused
+        );
+        assert_eq!(fs::read(fixture.layout.tree_path(&commit))?, PINNED_TREE);
+        Ok(())
+    }
+
+    #[test]
+    fn writer_preserves_conflicting_tree_bytes() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let commit = CommitId::parse(PINNED_COMMIT)?;
+        let tree = decode_tree(PINNED_TREE)?;
+        let tree_path = fixture.layout.tree_path(&commit);
+        create_parent(&tree_path)?;
+        let conflict = b"future or conflicting tree";
+        fs::write(&tree_path, conflict)?;
+
+        let error = fixture
+            .writer(writer_effects(1_720_000_000_250))?
+            .write_tree_hint(&commit, &tree)
+            .expect_err("conflicting immutable tree was overwritten");
+        assert!(error.is_conflict());
+        assert_eq!(fs::read(tree_path)?, conflict);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_replacement_faults_expose_only_old_or_new_complete_bytes()
+    -> Result<(), Box<dyn Error>> {
+        for point in [
+            PublicationPoint::BeforeAtomicReplace,
+            PublicationPoint::AfterAtomicReplace,
+        ] {
+            let fixture = Fixture::new()?;
+            let path = RepoPath::parse("config.json")?;
+            let commit = CommitId::parse(PINNED_COMMIT)?;
+            fixture.write_content(&path, PINNED_CONTENT)?;
+            let metadata_path = fixture.layout.download_metadata_path(&path)?;
+            create_parent(&metadata_path)?;
+            let old = b"old-complete-metadata\n";
+            fs::write(&metadata_path, old)?;
+            let faults = Arc::new(FaultController::default());
+            faults.fail_once(point);
+            let effects = Effects::new(
+                Arc::new(OsFileSystem),
+                Arc::new(SequenceOperationIds::new(1)),
+                Arc::new(FixedClock::new(1_720_000_000_250)),
+                faults,
+            );
+
+            let error = fixture
+                .writer(effects)?
+                .write_file_hint(&path, &commit, PINNED_ETAG)
+                .expect_err("injected metadata replacement fault was ignored");
+            assert_eq!(
+                error.may_have_published(),
+                point == PublicationPoint::AfterAtomicReplace
+            );
+            let visible = fs::read(&metadata_path)?;
+            assert!(visible == old || visible == PINNED_METADATA);
+        }
+        Ok(())
+    }
+
     struct Fixture {
         directory: TempDir,
         layout: HubLocalDirLayout,
@@ -809,6 +1330,24 @@ mod tests {
         fn write_metadata(&self, path: &RepoPath, timestamp: f64) -> Result<(), Box<dyn Error>> {
             write_metadata(&self.layout, path, timestamp)
         }
+
+        fn writer(&self, effects: Effects) -> Result<LocalDirBookkeepingWriter, Box<dyn Error>> {
+            let root: Arc<dyn RootedFileSystem> = Arc::new(CacheRoot::open(self.directory.path())?);
+            Ok(LocalDirBookkeepingWriter::from_layout(
+                self.layout.clone(),
+                root,
+                effects,
+            ))
+        }
+    }
+
+    fn writer_effects(unix_millis: u64) -> Effects {
+        Effects::new(
+            Arc::new(OsFileSystem),
+            Arc::new(SequenceOperationIds::new(1)),
+            Arc::new(FixedClock::new(unix_millis)),
+            Arc::new(NoPublicationFaults),
+        )
     }
 
     fn layout_and_root(

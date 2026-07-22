@@ -347,6 +347,10 @@ impl Effects {
         StagingName::new(&operation_id.to_string())
     }
 
+    pub(super) fn now_unix_millis(&self) -> io::Result<u64> {
+        self.clock.now_unix_millis()
+    }
+
     pub(super) fn check_publication_fault(&self, point: PublicationPoint) -> io::Result<()> {
         self.faults.check(point)
     }
