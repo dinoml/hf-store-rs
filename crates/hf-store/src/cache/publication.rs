@@ -27,10 +27,10 @@ use super::metadata::{
 };
 use super::rooted_fs::{
     CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedRegularFile,
-    StagingName, is_reparse_point, is_unsafe_cache_path_error, unsafe_cache_path,
+    RootedWrite, StagingName, is_reparse_point, is_unsafe_cache_path_error, unsafe_cache_path,
 };
 #[cfg(test)]
-use super::rooted_fs::{RootedLockAttempt, RootedLockGuard, RootedRead, RootedWrite};
+use super::rooted_fs::{RootedLockAttempt, RootedLockGuard, RootedRead};
 use super::sanitized_io::SanitizedIo;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -367,6 +367,28 @@ pub(super) struct CacheKernel {
     effects: Effects,
 }
 
+pub(super) struct CachePartialSink {
+    writer: Box<dyn RootedWrite>,
+}
+
+impl Debug for CachePartialSink {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachePartialSink")
+            .finish_non_exhaustive()
+    }
+}
+
+impl crate::transfer::PartialSink for CachePartialSink {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.writer.write_all(bytes)
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        self.writer.sync_all()
+    }
+}
+
 impl CacheKernel {
     pub(super) fn new(
         root: impl AsRef<Path>,
@@ -526,6 +548,76 @@ impl CacheKernel {
                 ))
             }
         }
+    }
+
+    pub(super) fn create_fresh_partial_sink(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+    ) -> Result<CachePartialSink, CacheError> {
+        let destination = self.layout.partial_data(commit, path)?;
+        self.ensure_parent(&destination)?;
+        let relative = self.relative_path(&destination)?;
+        match self.root.entry_kind(relative)? {
+            RootedEntryKind::Missing => {}
+            RootedEntryKind::RegularFile => self.root.remove_file(relative)?,
+            RootedEntryKind::Directory | RootedEntryKind::Other => {
+                return Err(CacheError::conflicting_record());
+            }
+        }
+        Ok(CachePartialSink {
+            writer: self.root.create_new(relative)?,
+        })
+    }
+
+    pub(super) fn partial_data_path(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+    ) -> Result<PathBuf, CacheError> {
+        Ok(self.layout.partial_data(commit, path)?)
+    }
+
+    pub(super) fn discard_partial(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+    ) -> Result<(), CacheError> {
+        for destination in [
+            self.layout.partial_data(commit, path)?,
+            self.layout.partial_record(commit, path)?,
+        ] {
+            let relative = self.relative_path(&destination)?;
+            match self.root.entry_kind(relative)? {
+                RootedEntryKind::Missing => {}
+                RootedEntryKind::RegularFile => self.root.remove_file(relative)?,
+                RootedEntryKind::Directory | RootedEntryKind::Other => {
+                    return Err(CacheError::conflicting_record());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn publish_validated_partial(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+        expected_size: u64,
+        expected_digest: BlobDigest,
+    ) -> Result<BlobPublication, CacheError> {
+        let destination = self.layout.partial_data(commit, path)?;
+        let relative = self.relative_path(&destination)?;
+        let (reader, actual_size) = match self.root.open_regular(relative)? {
+            RootedRegularFile::File { reader, size, .. } => (reader, size),
+            RootedRegularFile::Missing | RootedRegularFile::Other => {
+                return Err(CacheError::conflicting_record());
+            }
+        };
+        if actual_size != expected_size {
+            return Err(CacheError::size_mismatch(expected_size, actual_size));
+        }
+        self.publish_blob(reader, expected_size, expected_digest)
     }
 
     pub(super) fn blob_path(&self, digest: &BlobDigest) -> PathBuf {

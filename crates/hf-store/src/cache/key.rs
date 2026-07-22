@@ -172,18 +172,18 @@ impl Display for PartialTransferKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(super) struct BlobDigest([u8; 32]);
+pub(crate) struct BlobDigest([u8; 32]);
 
 impl BlobDigest {
-    pub(super) fn for_bytes(bytes: &[u8]) -> Self {
+    pub(crate) fn for_bytes(bytes: &[u8]) -> Self {
         Self(Sha256::digest(bytes).into())
     }
 
-    pub(super) const fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, ValidationError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, ValidationError> {
         let encoded = value.as_bytes();
         if encoded.len() != 64 {
             return Err(blob_digest_malformed());

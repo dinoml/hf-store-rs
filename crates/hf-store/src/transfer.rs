@@ -1,4 +1,93 @@
-use crate::error::HubOperationError;
+use std::fmt::Debug;
+use std::io;
+
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+
+use crate::cache::{BlobDigest, HubTreeEntry};
+use crate::error::{CacheFailure, HubOperationError};
+use crate::transport::TransportBody;
+
+pub(crate) trait PartialSink: Debug + Send {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()>;
+    fn sync_all(&self) -> io::Result<()>;
+}
+
+pub(crate) async fn stream_validated_body(
+    body: &mut dyn TransportBody,
+    sink: &mut dyn PartialSink,
+    entry: &HubTreeEntry,
+) -> Result<BlobDigest, HubOperationError> {
+    let expected_lfs = match (entry.lfs_sha256(), entry.lfs_size()) {
+        (Some(sha256), Some(size)) if is_lower_hex(sha256, 64) && size == entry.size() => {
+            Some(sha256)
+        }
+        (None, None) => None,
+        (Some(_), _) | (None, Some(_)) => {
+            return Err(HubOperationError::validation(transfer_validation_error()));
+        }
+    };
+    let expected_git =
+        (expected_lfs.is_none() && is_lower_hex(entry.blob_id(), 40)).then_some(entry.blob_id());
+    let mut git_hasher = expected_git.map(|_expected| {
+        let mut hasher = Sha1::new();
+        hasher.update(format!("blob {}\0", entry.size()).as_bytes());
+        hasher
+    });
+    let mut local_hasher = Sha256::new();
+    let mut received = 0_u64;
+
+    while let Some(chunk) = body
+        .next_chunk()
+        .await
+        .map_err(HubOperationError::transport)?
+    {
+        let chunk_size = u64::try_from(chunk.len())
+            .map_err(|_overflow| HubOperationError::validation(transfer_validation_error()))?;
+        received = received
+            .checked_add(chunk_size)
+            .ok_or_else(|| HubOperationError::validation(transfer_validation_error()))?;
+        if received > entry.size() {
+            return Err(HubOperationError::validation(transfer_validation_error()));
+        }
+        sink.write_all(&chunk)
+            .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+        local_hasher.update(&chunk);
+        if let Some(hasher) = git_hasher.as_mut() {
+            hasher.update(&chunk);
+        }
+    }
+    if received != entry.size() {
+        return Err(HubOperationError::validation(transfer_validation_error()));
+    }
+    sink.sync_all()
+        .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+
+    let digest = BlobDigest::from_bytes(local_hasher.finalize().into());
+    if expected_lfs.is_some_and(|expected| digest.to_string() != expected) {
+        return Err(HubOperationError::validation(transfer_validation_error()));
+    }
+    if let (Some(expected), Some(hasher)) = (expected_git, git_hasher) {
+        if format!("{:x}", hasher.finalize()) != expected {
+            return Err(HubOperationError::validation(transfer_validation_error()));
+        }
+    }
+    Ok(digest)
+}
+
+fn transfer_validation_error() -> crate::ValidationError {
+    crate::ValidationError::new(
+        "Hub file content",
+        crate::validation::ValidationErrorKind::Malformed,
+    )
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BodyDisposition {
@@ -121,7 +210,47 @@ fn require_matching_length(actual: Option<u64>, expected: u64) -> Result<(), Hub
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    use crate::transport::{TransportError, TransportFuture};
+
     use super::*;
+
+    #[derive(Debug)]
+    struct MemoryBody(VecDeque<Result<Box<[u8]>, TransportError>>);
+
+    impl TransportBody for MemoryBody {
+        fn next_chunk(&mut self) -> TransportFuture<'_, Result<Option<Box<[u8]>>, TransportError>> {
+            Box::pin(std::future::ready(match self.0.pop_front() {
+                Some(result) => result.map(Some),
+                None => Ok(None),
+            }))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MemorySink {
+        bytes: Vec<u8>,
+        fail_write: bool,
+        synced: AtomicBool,
+    }
+
+    impl PartialSink for MemorySink {
+        fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if self.fail_write {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "fixture"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn sync_all(&self) -> io::Result<()> {
+            self.synced.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
 
     #[test]
     fn full_and_exact_partial_responses_are_accepted() -> Result<(), HubOperationError> {
@@ -186,5 +315,69 @@ mod tests {
         }
         validate_file_response(200, Some("18446744073709551616"), None, None, 9)
             .expect_err("accepted an overflowing decimal header");
+    }
+
+    #[test]
+    fn streamed_git_and_lfs_content_is_bounded_hashed_and_synced()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = b"validated body";
+        let mut git = Sha1::new();
+        git.update(format!("blob {}\0", bytes.len()).as_bytes());
+        git.update(bytes);
+        let git_id = format!("{:x}", git.finalize());
+        let lfs_id = format!("{:x}", Sha256::digest(bytes));
+        for entry in [
+            HubTreeEntry::new(bytes.len() as u64, git_id)?,
+            HubTreeEntry::new(bytes.len() as u64, "pointer")?
+                .with_lfs(lfs_id, bytes.len() as u64)?,
+        ] {
+            let mut body = MemoryBody(VecDeque::from([
+                Ok(Box::<[u8]>::from(&bytes[..4])),
+                Ok(Box::<[u8]>::from(&bytes[4..])),
+            ]));
+            let mut sink = MemorySink::default();
+            let digest = run_ready(stream_validated_body(&mut body, &mut sink, &entry))?;
+            assert_eq!(sink.bytes, bytes);
+            assert!(sink.synced.load(Ordering::Acquire));
+            assert_eq!(digest, BlobDigest::for_bytes(bytes));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_overrunning_invalid_and_failed_streams_never_validate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let entry = HubTreeEntry::new(4, "opaque")?;
+        for chunks in [
+            VecDeque::from([Ok(Box::<[u8]>::from(&b"abc"[..]))]),
+            VecDeque::from([Ok(Box::<[u8]>::from(&b"abcde"[..]))]),
+            VecDeque::from([Err(TransportError::body())]),
+        ] {
+            let mut body = MemoryBody(chunks);
+            let mut sink = MemorySink::default();
+            run_ready(stream_validated_body(&mut body, &mut sink, &entry))
+                .expect_err("accepted an invalid stream");
+        }
+        let mut body = MemoryBody(VecDeque::from([Ok(Box::<[u8]>::from(&b"abcd"[..]))]));
+        let mut sink = MemorySink {
+            fail_write: true,
+            ..MemorySink::default()
+        };
+        assert!(
+            run_ready(stream_validated_body(&mut body, &mut sink, &entry))
+                .expect_err("accepted a sink failure")
+                .is_cache()
+        );
+        Ok(())
+    }
+
+    fn run_ready<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("future unexpectedly remained pending"),
+        }
     }
 }
