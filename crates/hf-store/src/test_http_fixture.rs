@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{self, Debug, Formatter};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -330,7 +330,11 @@ fn write_response(stream: &mut TcpStream, response: &ScriptedResponse) -> io::Re
         .unwrap_or(response.body.len())
         .min(response.body.len());
     stream.write_all(&response.body[..visible])?;
-    stream.flush()
+    stream.flush()?;
+    if response.disconnect_after.is_some() {
+        stream.shutdown(Shutdown::Write)?;
+    }
+    Ok(())
 }
 
 fn record_failure(failure: &Mutex<Option<Box<str>>>, message: impl Into<Box<str>>) {
