@@ -461,6 +461,17 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "network")]
+    #[derive(Debug)]
+    struct CancelOnProgress(CancellationToken);
+
+    #[cfg(feature = "network")]
+    impl ProgressObserver for CancelOnProgress {
+        fn observe(&self, _event: &crate::ProgressEvent) {
+            self.0.cancel();
+        }
+    }
+
     #[test]
     fn cache_streaming_publishes_only_a_complete_validated_blob() -> Result<(), Box<dyn Error>> {
         let (_directory, kernel) = kernel()?;
@@ -958,6 +969,64 @@ mod tests {
         let observed = fixture.finish();
         let error = result.expect_err("accepted a changed opaque validator");
         assert!(error.is_validation());
+        assert!(!kernel.partial_data_path(&commit, &path)?.try_exists()?);
+        assert_eq!(observed?.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn fixture_transfer_cancellation_never_publishes_complete_or_partial_bytes()
+    -> Result<(), Box<dyn Error>> {
+        use crate::hub_protocol::HubProtocol;
+        use crate::reqwest_transport::ReqwestTransport;
+        use crate::test_http_fixture::{Exchange, ExpectedRequest, ScriptedHub, ScriptedResponse};
+
+        let bytes = b"cancel this response";
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let path = RepoPath::parse("cancel.bin")?;
+        let request_path = format!("/org/repo/resolve/{}/cancel.bin", commit.as_str());
+        let fixture = ScriptedHub::start([Exchange::new(
+            ExpectedRequest::get(&request_path),
+            ScriptedResponse::new(200, bytes.as_slice()).header("etag", "stable-etag"),
+        )])?;
+        let protocol = HubProtocol::new(
+            Endpoint::parse(fixture.endpoint())?,
+            Arc::new(ReqwestTransport::build()?),
+        )?;
+        let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let digest = BlobDigest::for_bytes(bytes);
+        let entry = HubTreeEntry::new(bytes.len() as u64, "pointer")?
+            .with_lfs(digest.to_string(), bytes.len() as u64)?;
+        let (_directory, kernel) = kernel()?;
+        let cancellation = CancellationToken::new();
+        let progress_listener = CancelOnProgress(cancellation.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(async {
+            let mut response = protocol
+                .request_file(&repository, &commit, &path, None, None)
+                .await?;
+            kernel
+                .consume_file_response(
+                    &mut response,
+                    &commit,
+                    &path,
+                    &entry,
+                    None,
+                    &cancellation,
+                    &progress_listener,
+                )
+                .await
+        });
+        let observed = fixture.finish();
+        assert!(
+            result
+                .expect_err("published after cancellation")
+                .is_cancelled()
+        );
+        assert!(!kernel.blob_path(&digest).try_exists()?);
         assert!(!kernel.partial_data_path(&commit, &path)?.try_exists()?);
         assert_eq!(observed?.len(), 1);
         Ok(())
