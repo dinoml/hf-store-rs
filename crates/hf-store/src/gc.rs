@@ -111,11 +111,62 @@ pub enum GcCandidateKind {
     Blob,
 }
 
+/// Stable reason why an object is eligible in a version-one plan.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum GcCandidateReason {
+    /// A resumable partial exceeded its explicit grace period.
+    ExpiredPartial,
+    /// An immutable snapshot is detached and exceeded its retention grace.
+    DetachedSnapshot,
+    /// A validated owned blob has no edge from a retained snapshot.
+    UnreachableBlob,
+}
+
+/// Stable blocker preventing a stronger garbage-collection action.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum GcBlockerKind {
+    /// Python-visible compatible-cache state requires an external quiescence guarantee.
+    CompatibleMaintenanceRequired,
+}
+
+/// One safe, machine-readable blocker in an immutable plan.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GcBlocker {
+    kind: GcBlockerKind,
+    subject: Box<str>,
+}
+
+impl GcBlocker {
+    fn compatible_maintenance() -> Self {
+        Self {
+            kind: GcBlockerKind::CompatibleMaintenanceRequired,
+            subject: "python-visible-cache-state".into(),
+        }
+    }
+
+    /// Returns the stable blocker classification.
+    #[must_use]
+    pub const fn kind(&self) -> GcBlockerKind {
+        self.kind
+    }
+
+    /// Returns the safe logical scope affected by the blocker.
+    #[must_use]
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+}
+
 /// One immutable candidate observation in a [`GcPlan`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GcCandidate {
     id: Box<str>,
     kind: GcCandidateKind,
+    reason: GcCandidateReason,
     logical_bytes: u64,
     updated_unix_millis: u64,
     commit: Option<Box<str>>,
@@ -135,6 +186,12 @@ impl GcCandidate {
     #[must_use]
     pub const fn kind(&self) -> GcCandidateKind {
         self.kind
+    }
+
+    /// Returns the stable eligibility reason.
+    #[must_use]
+    pub const fn reason(&self) -> GcCandidateReason {
+        self.reason
     }
 
     /// Returns the estimated logical bytes.
@@ -169,6 +226,9 @@ impl GcCandidate {
             BlobDigest::parse(&self.fingerprint_sha256).map_err(HubError::validation)?;
         match self.kind {
             GcCandidateKind::PartialTransfer => {
+                if self.reason != GcCandidateReason::ExpiredPartial {
+                    return Err(HubError::protocol());
+                }
                 let commit = parse_commit(self.commit.as_deref())?;
                 let path = self
                     .repository_path
@@ -190,6 +250,9 @@ impl GcCandidate {
                 ))
             }
             GcCandidateKind::Snapshot => {
+                if self.reason != GcCandidateReason::DetachedSnapshot {
+                    return Err(HubError::protocol());
+                }
                 if self.repository_path.is_some() {
                     return Err(HubError::protocol());
                 }
@@ -205,6 +268,9 @@ impl GcCandidate {
                 )
             }
             GcCandidateKind::Blob => {
+                if self.reason != GcCandidateReason::UnreachableBlob {
+                    return Err(HubError::protocol());
+                }
                 if self.commit.is_some()
                     || self.selection_id.is_some()
                     || self.repository_path.is_some()
@@ -231,6 +297,11 @@ impl From<&GcObservation> for GcCandidate {
                 GcObservation::Snapshot(_) => GcCandidateKind::Snapshot,
                 GcObservation::Blob(_) => GcCandidateKind::Blob,
             },
+            reason: match candidate {
+                GcObservation::Partial(_) => GcCandidateReason::ExpiredPartial,
+                GcObservation::Snapshot(_) => GcCandidateReason::DetachedSnapshot,
+                GcObservation::Blob(_) => GcCandidateReason::UnreachableBlob,
+            },
             logical_bytes: candidate.size(),
             updated_unix_millis: candidate.updated_unix_millis(),
             commit: candidate.commit().map(|value| value.as_str().into()),
@@ -253,6 +324,7 @@ pub struct GcPlan {
     planned_unix_millis: u64,
     policy: GcPolicy,
     compatible_deletion_blocked: bool,
+    blockers: Box<[GcBlocker]>,
     candidates: Box<[GcCandidate]>,
 }
 
@@ -279,6 +351,11 @@ impl GcPlan {
             planned_unix_millis,
             policy,
             compatible_deletion_blocked: cache_mode == CacheMode::Compatible,
+            blockers: if cache_mode == CacheMode::Compatible {
+                vec![GcBlocker::compatible_maintenance()].into_boxed_slice()
+            } else {
+                Box::new([])
+            },
             candidates: candidates.into_boxed_slice(),
         };
         plan.plan_id = plan.computed_id()?;
@@ -340,6 +417,12 @@ impl GcPlan {
         self.compatible_deletion_blocked
     }
 
+    /// Returns deterministic blockers discovered while building the plan.
+    #[must_use]
+    pub fn blockers(&self) -> &[GcBlocker] {
+        &self.blockers
+    }
+
     /// Returns the cache view to which the plan is bound.
     #[must_use]
     pub const fn cache_mode(&self) -> CacheMode {
@@ -363,6 +446,7 @@ impl GcPlan {
             || self.version != PLAN_VERSION
             || !is_sha256(&self.plan_id)
             || self.compatible_deletion_blocked != (self.cache_mode == CacheMode::Compatible)
+            || !valid_blockers(self.cache_mode, &self.blockers)
             || Endpoint::parse(&self.endpoint)
                 .map_err(HubError::validation)?
                 .as_str()
@@ -395,6 +479,7 @@ impl GcPlan {
             self.planned_unix_millis,
             &self.policy,
             self.compatible_deletion_blocked,
+            &self.blockers,
             &self.candidates,
         ))
         .map_err(|_error| HubError::protocol())?;
@@ -444,6 +529,18 @@ impl GcExecutionReport {
         &self.plan_id
     }
 
+    /// Returns the report schema name.
+    #[must_use]
+    pub const fn schema(&self) -> &str {
+        self.schema
+    }
+
+    /// Returns the report schema version.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
     /// Returns removed candidate identities.
     #[must_use]
     pub fn removed(&self) -> &[Box<str>] {
@@ -478,6 +575,19 @@ fn is_sha256(value: &str) -> bool {
 
 fn candidate_key(candidate: &GcCandidate) -> (GcCandidateKind, &str) {
     (candidate.kind, candidate.id())
+}
+
+fn valid_blockers(cache_mode: CacheMode, blockers: &[GcBlocker]) -> bool {
+    match cache_mode {
+        CacheMode::Owned => blockers.is_empty(),
+        CacheMode::Compatible => {
+            blockers
+                == [GcBlocker {
+                    kind: GcBlockerKind::CompatibleMaintenanceRequired,
+                    subject: "python-visible-cache-state".into(),
+                }]
+        }
+    }
 }
 
 fn validate_policy(policy: &GcPolicy) -> Result<(), HubError> {
@@ -525,6 +635,25 @@ mod tests {
         altered["candidates"][0]["logical_bytes"] = 43.into();
         let _error = GcPlan::from_json(&serde_json::to_vec(&altered)?)
             .expect_err("altered plan must fail its identity check");
+
+        let compatible = GcPlan::new(
+            CacheMode::Compatible,
+            &Endpoint::hugging_face(),
+            &repository,
+            200,
+            GcPolicy::report_only(),
+            &[],
+        )?;
+        assert!(compatible.compatible_deletion_blocked());
+        assert_eq!(compatible.blockers().len(), 1);
+        assert_eq!(
+            compatible.blockers()[0].kind(),
+            GcBlockerKind::CompatibleMaintenanceRequired
+        );
+        assert_eq!(
+            compatible.blockers()[0].subject(),
+            "python-visible-cache-state"
+        );
         Ok(())
     }
 }

@@ -1,18 +1,16 @@
 //! Rust-native storage primitives for Hugging Face Hub repositories.
 //!
-//! This pre-alpha crate exposes validated repository identity, online Hub
+//! This crate exposes validated repository identity, online Hub
 //! acquisition, Python-compatible and owned cache views, transport-free offline
-//! lookup, and independent `local_dir` materialization. Public API stability is
-//! not yet guaranteed.
+//! lookup, and independent `local_dir` materialization.
 //!
 //! # Examples
 //!
-//! ```
-
 #![allow(
     clippy::multiple_crate_versions,
     reason = "the Rustls/Reqwest graph and cache primitives currently require parallel transitive versions"
 )]
+//! ```
 //! use hf_store::RepositoryKind;
 //!
 //! assert_eq!(RepositoryKind::Model.to_string(), "model");
@@ -82,7 +80,10 @@ pub use error::HubOperationError as HubError;
 #[doc(inline)]
 pub use fetch_plan::{FetchPlan, PlannedFile};
 #[doc(inline)]
-pub use gc::{GcCandidate, GcCandidateKind, GcExecutionReport, GcPlan, GcPolicy};
+pub use gc::{
+    GcBlocker, GcBlockerKind, GcCandidate, GcCandidateKind, GcCandidateReason, GcExecutionReport,
+    GcPlan, GcPolicy,
+};
 #[doc(inline)]
 pub use progress::{ProgressEvent, ProgressObserver, ProgressPhase, ReuseDecision};
 #[doc(inline)]

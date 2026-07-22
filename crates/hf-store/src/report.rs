@@ -420,6 +420,18 @@ impl VerificationReport {
         }
     }
 
+    /// Returns the report schema name.
+    #[must_use]
+    pub const fn schema(&self) -> &str {
+        self.schema
+    }
+
+    /// Returns the report schema version.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
     /// Returns whether every required record and file validated.
     #[must_use]
     pub const fn is_valid(&self) -> bool {
