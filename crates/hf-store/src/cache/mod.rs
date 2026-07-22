@@ -7,6 +7,7 @@ mod key;
 mod layout;
 mod local_dir_bookkeeping;
 mod local_dir_layout;
+mod local_dir_materialization;
 mod metadata;
 mod publication;
 #[cfg(test)]

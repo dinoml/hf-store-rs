@@ -346,6 +346,10 @@ impl Effects {
         let operation_id = self.operation_ids.next()?;
         StagingName::new(&operation_id.to_string())
     }
+
+    pub(super) fn check_publication_fault(&self, point: PublicationPoint) -> io::Result<()> {
+        self.faults.check(point)
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -54,13 +54,19 @@ help diagnostics explain which case was observed, but it never grants implicit
 permission to discard current bytes. Conflict errors and debug output do not
 include file content or untrusted metadata values.
 
-User-visible repository files are always independent copies. v0.1 does not use
-symlinks, hard links, or reflinks for `local_dir`, even when the source is an
-immutable shared blob. Each replacement is staged on the destination volume,
-written and hashed while copying, flushed, checked against the expected size
-and known remote digest, and atomically installed. A validated existing file is
-rechecked after the materialization lock is acquired before it is reused or
-replaced.
+User-visible repository files are always independent copies. v0.1 never uses a
+symlink, hard link, or reflink from cache or source content into `local_dir`,
+even when the source is an immutable shared blob. A missing-path create-once
+install may transiently hard-link the already independent destination-volume
+staging file to its final name before unlinking the staging name. This is an
+atomic no-clobber installation detail, not sharing with a cache blob. If the
+filesystem reports that operation as unsupported, materialization fails instead
+of falling back to a visible partial file or a racy overwrite. Each replacement
+is staged
+on the destination volume, written and hashed while copying, flushed, checked
+against the expected size and known remote digest, and atomically installed. A
+validated existing file is rechecked after the materialization lock is acquired
+before it is reused or replaced.
 
 Cooperating materializers serialize the entire reconciliation with an
 operating-system advisory lock in `.cache/hf-store/hf-store-v1`. The lock is

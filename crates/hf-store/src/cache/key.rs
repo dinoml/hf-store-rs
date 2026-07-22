@@ -222,7 +222,7 @@ fn validate_materialization_collisions(paths: &[&str]) -> Result<(), ValidationE
     Ok(())
 }
 
-fn portable_path_key(path: &str) -> String {
+pub(super) fn portable_path_key(path: &str) -> String {
     let normalized = path.nfc().collect::<String>();
     normalized.as_str().case_fold().nfc().collect()
 }
