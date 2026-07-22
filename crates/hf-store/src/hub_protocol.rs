@@ -3,11 +3,15 @@ use std::sync::Arc;
 use serde::Deserialize;
 use url::Url;
 
+use crate::cache::{HubTree, HubTreeEntry};
 use crate::error::HubOperationError;
 use crate::transport::{RedirectFollower, Transport, TransportMethod, TransportRequest};
 use crate::{AuthToken, CommitId, Endpoint, RepositoryKind, RepositorySpec, Revision};
 
 const MAX_INFO_BODY_BYTES: usize = 1024 * 1024;
+const MAX_TREE_PAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TREE_PAGES: usize = 1024;
+const MAX_TREE_FILES: usize = 1_000_000;
 
 #[derive(Debug)]
 pub(crate) struct HubProtocol {
@@ -58,11 +62,160 @@ impl HubProtocol {
             serde_json::from_slice(&body).map_err(|_source| HubOperationError::protocol())?;
         CommitId::parse(info.sha).map_err(HubOperationError::validation)
     }
+
+    pub(crate) async fn retrieve_tree(
+        &self,
+        repository: &RepositorySpec,
+        commit: &CommitId,
+        authorization: Option<&AuthToken>,
+    ) -> Result<HubTree, HubOperationError> {
+        let mut target = repository_api_url(&self.endpoint, repository, "tree", commit.as_str())?;
+        target
+            .query_pairs_mut()
+            .append_pair("recursive", "true")
+            .append_pair("expand", "true");
+        let endpoint =
+            Url::parse(self.endpoint.as_str()).map_err(|_source| HubOperationError::protocol())?;
+        let mut visited = std::collections::BTreeSet::new();
+        let mut files = Vec::new();
+
+        for _page in 0..MAX_TREE_PAGES {
+            if !visited.insert(target.as_str().to_owned()) || !same_origin(&target, &endpoint) {
+                return Err(HubOperationError::protocol());
+            }
+            let mut request = TransportRequest::new(TransportMethod::Get, target.clone())
+                .map_err(HubOperationError::transport)?;
+            if let Some(token) = authorization {
+                request = request.with_authorization(token.clone());
+            }
+            let mut response = self
+                .redirects
+                .send(request)
+                .await
+                .map_err(HubOperationError::transport)?;
+            if let Some(error) = HubOperationError::from_status(response.status(), None) {
+                return Err(error);
+            }
+            let next = response
+                .headers()
+                .get("link")
+                .map(|value| parse_next_link(&target, value))
+                .transpose()?
+                .flatten();
+            let body = collect_bounded_body(&mut response, MAX_TREE_PAGE_BODY_BYTES).await?;
+            let entries: Vec<RawTreeEntry> =
+                serde_json::from_slice(&body).map_err(|_source| HubOperationError::protocol())?;
+            for raw in entries {
+                if let Some(file) = raw.into_file()? {
+                    files.push(file);
+                    if files.len() > MAX_TREE_FILES {
+                        return Err(HubOperationError::protocol());
+                    }
+                }
+            }
+            match next {
+                Some(next) => target = next,
+                None => {
+                    return HubTree::new(files).map_err(|_source| tree_validation_error());
+                }
+            }
+        }
+        Err(HubOperationError::protocol())
+    }
 }
 
 #[derive(Deserialize)]
 struct RepositoryInfo {
     sha: Box<str>,
+}
+
+#[derive(Deserialize)]
+struct RawTreeEntry {
+    #[serde(rename = "type")]
+    kind: Box<str>,
+    path: Box<str>,
+    oid: Box<str>,
+    size: Option<u64>,
+    lfs: Option<RawLfs>,
+    #[serde(rename = "xetHash")]
+    xet_hash: Option<Box<str>>,
+}
+
+#[derive(Deserialize)]
+struct RawLfs {
+    oid: Box<str>,
+    size: u64,
+}
+
+impl RawTreeEntry {
+    fn into_file(self) -> Result<Option<(crate::RepoPath, HubTreeEntry)>, HubOperationError> {
+        match self.kind.as_ref() {
+            "directory" => Ok(None),
+            "file" => {
+                let path =
+                    crate::RepoPath::parse(self.path).map_err(HubOperationError::validation)?;
+                let size = self.size.ok_or_else(HubOperationError::protocol)?;
+                let mut entry =
+                    HubTreeEntry::new(size, self.oid).map_err(|_source| tree_validation_error())?;
+                if let Some(lfs) = self.lfs {
+                    if lfs.size != size {
+                        return Err(tree_validation_error());
+                    }
+                    entry = entry
+                        .with_lfs(lfs.oid, lfs.size)
+                        .map_err(|_source| tree_validation_error())?;
+                }
+                if let Some(hash) = self.xet_hash {
+                    entry = entry
+                        .with_xet(hash)
+                        .map_err(|_source| tree_validation_error())?;
+                }
+                Ok(Some((path, entry)))
+            }
+            _ => Err(HubOperationError::protocol()),
+        }
+    }
+}
+
+fn tree_validation_error() -> HubOperationError {
+    HubOperationError::validation(crate::ValidationError::new(
+        "Hub repository tree",
+        crate::validation::ValidationErrorKind::Malformed,
+    ))
+}
+
+fn parse_next_link(base: &Url, value: &str) -> Result<Option<Url>, HubOperationError> {
+    let mut next = None;
+    for item in value.split(',') {
+        let Some((target, parameters)) = item.trim().split_once('>') else {
+            return Err(HubOperationError::protocol());
+        };
+        let Some(target) = target.strip_prefix('<') else {
+            return Err(HubOperationError::protocol());
+        };
+        let is_next = parameters.split(';').any(|parameter| {
+            parameter
+                .trim()
+                .strip_prefix("rel=")
+                .is_some_and(|relation| relation.trim_matches('"') == "next")
+        });
+        if is_next {
+            if next.is_some() {
+                return Err(HubOperationError::protocol());
+            }
+            next = Some(
+                base.join(target)
+                    .map_err(|_source| HubOperationError::protocol())?,
+            );
+        }
+    }
+    Ok(next)
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 async fn collect_bounded_body(
@@ -257,6 +410,88 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn paginated_tree_is_commit_bound_complete_and_validated() -> Result<(), Box<dyn Error>> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let first = response_with_headers(
+            200,
+            br#"[
+                {"type":"directory","path":"weights","oid":"tree-id"},
+                {"type":"file","path":"weights/model.bin","oid":"pointer-id","size":5,
+                 "lfs":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":5,"pointerSize":130}}
+            ]"#,
+            [("link", "</api/models/owner/repo/tree/0123456789abcdef0123456789abcdef01234567?cursor=last>; rel=\"next\"")],
+        )?;
+        let second = response_with_headers(
+            200,
+            br#"[{"type":"file","path":"config.json","oid":"git-id","size":2,"xetHash":"xet-id"}]"#,
+            [],
+        )?;
+        let protocol = protocol_with_responses([first, second], Arc::clone(&requests))?;
+        let tree =
+            run_ready(protocol.retrieve_tree(&repository()?, &CommitId::parse(COMMIT)?, None))?;
+
+        assert_eq!(
+            tree.files()
+                .keys()
+                .map(crate::RepoPath::as_str)
+                .collect::<Vec<_>>(),
+            ["config.json", "weights/model.bin"]
+        );
+        let model = tree
+            .files()
+            .get(&crate::RepoPath::parse("weights/model.bin")?)
+            .ok_or("model entry missing")?;
+        assert_eq!(model.size(), 5);
+        assert_eq!(
+            model.lfs_sha256(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let requests = requests
+            .lock()
+            .map_err(|_poisoned| "request lock poisoned")?;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.ends_with(&format!(
+            "/api/models/owner/repo/tree/{COMMIT}?recursive=true&expand=true"
+        )));
+        assert!(
+            requests[1]
+                .0
+                .ends_with(&format!("/api/models/owner/repo/tree/{COMMIT}?cursor=last"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_rejects_duplicate_unsafe_and_untrusted_pagination() -> Result<(), Box<dyn Error>> {
+        for body in [
+            br#"[{"type":"file","path":"same","oid":"a","size":1},{"type":"file","path":"same","oid":"b","size":1}]"#.as_slice(),
+            br#"[{"type":"file","path":"../escape","oid":"a","size":1}]"#.as_slice(),
+            br#"[{"type":"file","path":"mismatch","oid":"a","size":2,"lfs":{"oid":"sha","size":1}}]"#.as_slice(),
+        ] {
+            let protocol = protocol_with_response(response(200, [body])?)?;
+            let error = run_ready(protocol.retrieve_tree(
+                &repository()?,
+                &CommitId::parse(COMMIT)?,
+                None,
+            ))
+            .expect_err("accepted malformed tree");
+            assert!(error.is_validation());
+        }
+
+        let protocol = protocol_with_response(response_with_headers(
+            200,
+            b"[]",
+            [("link", "<https://evil.example/tree?secret=value>; rel=next")],
+        )?)?;
+        assert!(
+            run_ready(protocol.retrieve_tree(&repository()?, &CommitId::parse(COMMIT)?, None,))
+                .expect_err("followed untrusted pagination")
+                .is_protocol()
+        );
+        Ok(())
+    }
+
     fn repository() -> Result<RepositorySpec, crate::ValidationError> {
         Ok(RepositorySpec::model(RepositoryId::parse("owner/repo")?))
     }
@@ -279,12 +514,31 @@ mod tests {
     fn protocol_with_response(
         response: TransportResponse,
     ) -> Result<HubProtocol, HubOperationError> {
+        protocol_with_responses([response], Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn protocol_with_responses(
+        responses: impl IntoIterator<Item = TransportResponse>,
+        requests: Arc<Mutex<Vec<(String, bool)>>>,
+    ) -> Result<HubProtocol, HubOperationError> {
         HubProtocol::new(
             Endpoint::parse("https://hub.example").map_err(HubOperationError::validation)?,
             Arc::new(ScriptedTransport {
-                responses: Mutex::new(VecDeque::from([response])),
-                requests: Arc::new(Mutex::new(Vec::new())),
+                responses: Mutex::new(responses.into_iter().collect()),
+                requests,
             }),
+        )
+    }
+
+    fn response_with_headers<'a>(
+        status: u16,
+        body: &'a [u8],
+        headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<TransportResponse, TransportError> {
+        TransportResponse::new(
+            status,
+            TransportHeaders::new(headers)?,
+            Box::new(MemoryBody(VecDeque::from([Box::<[u8]>::from(body)]))),
         )
     }
 

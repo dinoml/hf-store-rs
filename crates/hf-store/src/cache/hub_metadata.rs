@@ -29,12 +29,12 @@ pub(super) fn encode_ref(commit: &CommitId) -> Vec<u8> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct HubTree {
+pub(crate) struct HubTree {
     files: BTreeMap<RepoPath, HubTreeEntry>,
 }
 
 impl HubTree {
-    pub(super) fn new(
+    pub(crate) fn new(
         entries: impl IntoIterator<Item = (RepoPath, HubTreeEntry)>,
     ) -> Result<Self, HubMetadataError> {
         let mut files = BTreeMap::new();
@@ -49,7 +49,7 @@ impl HubTree {
         Ok(tree)
     }
 
-    pub(super) fn files(&self) -> &BTreeMap<RepoPath, HubTreeEntry> {
+    pub(crate) fn files(&self) -> &BTreeMap<RepoPath, HubTreeEntry> {
         &self.files
     }
 
@@ -74,7 +74,7 @@ impl HubTree {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(super) struct HubTreeEntry {
+pub(crate) struct HubTreeEntry {
     size: u64,
     blob_id: Box<str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,7 +86,7 @@ pub(super) struct HubTreeEntry {
 }
 
 impl HubTreeEntry {
-    pub(super) fn new(size: u64, blob_id: impl AsRef<str>) -> Result<Self, HubMetadataError> {
+    pub(crate) fn new(size: u64, blob_id: impl AsRef<str>) -> Result<Self, HubMetadataError> {
         Ok(Self {
             size,
             blob_id: validate_opaque(blob_id.as_ref().to_owned(), "Hub tree blob identifier")?,
@@ -96,7 +96,7 @@ impl HubTreeEntry {
         })
     }
 
-    pub(super) fn with_lfs(
+    pub(crate) fn with_lfs(
         mut self,
         sha256: impl AsRef<str>,
         size: u64,
@@ -109,7 +109,7 @@ impl HubTreeEntry {
         Ok(self)
     }
 
-    pub(super) fn with_xet(mut self, hash: impl AsRef<str>) -> Result<Self, HubMetadataError> {
+    pub(crate) fn with_xet(mut self, hash: impl AsRef<str>) -> Result<Self, HubMetadataError> {
         self.xet_hash = Some(validate_opaque(
             hash.as_ref().to_owned(),
             "Hub tree Xet identifier",
@@ -117,23 +117,23 @@ impl HubTreeEntry {
         Ok(self)
     }
 
-    pub(super) const fn size(&self) -> u64 {
+    pub(crate) const fn size(&self) -> u64 {
         self.size
     }
 
-    pub(super) fn blob_id(&self) -> &str {
+    pub(crate) fn blob_id(&self) -> &str {
         &self.blob_id
     }
 
-    pub(super) fn lfs_sha256(&self) -> Option<&str> {
+    pub(crate) fn lfs_sha256(&self) -> Option<&str> {
         self.lfs_sha256.as_deref()
     }
 
-    pub(super) const fn lfs_size(&self) -> Option<u64> {
+    pub(crate) const fn lfs_size(&self) -> Option<u64> {
         self.lfs_size
     }
 
-    pub(super) fn xet_hash(&self) -> Option<&str> {
+    pub(crate) fn xet_hash(&self) -> Option<&str> {
         self.xet_hash.as_deref()
     }
 
@@ -387,7 +387,7 @@ fn validate_opaque_ref(value: &str, subject: &'static str) -> Result<(), HubMeta
 }
 
 #[derive(Debug)]
-pub(super) struct HubMetadataError {
+pub(crate) struct HubMetadataError {
     kind: HubMetadataErrorKind,
     backtrace: Backtrace,
 }
