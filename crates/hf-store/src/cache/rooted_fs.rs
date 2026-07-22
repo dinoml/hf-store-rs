@@ -179,6 +179,12 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         ))
     }
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn read_link(&self, _path: &Path) -> io::Result<PathBuf> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "symbolic-link reading is unsupported by this filesystem adapter",
+        ))
+    }
     fn remove_dir(&self, _path: &Path) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -637,6 +643,11 @@ impl RootedFileSystem for CacheRoot {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let (parent, name) = self.open_parent_and_name(path, false)?;
         parent.remove_file(name)
+    }
+
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+        let (parent, name) = self.open_parent_and_name(path, false)?;
+        parent.read_link_contents(name)
     }
 
     fn remove_dir(&self, path: &Path) -> io::Result<()> {

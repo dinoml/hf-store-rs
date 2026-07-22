@@ -4,7 +4,9 @@ pub(crate) use acquisition::AcquiredSnapshotFileForm;
 #[cfg(feature = "network")]
 pub(crate) use acquisition::AcquisitionCache;
 pub(crate) use acquisition::{AcquiredSnapshot, AcquiredSnapshotFile, OfflineCache};
-pub(crate) use acquisition::{InventoryRecord, InventoryRecordKind, InventoryRecordMetadata};
+pub(crate) use acquisition::{
+    InventoryRecord, InventoryRecordKind, InventoryRecordMetadata, InventoryRecordSemantic,
+};
 pub(crate) use acquisition::{MaterializedLocalDir, MaterializedLocalDirFile};
 pub(crate) use publication::{GcObservation, PartialGcCandidate};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

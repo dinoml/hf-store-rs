@@ -110,7 +110,16 @@ impl CompatibleCacheOffline {
     pub(super) fn inventory_entries(
         &self,
     ) -> Result<Vec<super::publication::CacheInventoryEntry>, CompatibleCacheError> {
-        self.sidecar.inventory_entries().map_err(Into::into)
+        let mut entries = self.sidecar.inventory_entries()?;
+        for entry in &mut entries {
+            entry.semantic = super::publication::CacheInventorySemantic::SidecarOnly;
+        }
+        entries.extend(self.sidecar.compatible_inventory_entries(
+            self.reader.layout().repository_relative(),
+            &self.reader.layout().staging_directory(),
+        )?);
+        entries.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(entries)
     }
     pub(super) fn from_parts(reader: HubCacheReader, sidecar: CacheKernel) -> Self {
         Self { reader, sidecar }
@@ -748,6 +757,35 @@ mod tests {
             );
             assert!(!file.hub_blob_key().as_str().is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_explains_python_visible_copies_and_private_sidecars() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = Fixture::new()?;
+        let requested = [
+            RepoPath::parse("config.json")?,
+            RepoPath::parse("weights/model.bin")?,
+        ];
+        let _snapshot = fixture
+            .importer()?
+            .import(&Revision::parse("main")?, &requested)?;
+        let entries = fixture.offline()?.inventory_entries()?;
+        assert!(entries.iter().any(|entry| {
+            entry.relative_path.contains("snapshots/")
+                && entry.semantic
+                    == crate::cache::publication::CacheInventorySemantic::CopiedWithBlob
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.relative_path.contains(".hf-store/")
+                && entry.semantic == crate::cache::publication::CacheInventorySemantic::SidecarOnly
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.relative_path.contains("refs/main")
+                && entry.metadata_state
+                    == crate::cache::publication::CacheInventoryMetadataState::Recognized
+        }));
         Ok(())
     }
 

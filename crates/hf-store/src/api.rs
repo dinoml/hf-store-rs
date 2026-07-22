@@ -589,8 +589,8 @@ impl OfflineStore {
         paths: &[RepoPath],
     ) -> InspectionReport {
         match self.open(repository, revision, paths) {
-            Ok(snapshot) => InspectionReport::complete(self.cache_mode, &snapshot),
-            Err(error) => InspectionReport::failed(self.cache_mode, &error),
+            Ok(snapshot) => InspectionReport::complete(self.cache_mode, revision, paths, &snapshot),
+            Err(error) => InspectionReport::failed(self.cache_mode, revision, paths, &error),
         }
     }
 
@@ -983,6 +983,15 @@ mod tests {
             entry.path().contains("manifest.json")
                 && entry.state() == crate::InventoryState::Corrupt
         }));
+        let verification = offline.verify(
+            first.repository(),
+            &Revision::parse("main")?,
+            std::slice::from_ref(&path),
+        );
+        assert!(!verification.is_valid());
+        assert_eq!(verification.findings().len(), 1);
+        assert_eq!(verification.findings()[0].revision(), "main");
+        assert_eq!(verification.findings()[0].paths()[0].as_ref(), "model.bin");
         assert_eq!(fixture.finish()?.len(), 5);
         Ok(())
     }

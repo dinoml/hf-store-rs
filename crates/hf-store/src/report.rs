@@ -21,6 +21,14 @@ pub enum InventoryState {
     Corrupt,
     /// Recognized metadata uses an unsupported version.
     UnsupportedVersion,
+    /// Private hf-store metadata without an independently complete upstream snapshot.
+    SidecarOnly,
+    /// A regular snapshot file with no retained physical blob.
+    SnapshotOnly,
+    /// A regular snapshot copy whose identical retained blob was found.
+    CopiedWithBlob,
+    /// A contained relative snapshot symlink to a regular physical blob.
+    RelativeSymlink,
 }
 
 /// One cache-relative entry in a repository inventory.
@@ -71,6 +79,15 @@ impl CacheInventoryReport {
                     InventoryState::UnsupportedVersion
                 } else if record.metadata == crate::cache::InventoryRecordMetadata::Corrupt {
                     InventoryState::Corrupt
+                } else if record.semantic == crate::cache::InventoryRecordSemantic::SidecarOnly {
+                    InventoryState::SidecarOnly
+                } else if record.semantic == crate::cache::InventoryRecordSemantic::SnapshotOnly {
+                    InventoryState::SnapshotOnly
+                } else if record.semantic == crate::cache::InventoryRecordSemantic::CopiedWithBlob {
+                    InventoryState::CopiedWithBlob
+                } else if record.semantic == crate::cache::InventoryRecordSemantic::RelativeSymlink
+                {
+                    InventoryState::RelativeSymlink
                 } else {
                     match record.namespace.as_ref() {
                         "staging" => InventoryState::Staging,
@@ -98,6 +115,24 @@ impl CacheInventoryReport {
     #[must_use]
     pub fn entries(&self) -> &[InventoryEntry] {
         &self.entries
+    }
+
+    /// Returns the report schema name.
+    #[must_use]
+    pub const fn schema(&self) -> &str {
+        self.schema
+    }
+
+    /// Returns the report schema version.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Returns the inventoried cache view.
+    #[must_use]
+    pub const fn cache_mode(&self) -> CacheMode {
+        self.cache_mode
     }
 }
 
@@ -129,11 +164,40 @@ pub struct InspectionReport {
     state: InspectionState,
     commit: Option<Box<str>>,
     selection_id: Option<Box<str>>,
+    requested_revision: Box<str>,
+    requested_paths: Box<[Box<str>]>,
+    finding: Option<InspectionFinding>,
     files: Box<[InspectedFile]>,
 }
 
+/// Exact safe evidence for an unsuccessful selection inspection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InspectionFinding {
+    state: InspectionState,
+    subject: &'static str,
+}
+
+impl InspectionFinding {
+    /// Returns the classified observed state.
+    #[must_use]
+    pub const fn state(&self) -> InspectionState {
+        self.state
+    }
+
+    /// Returns the stable logical cache subject that failed validation.
+    #[must_use]
+    pub const fn subject(&self) -> &str {
+        self.subject
+    }
+}
+
 impl InspectionReport {
-    pub(crate) fn complete(cache_mode: CacheMode, snapshot: &Snapshot) -> Self {
+    pub(crate) fn complete(
+        cache_mode: CacheMode,
+        revision: &crate::Revision,
+        paths: &[crate::RepoPath],
+        snapshot: &Snapshot,
+    ) -> Self {
         Self {
             schema: "hf-store.inspection",
             version: 1,
@@ -141,11 +205,19 @@ impl InspectionReport {
             state: InspectionState::Complete,
             commit: Some(snapshot.commit().as_str().into()),
             selection_id: Some(snapshot.selection_id().to_string().into()),
+            requested_revision: revision.as_str().into(),
+            requested_paths: canonical_paths(paths),
+            finding: None,
             files: snapshot.files().iter().map(InspectedFile::from).collect(),
         }
     }
 
-    pub(crate) fn failed(cache_mode: CacheMode, error: &HubError) -> Self {
+    pub(crate) fn failed(
+        cache_mode: CacheMode,
+        revision: &crate::Revision,
+        paths: &[crate::RepoPath],
+        error: &HubError,
+    ) -> Self {
         let state = if error.is_cache_incomplete() {
             InspectionState::Incomplete
         } else if error.is_cache_corrupt() || error.is_validation() {
@@ -164,6 +236,12 @@ impl InspectionReport {
             state,
             commit: None,
             selection_id: None,
+            requested_revision: revision.as_str().into(),
+            requested_paths: canonical_paths(paths),
+            finding: Some(InspectionFinding {
+                state,
+                subject: inspection_subject(state),
+            }),
             files: Box::new([]),
         }
     }
@@ -202,6 +280,24 @@ impl InspectionReport {
     #[must_use]
     pub fn selection_id(&self) -> Option<&str> {
         self.selection_id.as_deref()
+    }
+
+    /// Returns the exact requested revision spelling.
+    #[must_use]
+    pub fn requested_revision(&self) -> &str {
+        &self.requested_revision
+    }
+
+    /// Returns requested repository paths in canonical order.
+    #[must_use]
+    pub fn requested_paths(&self) -> &[Box<str>] {
+        &self.requested_paths
+    }
+
+    /// Returns safe failure evidence when the selection was not complete.
+    #[must_use]
+    pub const fn finding(&self) -> Option<&InspectionFinding> {
+        self.finding.as_ref()
     }
 
     /// Returns validated files in canonical repository-path order.
@@ -264,16 +360,63 @@ pub struct VerificationReport {
     version: u32,
     valid: bool,
     inspection: InspectionReport,
+    findings: Box<[VerificationFinding]>,
+}
+
+/// One stable negative verification finding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct VerificationFinding {
+    state: InspectionState,
+    subject: &'static str,
+    revision: Box<str>,
+    paths: Box<[Box<str>]>,
+}
+
+impl VerificationFinding {
+    /// Returns the negative finding classification.
+    #[must_use]
+    pub const fn state(&self) -> InspectionState {
+        self.state
+    }
+
+    /// Returns the logical record or content scope that failed.
+    #[must_use]
+    pub const fn subject(&self) -> &str {
+        self.subject
+    }
+
+    /// Returns the exact revision that was verified.
+    #[must_use]
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// Returns every selected path whose complete closure could not be proven.
+    #[must_use]
+    pub fn paths(&self) -> &[Box<str>] {
+        &self.paths
+    }
 }
 
 impl VerificationReport {
-    pub(crate) const fn from_inspection(inspection: InspectionReport) -> Self {
+    pub(crate) fn from_inspection(inspection: InspectionReport) -> Self {
         let valid = matches!(inspection.state, InspectionState::Complete);
+        let findings = match &inspection.finding {
+            Some(finding) => vec![VerificationFinding {
+                state: finding.state,
+                subject: finding.subject,
+                revision: inspection.requested_revision.clone(),
+                paths: inspection.requested_paths.clone(),
+            }]
+            .into_boxed_slice(),
+            None => Box::new([]),
+        };
         Self {
             schema: "hf-store.verification",
             version: 1,
             valid,
             inspection,
+            findings,
         }
     }
 
@@ -287,5 +430,32 @@ impl VerificationReport {
     #[must_use]
     pub const fn inspection(&self) -> &InspectionReport {
         &self.inspection
+    }
+
+    /// Returns stable negative findings; valid reports contain none.
+    #[must_use]
+    pub fn findings(&self) -> &[VerificationFinding] {
+        &self.findings
+    }
+}
+
+fn canonical_paths(paths: &[crate::RepoPath]) -> Box<[Box<str>]> {
+    let mut paths = paths
+        .iter()
+        .map(|path| Box::<str>::from(path.as_str()))
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    paths.into_boxed_slice()
+}
+
+const fn inspection_subject(state: InspectionState) -> &'static str {
+    match state {
+        InspectionState::Complete => "selection",
+        InspectionState::Incomplete => "selection-manifest-or-content",
+        InspectionState::Corrupt => "selection-manifest-or-selected-file",
+        InspectionState::UnsupportedVersion => "selection-manifest",
+        InspectionState::Busy => "selection-lease",
+        InspectionState::Io => "cache-root",
     }
 }

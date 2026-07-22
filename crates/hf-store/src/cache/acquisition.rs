@@ -420,11 +420,20 @@ impl OfflineCache {
             .map(|entry| InventoryRecord {
                 relative_path: entry.relative_path,
                 namespace: entry.namespace,
-                kind: match entry.kind {
-                    super::rooted_fs::RootedEntryKind::Directory => InventoryRecordKind::Directory,
-                    super::rooted_fs::RootedEntryKind::Other => InventoryRecordKind::Unsafe,
-                    super::rooted_fs::RootedEntryKind::Missing
-                    | super::rooted_fs::RootedEntryKind::RegularFile => InventoryRecordKind::File,
+                kind: match (entry.kind, entry.semantic) {
+                    (
+                        super::rooted_fs::RootedEntryKind::Other,
+                        super::publication::CacheInventorySemantic::RelativeSymlink,
+                    )
+                    | (
+                        super::rooted_fs::RootedEntryKind::Missing
+                        | super::rooted_fs::RootedEntryKind::RegularFile,
+                        _,
+                    ) => InventoryRecordKind::File,
+                    (super::rooted_fs::RootedEntryKind::Directory, _) => {
+                        InventoryRecordKind::Directory
+                    }
+                    (super::rooted_fs::RootedEntryKind::Other, _) => InventoryRecordKind::Unsafe,
                 },
                 metadata: match entry.metadata_state {
                     super::publication::CacheInventoryMetadataState::Recognized => {
@@ -435,6 +444,23 @@ impl OfflineCache {
                     }
                     super::publication::CacheInventoryMetadataState::Unsupported => {
                         InventoryRecordMetadata::Unsupported
+                    }
+                },
+                semantic: match entry.semantic {
+                    super::publication::CacheInventorySemantic::Ordinary => {
+                        InventoryRecordSemantic::Ordinary
+                    }
+                    super::publication::CacheInventorySemantic::SidecarOnly => {
+                        InventoryRecordSemantic::SidecarOnly
+                    }
+                    super::publication::CacheInventorySemantic::SnapshotOnly => {
+                        InventoryRecordSemantic::SnapshotOnly
+                    }
+                    super::publication::CacheInventorySemantic::CopiedWithBlob => {
+                        InventoryRecordSemantic::CopiedWithBlob
+                    }
+                    super::publication::CacheInventorySemantic::RelativeSymlink => {
+                        InventoryRecordSemantic::RelativeSymlink
                     }
                 },
             })
@@ -533,6 +559,7 @@ pub(crate) struct InventoryRecord {
     pub(crate) namespace: Box<str>,
     pub(crate) kind: InventoryRecordKind,
     pub(crate) metadata: InventoryRecordMetadata,
+    pub(crate) semantic: InventoryRecordSemantic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -547,6 +574,15 @@ pub(crate) enum InventoryRecordMetadata {
     Recognized,
     Corrupt,
     Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryRecordSemantic {
+    Ordinary,
+    SidecarOnly,
+    SnapshotOnly,
+    CopiedWithBlob,
+    RelativeSymlink,
 }
 
 #[derive(Clone, Debug)]

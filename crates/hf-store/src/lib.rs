@@ -88,7 +88,10 @@ pub use progress::{ProgressEvent, ProgressObserver, ProgressPhase, ReuseDecision
 #[doc(inline)]
 pub use report::{CacheInventoryReport, InventoryEntry, InventoryState};
 #[doc(inline)]
-pub use report::{InspectedFile, InspectionReport, InspectionState, VerificationReport};
+pub use report::{
+    InspectedFile, InspectionFinding, InspectionReport, InspectionState, VerificationFinding,
+    VerificationReport,
+};
 
 #[doc(inline)]
 pub use repo::{RepositoryId, RepositoryKind, RepositorySpec};

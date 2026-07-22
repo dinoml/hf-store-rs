@@ -409,6 +409,7 @@ pub(super) struct CacheInventoryEntry {
     pub(super) namespace: Box<str>,
     pub(super) kind: RootedEntryKind,
     pub(super) metadata_state: CacheInventoryMetadataState,
+    pub(super) semantic: CacheInventorySemantic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,6 +417,15 @@ pub(super) enum CacheInventoryMetadataState {
     Recognized,
     Corrupt,
     Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CacheInventorySemantic {
+    Ordinary,
+    SidecarOnly,
+    SnapshotOnly,
+    CopiedWithBlob,
+    RelativeSymlink,
 }
 
 #[derive(Clone, Debug)]
@@ -597,6 +607,24 @@ fn unix_millis_from_system_time(time: SystemTime) -> Result<u64, CacheError> {
     u64::try_from(millis).map_err(|_overflow| CacheError::conflicting_record())
 }
 
+fn resolve_relative_target(link: &Path, target: &Path) -> Option<PathBuf> {
+    if target.is_absolute() {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in link.parent()?.join(target).components() {
+        match component {
+            Component::Normal(value) => components.push(value.to_os_string()),
+            Component::ParentDir => {
+                components.pop()?;
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(components.into_iter().collect())
+}
+
 impl PartialGcCandidate {
     pub(crate) fn from_observation(
         key: Box<str>,
@@ -686,6 +714,191 @@ impl crate::transfer::PartialSink for CachePartialSink {
 }
 
 impl CacheKernel {
+    pub(super) fn compatible_inventory_entries(
+        &self,
+        repository: &Path,
+        staging_directory: &Path,
+    ) -> Result<Vec<CacheInventoryEntry>, CacheError> {
+        let blobs = self.compatible_blob_digests(&repository.join("blobs"))?;
+        let mut entries = Vec::new();
+        for namespace in ["refs", "trees", "blobs", "snapshots", ".no_exist"] {
+            self.walk_compatible_inventory(
+                &repository.join(namespace),
+                repository,
+                namespace,
+                &blobs,
+                &mut entries,
+            )?;
+        }
+        self.walk_compatible_inventory(
+            self.relative_path(staging_directory)?,
+            repository,
+            "staging",
+            &blobs,
+            &mut entries,
+        )?;
+        entries.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(entries)
+    }
+
+    fn compatible_blob_digests(
+        &self,
+        directory: &Path,
+    ) -> Result<BTreeSet<BlobDigest>, CacheError> {
+        let entries = match self.root.read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut digests = BTreeSet::new();
+        for path in entries {
+            let name = path.file_name().and_then(std::ffi::OsStr::to_str);
+            if self.root.entry_kind(&path)? == RootedEntryKind::RegularFile
+                && !name.is_some_and(|value| value.ends_with(".incomplete"))
+            {
+                digests.insert(self.hash_regular_file(&path)?);
+            }
+        }
+        Ok(digests)
+    }
+
+    fn walk_compatible_inventory(
+        &self,
+        directory: &Path,
+        repository: &Path,
+        namespace: &str,
+        blob_digests: &BTreeSet<BlobDigest>,
+        entries: &mut Vec<CacheInventoryEntry>,
+    ) -> Result<(), CacheError> {
+        let children = match self.root.read_dir(directory) {
+            Ok(children) => children,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for child in children {
+            let kind = self.root.entry_kind(&child)?;
+            let (metadata_state, semantic) = self.compatible_inventory_classification(
+                &child,
+                repository,
+                namespace,
+                kind,
+                blob_digests,
+            )?;
+            entries.push(CacheInventoryEntry {
+                relative_path: child.to_string_lossy().replace('\\', "/").into(),
+                namespace: if namespace == "blobs"
+                    && child
+                        .file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .is_some_and(|name| name.ends_with(".incomplete"))
+                {
+                    "partials".into()
+                } else {
+                    namespace.into()
+                },
+                kind,
+                metadata_state,
+                semantic,
+            });
+            if kind == RootedEntryKind::Directory {
+                self.walk_compatible_inventory(
+                    &child,
+                    repository,
+                    namespace,
+                    blob_digests,
+                    entries,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compatible_inventory_classification(
+        &self,
+        path: &Path,
+        repository: &Path,
+        namespace: &str,
+        kind: RootedEntryKind,
+        blob_digests: &BTreeSet<BlobDigest>,
+    ) -> Result<(CacheInventoryMetadataState, CacheInventorySemantic), CacheError> {
+        if kind == RootedEntryKind::Other && namespace == "snapshots" {
+            let valid = self
+                .root
+                .read_link(path)
+                .ok()
+                .and_then(|target| resolve_relative_target(path, &target))
+                .is_some_and(|target| {
+                    target.starts_with(repository.join("blobs"))
+                        && self
+                            .root
+                            .entry_kind(&target)
+                            .is_ok_and(|kind| kind == RootedEntryKind::RegularFile)
+                });
+            return Ok((
+                CacheInventoryMetadataState::Recognized,
+                if valid {
+                    CacheInventorySemantic::RelativeSymlink
+                } else {
+                    CacheInventorySemantic::Ordinary
+                },
+            ));
+        }
+        if kind != RootedEntryKind::RegularFile {
+            return Ok((
+                CacheInventoryMetadataState::Recognized,
+                CacheInventorySemantic::Ordinary,
+            ));
+        }
+        let metadata = match namespace {
+            "refs" => match self.root.read_regular_bounded(path, 64)?.bytes() {
+                Some(bytes) if super::hub_metadata::decode_ref(&bytes).is_ok() => {
+                    CacheInventoryMetadataState::Recognized
+                }
+                Some(_) | None => CacheInventoryMetadataState::Corrupt,
+            },
+            "trees" => match self
+                .root
+                .read_regular_bounded(path, 64 * 1024 * 1024)?
+                .bytes()
+                .as_deref()
+                .map(super::hub_metadata::decode_tree)
+            {
+                Some(Ok(_tree)) => CacheInventoryMetadataState::Recognized,
+                Some(Err(error)) if error.is_unknown_version() => {
+                    CacheInventoryMetadataState::Unsupported
+                }
+                Some(Err(_)) | None => CacheInventoryMetadataState::Corrupt,
+            },
+            _ => CacheInventoryMetadataState::Recognized,
+        };
+        let semantic = if namespace == "snapshots" {
+            if blob_digests.contains(&self.hash_regular_file(path)?) {
+                CacheInventorySemantic::CopiedWithBlob
+            } else {
+                CacheInventorySemantic::SnapshotOnly
+            }
+        } else {
+            CacheInventorySemantic::Ordinary
+        };
+        Ok((metadata, semantic))
+    }
+
+    fn hash_regular_file(&self, path: &Path) -> Result<BlobDigest, CacheError> {
+        let RootedRegularFile::File { mut reader, .. } = self.root.open_regular(path)? else {
+            return Err(CacheError::conflicting_record());
+        };
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; COPY_BUFFER_SIZE].into_boxed_slice();
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(BlobDigest::from_bytes(hasher.finalize().into()))
+    }
+
     pub(super) fn plan_snapshot_gc(
         &self,
         now_unix_millis: u64,
@@ -1321,6 +1534,7 @@ impl CacheKernel {
                 namespace: namespace.into(),
                 kind,
                 metadata_state: self.inventory_metadata_state(&child, namespace, kind)?,
+                semantic: CacheInventorySemantic::Ordinary,
             });
             if kind == RootedEntryKind::Directory {
                 self.walk_inventory(&child, namespace, entries)?;
