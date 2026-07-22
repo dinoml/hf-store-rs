@@ -1,8 +1,9 @@
 //! Rust-native storage primitives for Hugging Face Hub repositories.
 //!
-//! This pre-alpha crate currently exposes validated repository, revision, path,
-//! endpoint, and request-time authentication vocabulary. It does not yet expose
-//! a Hub transport or cache service.
+//! This pre-alpha crate exposes validated repository identity, online Hub
+//! acquisition, Python-compatible and owned cache views, transport-free offline
+//! lookup, and independent `local_dir` materialization. Public API stability is
+//! not yet guaranteed.
 //!
 //! # Examples
 //!

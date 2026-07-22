@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/dinoml/hf-store-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/dinoml/hf-store-rs/actions/workflows/ci.yml)
 
-`hf-store-rs` is the planned Rust-native storage boundary for Hugging Face Hub
-repositories. It will resolve revisions, download and validate files, and expose
+`hf-store-rs` is a Rust-native storage boundary for Hugging Face Hub
+repositories. It resolves revisions, downloads and validates files, and exposes
 immutable local snapshots through a cross-platform cache.
 
 Its primary integration surface is a typed Rust library for in-process runtimes
@@ -13,9 +13,9 @@ without understanding cache internals. The CLI is a thin adapter over the same
 library contracts, not the application integration boundary.
 
 > [!IMPORTANT]
-> This repository is pre-alpha. Version `0.0.0` does not yet provide a
-> transport-backed public fetch API or a stability guarantee. Its private
-> shared-cache adapter is conformance-tested specifically against
+> This repository is pre-alpha. Version `0.0.0` provides an unstable
+> transport-backed fetch and transport-free offline API, but no compatibility
+> guarantee for that Rust API yet. Its shared-cache adapter is conformance-tested specifically against
 > `huggingface_hub` v1.24.0 at commit
 > `36fd32c84d630f455a23b9a3bc4dc7b76d19cdde`; compatibility with other versions
 > is not implied.
@@ -48,6 +48,10 @@ interoperability, and publication decisions are recorded in
 contract, invariants, and delivery phases live in
 [RFC 0001](rfcs/0001-hub-store-v0.1.md). Progress is tracked in
 [issue #1](https://github.com/dinoml/hf-store-rs/issues/1).
+
+The cross-platform publication guarantee is atomic visibility, not general
+power-loss durability. The tested capability matrix and exact boundary are in
+[Platform filesystem capabilities](docs/platform-capabilities.md).
 
 The library-first downstream contract is accepted in
 [ADR 0009](adr/0009-library-first-integration.md). Exact public type names remain
