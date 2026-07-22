@@ -244,7 +244,15 @@ fn handle_connection(
         .lock()
         .map_err(|_poisoned| io::Error::other("fixture request log lock poisoned"))?
         .push(request);
-    write_response(&mut stream, &exchange.response)
+    match write_response(&mut stream, &exchange.response) {
+        Err(source)
+            if exchange.response.disconnect_after.is_some()
+                && expected_disconnect_error(source.kind()) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> io::Result<RecordedRequest> {
@@ -333,16 +341,22 @@ fn write_response(stream: &mut TcpStream, response: &ScriptedResponse) -> io::Re
     stream.flush()?;
     if response.disconnect_after.is_some() {
         if let Err(source) = stream.shutdown(Shutdown::Write) {
-            match source.kind() {
-                io::ErrorKind::BrokenPipe
-                | io::ErrorKind::ConnectionAborted
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::NotConnected => {}
-                _ => return Err(source),
+            if !expected_disconnect_error(source.kind()) {
+                return Err(source);
             }
         }
     }
     Ok(())
+}
+
+fn expected_disconnect_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+    )
 }
 
 fn record_failure(failure: &Mutex<Option<Box<str>>>, message: impl Into<Box<str>>) {
