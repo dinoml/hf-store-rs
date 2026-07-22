@@ -332,7 +332,15 @@ fn write_response(stream: &mut TcpStream, response: &ScriptedResponse) -> io::Re
     stream.write_all(&response.body[..visible])?;
     stream.flush()?;
     if response.disconnect_after.is_some() {
-        stream.shutdown(Shutdown::Write)?;
+        if let Err(source) = stream.shutdown(Shutdown::Write) {
+            match source.kind() {
+                io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NotConnected => {}
+                _ => return Err(source),
+            }
+        }
     }
     Ok(())
 }
