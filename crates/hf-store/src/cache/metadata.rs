@@ -413,6 +413,8 @@ impl CacheRecord for RemoteTreeRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PartialTransferRecord {
+    origin_key: String,
+    repository_key: String,
     commit: String,
     path: String,
     expected_size: u64,
@@ -428,6 +430,8 @@ impl PartialTransferRecord {
         reason = "the transfer resume identity is intentionally explicit"
     )]
     pub(super) fn new(
+        origin: &OriginKey,
+        repository: &RepositoryKey,
         commit: &CommitId,
         path: &RepoPath,
         expected_size: u64,
@@ -437,6 +441,8 @@ impl PartialTransferRecord {
         updated_unix_millis: u64,
     ) -> Result<Self, ValidationError> {
         let record = Self {
+            origin_key: origin.to_string(),
+            repository_key: repository.to_string(),
             commit: commit.as_str().to_owned(),
             path: path.as_str().to_owned(),
             expected_size,
@@ -452,12 +458,57 @@ impl PartialTransferRecord {
     pub(super) const fn updated_unix_millis(&self) -> u64 {
         self.updated_unix_millis
     }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "resume eligibility deliberately compares every immutable transfer identity field"
+    )]
+    pub(super) fn resume_offset_if_eligible(
+        &self,
+        origin: &OriginKey,
+        repository: &RepositoryKey,
+        commit: &CommitId,
+        path: &RepoPath,
+        expected_size: u64,
+        actual_size: u64,
+        validator: Option<&str>,
+        target_digest: Option<&BlobDigest>,
+    ) -> Option<u64> {
+        let target = target_digest.map(ToString::to_string);
+        (self.origin_key == origin.to_string()
+            && self.repository_key == repository.to_string()
+            && self.commit == commit.as_str()
+            && self.path == path.as_str()
+            && self.expected_size == expected_size
+            && self.received_size == actual_size
+            && self.received_size > 0
+            && self.received_size < self.expected_size
+            && self.validator.as_deref() == validator
+            && self.target_sha256.as_deref() == target.as_deref()
+            && (validator.is_some() || target.is_some()))
+        .then_some(self.received_size)
+    }
+
+    pub(super) fn matches_cache_identity(
+        &self,
+        origin: &OriginKey,
+        repository: &RepositoryKey,
+        commit: &CommitId,
+        path: &RepoPath,
+    ) -> bool {
+        self.origin_key == origin.to_string()
+            && self.repository_key == repository.to_string()
+            && self.commit == commit.as_str()
+            && self.path == path.as_str()
+    }
 }
 
 impl CacheRecord for PartialTransferRecord {
     const KIND: &'static str = "partial_transfer";
 
     fn validate(&self) -> Result<(), ValidationError> {
+        validate_sha256_hex(&self.origin_key, "partial transfer origin key")?;
+        validate_sha256_hex(&self.repository_key, "partial transfer repository key")?;
         let _commit = CommitId::parse(&self.commit)?;
         let _path = RepoPath::parse(&self.path)?;
         if self.received_size > self.expected_size {
@@ -866,6 +917,8 @@ mod tests {
             vec![RemoteFileRecord::new(&path, 7, Some(hub_blob.clone()))],
         )?)?;
         assert_round_trip(&PartialTransferRecord::new(
+            &origin_key,
+            &repository_key,
             &commit,
             &path,
             7,
@@ -1080,12 +1133,100 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let commit = CommitId::parse(COMMIT)?;
         let path = RepoPath::parse("weights/model.bin")?;
+        let endpoint = Endpoint::hugging_face();
+        let origin = OriginKey::derive(&endpoint)?;
+        let repository = RepositoryKey::derive(
+            &origin,
+            &RepositorySpec::model(RepositoryId::parse("org/repo")?),
+        )?;
 
-        PartialTransferRecord::new(&commit, &path, 10, 1, None, None, 42)
+        PartialTransferRecord::new(&origin, &repository, &commit, &path, 10, 1, None, None, 42)
             .expect_err("received bytes without a validator or target must not be resumable");
-        PartialTransferRecord::new(&commit, &path, 10, 1, Some(String::new()), None, 42)
-            .expect_err("an empty remote validator is not a stable resume identity");
+        PartialTransferRecord::new(
+            &origin,
+            &repository,
+            &commit,
+            &path,
+            10,
+            1,
+            Some(String::new()),
+            None,
+            42,
+        )
+        .expect_err("an empty remote validator is not a stable resume identity");
 
+        Ok(())
+    }
+
+    #[test]
+    fn partial_resume_requires_every_record_and_file_identity_to_match()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = Endpoint::hugging_face();
+        let origin = OriginKey::derive(&endpoint)?;
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let repository = RepositoryKey::derive(&origin, &spec)?;
+        let commit = CommitId::parse(COMMIT)?;
+        let path = RepoPath::parse("weights/model.bin")?;
+        let digest = BlobDigest::for_bytes(b"complete target");
+        let record = PartialTransferRecord::new(
+            &origin,
+            &repository,
+            &commit,
+            &path,
+            10,
+            4,
+            Some("etag".to_owned()),
+            Some(digest),
+            42,
+        )?;
+        assert_eq!(
+            record.resume_offset_if_eligible(
+                &origin,
+                &repository,
+                &commit,
+                &path,
+                10,
+                4,
+                Some("etag"),
+                Some(&digest),
+            ),
+            Some(4)
+        );
+        for (size, actual, validator, target) in [
+            (11, 4, Some("etag"), Some(&digest)),
+            (10, 3, Some("etag"), Some(&digest)),
+            (10, 4, Some("changed"), Some(&digest)),
+            (10, 4, Some("etag"), None),
+        ] {
+            assert_eq!(
+                record.resume_offset_if_eligible(
+                    &origin,
+                    &repository,
+                    &commit,
+                    &path,
+                    size,
+                    actual,
+                    validator,
+                    target,
+                ),
+                None
+            );
+        }
+
+        let other_origin = OriginKey::derive(&Endpoint::parse("https://mirror.example")?)?;
+        assert_eq!(
+            record.resume_offset_if_eligible(
+                &other_origin,
+                &repository,
+                &commit,
+                &path,
+                10,
+                4,
+                Some("etag"),
+                Some(&digest),
+            ),
+            None
+        );
         Ok(())
     }
 

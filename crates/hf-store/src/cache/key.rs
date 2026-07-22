@@ -15,6 +15,7 @@ const REPOSITORY_DOMAIN: u8 = 2;
 const REVISION_DOMAIN: u8 = 3;
 const SELECTION_DOMAIN: u8 = 4;
 const HUB_BLOB_BINDING_DOMAIN: u8 = 5;
+const PARTIAL_TRANSFER_DOMAIN: u8 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct CacheKey([u8; 32]);
@@ -138,6 +139,33 @@ impl HubBlobBindingKey {
 }
 
 impl Display for HubBlobBindingKey {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.0, formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(super) struct PartialTransferKey(CacheKey);
+
+impl PartialTransferKey {
+    pub(super) fn derive(
+        repository: &RepositoryKey,
+        commit: &crate::CommitId,
+        path: &RepoPath,
+    ) -> Result<Self, ValidationError> {
+        derive_key(
+            PARTIAL_TRANSFER_DOMAIN,
+            &[
+                repository.as_bytes(),
+                commit.as_str().as_bytes(),
+                path.as_str().as_bytes(),
+            ],
+        )
+        .map(Self)
+    }
+}
+
+impl Display for PartialTransferKey {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         Display::fmt(&self.0, formatter)
     }

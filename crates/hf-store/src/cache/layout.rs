@@ -5,7 +5,8 @@ use crate::{CommitId, Endpoint, RepositorySpec, Revision};
 
 use super::hub_layout::HubBlobKey;
 use super::key::{
-    BlobDigest, HubBlobBindingKey, OriginKey, RepositoryKey, RevisionKey, SelectionId,
+    BlobDigest, HubBlobBindingKey, OriginKey, PartialTransferKey, RepositoryKey, RevisionKey,
+    SelectionId,
 };
 
 const CACHE_DIRECTORY: &str = "hf-store-v1";
@@ -151,6 +152,43 @@ impl CacheLayout {
             .join(format!("{operation_id}.blob"))
     }
 
+    pub(super) fn partial_record(
+        &self,
+        commit: &CommitId,
+        path: &crate::RepoPath,
+    ) -> Result<PathBuf, ValidationError> {
+        let key = PartialTransferKey::derive(&self.repository, commit, path)?;
+        Ok(self
+            .repository_directory()
+            .join("partials")
+            .join(format!("{key}.json")))
+    }
+
+    pub(super) fn partial_data(
+        &self,
+        commit: &CommitId,
+        path: &crate::RepoPath,
+    ) -> Result<PathBuf, ValidationError> {
+        let key = PartialTransferKey::derive(&self.repository, commit, path)?;
+        Ok(self
+            .repository_directory()
+            .join("partials")
+            .join(format!("{key}.partial")))
+    }
+
+    pub(super) fn partial_lock(
+        &self,
+        commit: &CommitId,
+        path: &crate::RepoPath,
+    ) -> Result<PathBuf, ValidationError> {
+        let key = PartialTransferKey::derive(&self.repository, commit, path)?;
+        Ok(self
+            .repository_directory()
+            .join("locks")
+            .join("partials")
+            .join(format!("{key}.lock")))
+    }
+
     pub(super) fn snapshot_directory(&self, commit: &CommitId, selection: &SelectionId) -> PathBuf {
         self.repository_directory()
             .join("snapshots")
@@ -230,6 +268,27 @@ mod tests {
             assert!(!rendered.contains("private-branch"));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn partial_data_record_and_lock_share_one_fixed_identity_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let layout = CacheLayout::new(
+            "cache",
+            &Endpoint::hugging_face(),
+            &RepositorySpec::model(RepositoryId::parse("org/repo")?),
+        )?;
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let path = RepoPath::parse("nested/model.bin")?;
+        let record = layout.partial_record(&commit, &path)?;
+        let data = layout.partial_data(&commit, &path)?;
+        let lock = layout.partial_lock(&commit, &path)?;
+        assert_eq!(record.file_stem(), data.file_stem());
+        assert_eq!(record.file_stem(), lock.file_stem());
+        assert!(record.starts_with(layout.repository_directory()));
+        assert!(data.starts_with(layout.repository_directory()));
+        assert!(lock.starts_with(layout.repository_directory()));
         Ok(())
     }
 

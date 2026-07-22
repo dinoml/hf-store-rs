@@ -658,6 +658,8 @@ impl CacheKernel {
     ) -> Result<PartialTransferRecord, CacheError> {
         let updated = self.effects.clock.now_unix_millis()?;
         Ok(PartialTransferRecord::new(
+            self.layout.origin_key(),
+            self.layout.repository_key(),
             commit,
             path,
             expected_size,
@@ -666,6 +668,63 @@ impl CacheKernel {
             target_digest,
             updated,
         )?)
+    }
+
+    pub(super) fn persist_partial_record(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+        expected_size: u64,
+        received_size: u64,
+        validator: Option<String>,
+        target_digest: Option<BlobDigest>,
+    ) -> Result<(), CacheError> {
+        let record = self.new_partial_record(
+            commit,
+            path,
+            expected_size,
+            received_size,
+            validator,
+            target_digest,
+        )?;
+        let destination = self.layout.partial_record(commit, path)?;
+        self.replace_record(&destination, &record)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "resume lookup compares every immutable transfer identity field"
+    )]
+    pub(super) fn partial_resume_offset(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+        expected_size: u64,
+        actual_size: u64,
+        validator: Option<&str>,
+        target_digest: Option<&BlobDigest>,
+    ) -> Result<Option<u64>, CacheError> {
+        let destination = self.layout.partial_record(commit, path)?;
+        let record: PartialTransferRecord =
+            self.read_record(&destination, MAX_SMALL_RECORD_BYTES)?;
+        if !record.matches_cache_identity(
+            self.layout.origin_key(),
+            self.layout.repository_key(),
+            commit,
+            path,
+        ) {
+            return Ok(None);
+        }
+        Ok(record.resume_offset_if_eligible(
+            self.layout.origin_key(),
+            self.layout.repository_key(),
+            commit,
+            path,
+            expected_size,
+            actual_size,
+            validator,
+            target_digest,
+        ))
     }
 
     fn replace_record<T: CacheRecord>(
@@ -1411,6 +1470,57 @@ mod tests {
 
         assert_eq!(error.io_kind(), Some(io::ErrorKind::PermissionDenied));
         assert_secret_absent_from_error_chain(&error);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_records_persist_and_resume_only_for_the_exact_file_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let commit = CommitId::parse(FIRST_COMMIT)?;
+        let path = RepoPath::parse("weights/model.bin")?;
+        let digest = BlobDigest::for_bytes(b"complete target");
+        fixture.kernel.persist_partial_record(
+            &commit,
+            &path,
+            10,
+            4,
+            Some("etag".to_owned()),
+            Some(digest),
+        )?;
+        assert_eq!(
+            fixture.kernel.partial_resume_offset(
+                &commit,
+                &path,
+                10,
+                4,
+                Some("etag"),
+                Some(&digest),
+            )?,
+            Some(4)
+        );
+        assert_eq!(
+            fixture.kernel.partial_resume_offset(
+                &commit,
+                &path,
+                10,
+                3,
+                Some("etag"),
+                Some(&digest),
+            )?,
+            None
+        );
+        assert_eq!(
+            fixture.kernel.partial_resume_offset(
+                &commit,
+                &path,
+                10,
+                4,
+                Some("changed"),
+                Some(&digest),
+            )?,
+            None
+        );
         Ok(())
     }
 
