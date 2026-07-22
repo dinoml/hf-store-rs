@@ -27,6 +27,12 @@ mod validation;
 #[cfg(test)]
 mod test_http_fixture;
 
+#[allow(
+    dead_code,
+    reason = "private transport seams are being built before the public HubStore service"
+)]
+mod transport;
+
 #[doc(inline)]
 pub use auth::AuthToken;
 #[doc(inline)]

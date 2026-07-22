@@ -13,7 +13,7 @@ use crate::validation::{ValidationError, ValidationErrorKind};
 pub struct AuthToken(
     #[allow(
         dead_code,
-        reason = "the Phase 2 transport will read the validated secret"
+        reason = "the private transport seam consumes the token only in tests until its adapter lands"
     )]
     Zeroizing<String>,
 );
@@ -41,6 +41,14 @@ impl AuthToken {
         }
 
         Ok(Self(value))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the production network adapter will consume the validated request-time token"
+    )]
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
     }
 }
 
