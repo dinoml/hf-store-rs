@@ -135,3 +135,25 @@ fn raw_token_argument_is_absent_and_secret_value_is_not_echoed() -> Result<(), B
     assert!(!rendered.contains(secret));
     Ok(())
 }
+
+#[test]
+fn strict_offline_rejects_proxy_configuration_without_echoing_it() -> Result<(), Box<dyn Error>> {
+    let proxy = "http://proxy-user:proxy-secret@proxy.invalid";
+    let output = run(&[
+        "--proxy",
+        proxy,
+        "fetch",
+        "--offline",
+        "--repo-kind",
+        "model",
+        "org/repo",
+    ])?;
+    assert_eq!(output.status.code(), Some(2));
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!rendered.contains("proxy-secret"));
+    Ok(())
+}

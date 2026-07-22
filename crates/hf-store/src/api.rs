@@ -177,6 +177,7 @@ impl Debug for FetchOptions {
 #[derive(Clone, Debug)]
 pub struct HubStoreBuilder {
     endpoint: Endpoint,
+    proxy: Option<Endpoint>,
     cache_root: Option<PathBuf>,
     cache_mode: CacheMode,
     max_concurrent_downloads: usize,
@@ -187,6 +188,17 @@ impl HubStoreBuilder {
     #[must_use]
     pub fn endpoint(mut self, endpoint: Endpoint) -> Self {
         self.endpoint = endpoint;
+        self
+    }
+
+    /// Selects one explicit credential-free HTTP or HTTPS forward proxy.
+    ///
+    /// Ambient operating-system and process proxy configuration is never
+    /// discovered. The validated endpoint form rejects user information,
+    /// queries, and fragments.
+    #[must_use]
+    pub fn proxy(mut self, proxy: Endpoint) -> Self {
+        self.proxy = Some(proxy);
         self
     }
 
@@ -216,6 +228,7 @@ impl HubStoreBuilder {
     pub fn build(self) -> HubStore {
         HubStore {
             endpoint: self.endpoint,
+            proxy: self.proxy,
             cache_root: self.cache_root,
             cache_mode: self.cache_mode,
             max_concurrent_downloads: self.max_concurrent_downloads,
@@ -229,6 +242,7 @@ impl Default for HubStoreBuilder {
     fn default() -> Self {
         Self {
             endpoint: Endpoint::hugging_face(),
+            proxy: None,
             cache_root: None,
             cache_mode: CacheMode::Compatible,
             max_concurrent_downloads: 8,
@@ -243,6 +257,7 @@ impl Default for HubStoreBuilder {
 /// returns a backend-unavailable [`crate::HubError`].
 pub struct HubStore {
     endpoint: Endpoint,
+    proxy: Option<Endpoint>,
     cache_root: Option<PathBuf>,
     cache_mode: CacheMode,
     max_concurrent_downloads: usize,
@@ -488,7 +503,7 @@ impl HubStore {
             return Ok(Arc::clone(transport));
         }
         let transport: Arc<dyn Transport> = Arc::new(
-            crate::reqwest_transport::ReqwestTransport::build()
+            crate::reqwest_transport::ReqwestTransport::build_with_proxy(self.proxy.as_ref())
                 .map_err(HubOperationError::transport)?,
         );
         *slot = Some(Arc::clone(&transport));
@@ -512,6 +527,7 @@ impl Debug for HubStore {
         formatter
             .debug_struct("HubStore")
             .field("endpoint", &self.endpoint)
+            .field("has_proxy", &self.proxy.is_some())
             .field("has_cache_root", &self.cache_root.is_some())
             .field("cache_mode", &self.cache_mode)
             .field("max_concurrent_downloads", &self.max_concurrent_downloads)
@@ -929,6 +945,42 @@ mod tests {
         assert_eq!(plan.commit().as_str(), COMMIT);
         assert_eq!(plan.files()[0].path().as_str(), "config.json");
         assert_eq!(observed?.len(), 2);
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn public_service_uses_only_the_explicit_forward_proxy() -> Result<(), Box<dyn Error>> {
+        use crate::test_http_fixture::{Exchange, ExpectedRequest, ScriptedHub, ScriptedResponse};
+
+        const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+        let endpoint = Endpoint::parse("http://hf-store.invalid")?;
+        let fixture = ScriptedHub::start([
+            Exchange::new(
+                ExpectedRequest::get("http://hf-store.invalid/api/models/owner/repo/revision/main"),
+                ScriptedResponse::new(200, format!(r#"{{"sha":"{COMMIT}"}}"#).into_bytes()),
+            ),
+            Exchange::new(
+                ExpectedRequest::get(&format!(
+                    "http://hf-store.invalid/api/models/owner/repo/tree/{COMMIT}?recursive=true&expand=true"
+                )),
+                ScriptedResponse::new(200, b"[]".as_slice()),
+            ),
+        ])?;
+        let store = HubStore::builder()
+            .endpoint(endpoint)
+            .proxy(Endpoint::parse(fixture.endpoint())?)
+            .build();
+        let request = FetchRequest::new(
+            RepositorySpec::model(RepositoryId::parse("owner/repo")?),
+            Revision::parse("main")?,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let plan = runtime.block_on(store.plan(request))?;
+        assert_eq!(plan.commit().as_str(), COMMIT);
+        assert_eq!(fixture.finish()?.len(), 2);
         Ok(())
     }
 

@@ -25,6 +25,8 @@ struct Cli {
     #[arg(long, default_value = "https://huggingface.co", global = true)]
     endpoint: String,
     #[arg(long, global = true)]
+    proxy: Option<String>,
+    #[arg(long, global = true)]
     cache_dir: Option<PathBuf>,
     #[arg(long, value_enum, global = true)]
     cache_mode: Option<CacheModeArg>,
@@ -168,7 +170,14 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(cache) => cache,
         Err(message) => return usage(&message),
     };
-    match execute(cli.command, endpoint, &cache) {
+    let proxy = match cli.proxy {
+        Some(value) => match Endpoint::parse(value) {
+            Ok(proxy) => Some(proxy),
+            Err(_error) => return usage("proxy failed validation"),
+        },
+        None => None,
+    };
+    match execute(cli.command, endpoint, proxy, &cache) {
         Ok(outcome) => emit(format, &outcome),
         Err(CommandFailure::Usage(message)) => usage(&message),
         Err(CommandFailure::Operation { command, error }) => emit_error(format, command, &error),
@@ -178,10 +187,11 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
 fn execute(
     command: Command,
     endpoint: Endpoint,
+    proxy: Option<Endpoint>,
     cache: &ResolvedCache,
 ) -> Result<CommandOutcome, CommandFailure> {
     match command {
-        Command::Fetch(args) => execute_fetch(args, endpoint, cache),
+        Command::Fetch(args) => execute_fetch(args, endpoint, proxy, cache),
         Command::Inspect(args) => execute_inspect(&args, endpoint, cache),
         Command::Verify(args) => execute_verify(&args, endpoint, cache),
         Command::Gc {
@@ -196,6 +206,7 @@ fn execute(
 fn execute_fetch(
     args: FetchArgs,
     endpoint: Endpoint,
+    proxy: Option<Endpoint>,
     cache: &ResolvedCache,
 ) -> Result<CommandOutcome, CommandFailure> {
     let repository = parse_repository(&args.repository)?;
@@ -206,6 +217,11 @@ fn execute_fetch(
         ));
     }
     if args.offline {
+        if proxy.is_some() {
+            return Err(CommandFailure::usage(
+                "--proxy is not valid for strict offline fetch",
+            ));
+        }
         if !args.paths.is_empty()
             && (!args.allow_patterns.is_empty() || !args.ignore_patterns.is_empty())
         {
@@ -259,12 +275,15 @@ fn execute_fetch(
     {
         request = request.authorization(token);
     }
-    let store = HubStore::builder()
+    let mut builder = HubStore::builder()
         .endpoint(endpoint)
         .cache_root(&cache.directory)
         .cache_mode(cache.mode)
-        .max_concurrent_downloads(args.concurrency)
-        .build();
+        .max_concurrent_downloads(args.concurrency);
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    let store = builder.build();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

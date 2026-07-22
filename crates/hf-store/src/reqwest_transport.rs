@@ -2,6 +2,7 @@ use std::fmt::{self, Debug, Formatter};
 
 use reqwest::header::{AUTHORIZATION, IF_RANGE, RANGE};
 
+use crate::Endpoint;
 use crate::transport::{
     Transport, TransportBody, TransportError, TransportFuture, TransportHeaders, TransportMethod,
     TransportRequest, TransportResponse,
@@ -12,11 +13,18 @@ pub(crate) struct ReqwestTransport {
 }
 
 impl ReqwestTransport {
-    pub(crate) fn build() -> Result<Self, TransportError> {
-        let client = reqwest::Client::builder()
+    pub(crate) fn build_with_proxy(proxy: Option<&Endpoint>) -> Result<Self, TransportError> {
+        let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .referer(false)
+            .referer(false);
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy.as_str())
+                    .map_err(|_source| TransportError::unavailable())?,
+            );
+        }
+        let client = builder
             .build()
             .map_err(|_source| TransportError::unavailable())?;
         Ok(Self { client })

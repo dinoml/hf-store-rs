@@ -638,7 +638,10 @@ mod tests {
                 .header("etag", "stable-etag"),
         )])?;
         let endpoint = Endpoint::parse(fixture.endpoint())?;
-        let protocol = HubProtocol::new(endpoint, Arc::new(ReqwestTransport::build()?))?;
+        let protocol = HubProtocol::new(
+            endpoint,
+            Arc::new(ReqwestTransport::build_with_proxy(None)?),
+        )?;
         let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
         let digest = BlobDigest::for_bytes(bytes);
         let entry = HubTreeEntry::new(bytes.len() as u64, "pointer")?
@@ -747,7 +750,7 @@ mod tests {
         )])?;
         let protocol = HubProtocol::new(
             Endpoint::parse(fixture.endpoint())?,
-            Arc::new(ReqwestTransport::build()?),
+            Arc::new(ReqwestTransport::build_with_proxy(None)?),
         )?;
         let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -835,7 +838,7 @@ mod tests {
         )])?;
         let protocol = HubProtocol::new(
             Endpoint::parse(fixture.endpoint())?,
-            Arc::new(ReqwestTransport::build()?),
+            Arc::new(ReqwestTransport::build_with_proxy(None)?),
         )?;
         let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -896,7 +899,7 @@ mod tests {
         ])?;
         let protocol = Arc::new(HubProtocol::new(
             Endpoint::parse(fixture.endpoint())?,
-            Arc::new(ReqwestTransport::build()?),
+            Arc::new(ReqwestTransport::build_with_proxy(None)?),
         )?);
         let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
         let digest = BlobDigest::for_bytes(bytes);
@@ -952,7 +955,7 @@ mod tests {
         }))?;
         let protocol = Arc::new(HubProtocol::new(
             Endpoint::parse(fixture.endpoint())?,
-            Arc::new(ReqwestTransport::build()?),
+            Arc::new(ReqwestTransport::build_with_proxy(None)?),
         )?);
         let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
         let entry = HubTreeEntry::new(10, "opaque")?;
@@ -1029,7 +1032,7 @@ mod tests {
         )])?;
         let protocol = HubProtocol::new(
             Endpoint::parse(fixture.endpoint())?,
-            Arc::new(ReqwestTransport::build()?),
+            Arc::new(ReqwestTransport::build_with_proxy(None)?),
         )?;
         let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1083,7 +1086,7 @@ mod tests {
         )])?;
         let protocol = HubProtocol::new(
             Endpoint::parse(fixture.endpoint())?,
-            Arc::new(ReqwestTransport::build()?),
+            Arc::new(ReqwestTransport::build_with_proxy(None)?),
         )?;
         let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
         let digest = BlobDigest::for_bytes(bytes);
