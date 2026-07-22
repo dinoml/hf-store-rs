@@ -118,6 +118,7 @@ pub struct InspectedFile {
     path: Box<str>,
     sha256: Box<str>,
     size: u64,
+    form: crate::SnapshotFileForm,
 }
 
 impl InspectedFile {
@@ -138,6 +139,12 @@ impl InspectedFile {
     pub const fn size(&self) -> u64 {
         self.size
     }
+
+    /// Returns the physical cache form proven during validation.
+    #[must_use]
+    pub const fn form(&self) -> crate::SnapshotFileForm {
+        self.form
+    }
 }
 
 impl From<&crate::SnapshotFile> for InspectedFile {
@@ -146,6 +153,7 @@ impl From<&crate::SnapshotFile> for InspectedFile {
             path: file.path().as_str().into(),
             sha256: file.sha256().into(),
             size: file.size(),
+            form: file.form(),
         }
     }
 }

@@ -1,5 +1,6 @@
 mod acquisition;
 mod compatible_cache;
+pub(crate) use acquisition::AcquiredSnapshotFileForm;
 #[cfg(feature = "network")]
 pub(crate) use acquisition::AcquisitionCache;
 pub(crate) use acquisition::{AcquiredSnapshot, AcquiredSnapshotFile, OfflineCache};

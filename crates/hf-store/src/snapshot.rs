@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::cache::{AcquiredSnapshot, AcquiredSnapshotFile};
+use crate::cache::{AcquiredSnapshot, AcquiredSnapshotFile, AcquiredSnapshotFileForm};
 use crate::cache::{MaterializedLocalDir, MaterializedLocalDirFile};
 use crate::{CommitId, Endpoint, RepoPath, RepositorySpec, Revision, SelectionId};
 
@@ -17,6 +17,7 @@ pub struct Snapshot {
     requested_revision: Revision,
     commit: CommitId,
     selection: SelectionId,
+    cache_mode: crate::CacheMode,
     files: Box<[SnapshotFile]>,
     reused: bool,
     _lease_owner: AcquiredSnapshot,
@@ -43,6 +44,7 @@ impl Snapshot {
             requested_revision,
             commit: acquired.commit().clone(),
             selection: *acquired.selection(),
+            cache_mode: acquired.mode(),
             files,
             reused,
             _lease_owner: acquired.clone(),
@@ -88,6 +90,12 @@ impl Snapshot {
         &self.selection
     }
 
+    /// Returns the owned or Python-compatible cache view backing this snapshot.
+    #[must_use]
+    pub const fn cache_mode(&self) -> crate::CacheMode {
+        self.cache_mode
+    }
+
     /// Returns selected files in canonical repository-path order.
     #[must_use]
     pub fn files(&self) -> &[SnapshotFile] {
@@ -117,6 +125,22 @@ pub struct SnapshotFile {
     local_path: PathBuf,
     sha256: Box<str>,
     size: u64,
+    form: SnapshotFileForm,
+}
+
+/// Physical compatible-cache form observed while validating a snapshot file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum SnapshotFileForm {
+    /// An hf-store-owned immutable snapshot entry.
+    Owned,
+    /// A Python-compatible regular file present only in the snapshot.
+    SnapshotOnly,
+    /// A Python-compatible regular snapshot copy with a retained blob.
+    CopiedWithBlob,
+    /// A contained Python-compatible relative symlink to a retained blob.
+    RelativeSymlink,
 }
 
 impl SnapshotFile {
@@ -143,6 +167,12 @@ impl SnapshotFile {
     pub const fn size(&self) -> u64 {
         self.size
     }
+
+    /// Returns the physical form proven during validation.
+    #[must_use]
+    pub const fn form(&self) -> SnapshotFileForm {
+        self.form
+    }
 }
 
 impl From<&AcquiredSnapshotFile> for SnapshotFile {
@@ -152,6 +182,12 @@ impl From<&AcquiredSnapshotFile> for SnapshotFile {
             local_path: file.content_path().to_path_buf(),
             sha256: file.digest().to_string().into(),
             size: file.size(),
+            form: match file.form() {
+                AcquiredSnapshotFileForm::Owned => SnapshotFileForm::Owned,
+                AcquiredSnapshotFileForm::SnapshotOnly => SnapshotFileForm::SnapshotOnly,
+                AcquiredSnapshotFileForm::CopiedWithBlob => SnapshotFileForm::CopiedWithBlob,
+                AcquiredSnapshotFileForm::RelativeSymlink => SnapshotFileForm::RelativeSymlink,
+            },
         }
     }
 }

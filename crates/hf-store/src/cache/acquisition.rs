@@ -14,6 +14,7 @@ use crate::{CancellationToken, CommitId, Endpoint, FetchPlan, RepoPath, Reposito
 
 use super::CacheView;
 use super::compatible_cache::{CompatibleCacheError, CompatibleCacheOffline, CompatibleSnapshot};
+use super::hub_cache::HubSnapshotFileForm;
 use super::key::{BlobDigest, SelectionId};
 use super::local_dir_completion::{LocalDirOfflineError, LocalDirOfflineReader};
 use super::local_dir_layout::HubLocalDirLayout;
@@ -403,6 +404,7 @@ impl OfflineCache {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AcquiredSnapshot {
+    mode: crate::CacheMode,
     root: PathBuf,
     commit: CommitId,
     selection: SelectionId,
@@ -414,6 +416,7 @@ impl AcquiredSnapshot {
     fn from_owned(commit: CommitId, selection: SelectionId, snapshot: OwnedSnapshotRead) -> Self {
         let (root, files, lease) = snapshot.into_parts();
         Self {
+            mode: crate::CacheMode::Owned,
             root,
             commit,
             selection,
@@ -428,6 +431,10 @@ impl AcquiredSnapshot {
 
     pub(crate) const fn commit(&self) -> &CommitId {
         &self.commit
+    }
+
+    pub(crate) const fn mode(&self) -> crate::CacheMode {
+        self.mode
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -453,10 +460,18 @@ impl From<CompatibleSnapshot> for AcquiredSnapshot {
                 content_path: file.content_path().to_path_buf(),
                 digest: file.digest(),
                 size: file.size(),
+                form: match file.form() {
+                    HubSnapshotFileForm::SnapshotOnly => AcquiredSnapshotFileForm::SnapshotOnly,
+                    HubSnapshotFileForm::CopiedWithBlob => AcquiredSnapshotFileForm::CopiedWithBlob,
+                    HubSnapshotFileForm::RelativeSymlink => {
+                        AcquiredSnapshotFileForm::RelativeSymlink
+                    }
+                },
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
+            mode: crate::CacheMode::Compatible,
             root: snapshot.root().to_path_buf(),
             commit: snapshot.commit().clone(),
             selection: *snapshot.selection(),
@@ -472,6 +487,15 @@ pub(crate) struct AcquiredSnapshotFile {
     content_path: PathBuf,
     digest: BlobDigest,
     size: u64,
+    form: AcquiredSnapshotFileForm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AcquiredSnapshotFileForm {
+    Owned,
+    SnapshotOnly,
+    CopiedWithBlob,
+    RelativeSymlink,
 }
 
 #[derive(Clone, Debug)]
@@ -497,6 +521,7 @@ impl From<OwnedSnapshotFile> for AcquiredSnapshotFile {
             content_path: file.content_path().to_path_buf(),
             digest: file.digest(),
             size: file.size(),
+            form: AcquiredSnapshotFileForm::Owned,
         }
     }
 }
@@ -516,6 +541,10 @@ impl AcquiredSnapshotFile {
 
     pub(crate) const fn size(&self) -> u64 {
         self.size
+    }
+
+    pub(crate) const fn form(&self) -> AcquiredSnapshotFileForm {
+        self.form
     }
 }
 

@@ -775,9 +775,11 @@ mod tests {
             .build()?;
         let first = runtime.block_on(store.fetch(request()?, FetchOptions::default()))?;
         assert!(!first.was_reused());
+        assert_eq!(first.cache_mode(), CacheMode::Owned);
         let path = RepoPath::parse("model.bin")?;
         let file = first.file(&path).ok_or("downloaded file missing")?;
         assert!(file.local_path().starts_with(first.directory()));
+        assert_eq!(file.form(), crate::SnapshotFileForm::Owned);
         assert_eq!(std::fs::read(file.local_path())?, bytes);
         assert_eq!(file.sha256(), digest);
 

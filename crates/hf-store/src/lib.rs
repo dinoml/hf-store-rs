@@ -92,6 +92,6 @@ pub use repo_path::RepoPath;
 #[doc(inline)]
 pub use revision::{CommitId, Revision};
 #[doc(inline)]
-pub use snapshot::{LocalDirectory, LocalDirectoryFile, Snapshot, SnapshotFile};
+pub use snapshot::{LocalDirectory, LocalDirectoryFile, Snapshot, SnapshotFile, SnapshotFileForm};
 #[doc(inline)]
 pub use validation::ValidationError;
