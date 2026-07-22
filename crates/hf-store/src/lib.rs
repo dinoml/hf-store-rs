@@ -24,6 +24,11 @@ mod endpoint;
     reason = "private operation errors precede the first public HubStore request API"
 )]
 mod error;
+#[allow(
+    dead_code,
+    reason = "private Hub protocol implementation precedes the public request API"
+)]
+mod hub_protocol;
 mod repo;
 mod repo_path;
 mod revision;
