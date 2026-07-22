@@ -100,7 +100,8 @@ impl Display for RevisionKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct SelectionId(CacheKey);
+/// Stable identity of an exact, portable repository path selection.
+pub struct SelectionId(CacheKey);
 
 impl SelectionId {
     pub(crate) fn derive(paths: &[RepoPath]) -> Result<Self, ValidationError> {

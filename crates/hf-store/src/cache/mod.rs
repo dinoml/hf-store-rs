@@ -5,7 +5,7 @@ mod hub_cache;
 mod hub_layout;
 mod hub_metadata;
 pub(crate) use hub_metadata::{HubTree, HubTreeEntry};
-pub(crate) use key::SelectionId;
+pub use key::SelectionId;
 mod key;
 mod layout;
 mod local_dir_bookkeeping;

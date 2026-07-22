@@ -12,11 +12,16 @@ keywords = ["cache", "huggingface", "machine-learning", "storage"]
 categories = ["caching", "web-programming::http-client"]
 publish = false
 
+[features]
+default = ["network"]
+network = ["dep:reqwest", "dep:tokio"]
+
 [dependencies]
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 fs4.workspace = true
 getrandom.workspace = true
+reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
@@ -25,6 +30,7 @@ unicode-normalization.workspace = true
 unicode-casefold.workspace = true
 url.workspace = true
 zeroize.workspace = true
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

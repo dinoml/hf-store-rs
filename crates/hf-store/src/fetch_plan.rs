@@ -1,16 +1,22 @@
-use std::collections::BTreeMap;
-
 use crate::cache::{HubTree, HubTreeEntry, RepositoryFilter, RepositorySelection, SelectionId};
 use crate::{CommitId, Endpoint, RepoPath, RepositorySpec, Revision, ValidationError};
 
 #[derive(Clone, Debug)]
-pub(crate) struct FetchPlan {
+/// Deterministic, immutable plan for acquiring selected files from one commit.
+pub struct FetchPlan {
     endpoint: Endpoint,
     repository: RepositorySpec,
     requested_revision: Revision,
     commit: CommitId,
     selection: RepositorySelection,
-    files: BTreeMap<RepoPath, HubTreeEntry>,
+    files: Box<[PlannedFile]>,
+}
+
+/// One validated Hub file selected by a [`FetchPlan`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedFile {
+    path: RepoPath,
+    entry: HubTreeEntry,
 }
 
 impl FetchPlan {
@@ -27,12 +33,13 @@ impl FetchPlan {
             .paths()
             .iter()
             .filter_map(|path| {
-                tree.files()
-                    .get(path)
-                    .cloned()
-                    .map(|entry| (path.clone(), entry))
+                tree.files().get(path).cloned().map(|entry| PlannedFile {
+                    path: path.clone(),
+                    entry,
+                })
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Ok(Self {
             endpoint,
             repository,
@@ -43,28 +50,76 @@ impl FetchPlan {
         })
     }
 
-    pub(crate) const fn endpoint(&self) -> &Endpoint {
+    /// Returns the endpoint whose metadata produced this plan.
+    #[must_use]
+    pub const fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
 
-    pub(crate) const fn repository(&self) -> &RepositorySpec {
+    /// Returns the repository identity.
+    #[must_use]
+    pub const fn repository(&self) -> &RepositorySpec {
         &self.repository
     }
 
-    pub(crate) const fn requested_revision(&self) -> &Revision {
+    /// Returns the originally requested revision.
+    #[must_use]
+    pub const fn requested_revision(&self) -> &Revision {
         &self.requested_revision
     }
 
-    pub(crate) const fn commit(&self) -> &CommitId {
+    /// Returns the resolved immutable commit.
+    #[must_use]
+    pub const fn commit(&self) -> &CommitId {
         &self.commit
     }
 
-    pub(crate) const fn selection_id(&self) -> &SelectionId {
+    /// Returns the identity derived only from the sorted selected path set.
+    #[must_use]
+    pub const fn selection_id(&self) -> &SelectionId {
         self.selection.selection_id()
     }
 
-    pub(crate) fn files(&self) -> &BTreeMap<RepoPath, HubTreeEntry> {
+    /// Returns selected files in canonical repository-path order.
+    #[must_use]
+    pub fn files(&self) -> &[PlannedFile] {
         &self.files
+    }
+}
+
+impl PlannedFile {
+    /// Returns the portable repository-relative path.
+    #[must_use]
+    pub const fn path(&self) -> &RepoPath {
+        &self.path
+    }
+
+    /// Returns the expected file size in bytes.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.entry.size()
+    }
+
+    /// Returns the Hub Git object identifier or opaque validator.
+    #[must_use]
+    pub fn blob_id(&self) -> &str {
+        self.entry.blob_id()
+    }
+
+    /// Returns a proven LFS SHA-256 identity when present.
+    #[must_use]
+    pub fn lfs_sha256(&self) -> Option<&str> {
+        self.entry.lfs_sha256()
+    }
+
+    /// Returns a Hub Xet identity when present.
+    #[must_use]
+    pub fn xet_hash(&self) -> Option<&str> {
+        self.entry.xet_hash()
+    }
+
+    pub(crate) const fn entry(&self) -> &HubTreeEntry {
+        &self.entry
     }
 }
 
@@ -102,8 +157,8 @@ mod tests {
         assert_eq!(plan.commit().as_str(), COMMIT);
         assert_eq!(
             plan.files()
-                .keys()
-                .map(RepoPath::as_str)
+                .iter()
+                .map(|file| file.path().as_str())
                 .collect::<Vec<_>>(),
             ["config.json"]
         );

@@ -16,7 +16,11 @@ pub(crate) enum CacheFailure {
     Io,
 }
 
-pub(crate) struct HubOperationError {
+/// A safe, classified failure from Hub planning or acquisition.
+///
+/// Human-readable text and private causes are not a stable classification API;
+/// use the query methods when selecting retry or user-interface policy.
+pub struct HubOperationError {
     kind: Box<HubOperationErrorKind>,
     backtrace: Backtrace,
 }
@@ -94,45 +98,63 @@ impl HubOperationError {
         }
     }
 
-    pub(crate) fn is_authentication(&self) -> bool {
+    /// Returns whether request authentication failed.
+    #[must_use]
+    pub fn is_authentication(&self) -> bool {
         matches!(self.kind.as_ref(), HubOperationErrorKind::Authentication)
     }
 
-    pub(crate) fn is_gated(&self) -> bool {
+    /// Returns whether access requires accepting a gated repository's terms.
+    #[must_use]
+    pub fn is_gated(&self) -> bool {
         matches!(self.kind.as_ref(), HubOperationErrorKind::Gated)
     }
 
-    pub(crate) fn is_missing(&self) -> bool {
+    /// Returns whether the requested repository object was not found.
+    #[must_use]
+    pub fn is_missing(&self) -> bool {
         matches!(self.kind.as_ref(), HubOperationErrorKind::Missing)
     }
 
-    pub(crate) fn is_rate_limited(&self) -> bool {
+    /// Returns whether the Hub rate limited the request.
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
         matches!(
             self.kind.as_ref(),
             HubOperationErrorKind::RateLimited { .. }
         )
     }
 
-    pub(crate) fn retry_after(&self) -> Option<Duration> {
+    /// Returns a server-provided retry delay when safely parsed.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
         match self.kind.as_ref() {
             HubOperationErrorKind::RateLimited { retry_after } => *retry_after,
             _ => None,
         }
     }
 
-    pub(crate) fn is_transport(&self) -> bool {
+    /// Returns whether an HTTP transport operation failed.
+    #[must_use]
+    pub fn is_transport(&self) -> bool {
         matches!(self.kind.as_ref(), HubOperationErrorKind::Transport(_))
     }
 
-    pub(crate) fn is_protocol(&self) -> bool {
+    /// Returns whether a response violated the supported Hub protocol.
+    #[must_use]
+    pub fn is_protocol(&self) -> bool {
         matches!(self.kind.as_ref(), HubOperationErrorKind::Protocol)
     }
 
-    pub(crate) fn is_validation(&self) -> bool {
+    /// Returns whether remote data failed identity or safety validation.
+    #[must_use]
+    pub fn is_validation(&self) -> bool {
         matches!(self.kind.as_ref(), HubOperationErrorKind::Validation(_))
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
+    /// Returns whether cooperative cancellation stopped the operation.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
         matches!(self.kind.as_ref(), HubOperationErrorKind::Cancelled)
     }
 
@@ -143,7 +165,23 @@ impl HubOperationError {
         }
     }
 
-    pub(crate) const fn backtrace(&self) -> &Backtrace {
+    /// Returns whether local cache state prevented the operation.
+    #[must_use]
+    pub fn is_cache(&self) -> bool {
+        matches!(self.kind.as_ref(), HubOperationErrorKind::Cache(_))
+    }
+
+    /// Returns whether this build has no usable network backend.
+    #[must_use]
+    pub fn is_backend_unavailable(&self) -> bool {
+        matches!(
+            self.kind.as_ref(),
+            HubOperationErrorKind::Transport(source) if source.is_unavailable()
+        )
+    }
+
+    /// Returns the captured operation backtrace.
+    pub const fn backtrace(&self) -> &Backtrace {
         &self.backtrace
     }
 }

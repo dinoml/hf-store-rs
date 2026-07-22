@@ -7,11 +7,17 @@
 //! # Examples
 //!
 //! ```
+
+#![allow(
+    clippy::multiple_crate_versions,
+    reason = "the Rustls/Reqwest graph and cache primitives currently require parallel transitive versions"
+)]
 //! use hf_store::RepositoryKind;
 //!
 //! assert_eq!(RepositoryKind::Model.to_string(), "model");
 //! ```
 
+mod api;
 mod auth;
 #[allow(
     dead_code,
@@ -36,6 +42,8 @@ mod fetch_plan;
 mod hub_protocol;
 mod repo;
 mod repo_path;
+#[cfg(feature = "network")]
+mod reqwest_transport;
 mod revision;
 mod validation;
 
@@ -49,9 +57,17 @@ mod test_http_fixture;
 mod transport;
 
 #[doc(inline)]
+pub use api::{FetchRequest, HubStore, HubStoreBuilder};
+#[doc(inline)]
 pub use auth::AuthToken;
 #[doc(inline)]
+pub use cache::SelectionId;
+#[doc(inline)]
 pub use endpoint::Endpoint;
+#[doc(inline)]
+pub use error::HubOperationError as HubError;
+#[doc(inline)]
+pub use fetch_plan::{FetchPlan, PlannedFile};
 
 #[doc(inline)]
 pub use repo::{RepositoryId, RepositoryKind, RepositorySpec};

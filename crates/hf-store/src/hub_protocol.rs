@@ -542,8 +542,8 @@ mod tests {
         assert_eq!(plan.commit().as_str(), COMMIT);
         assert_eq!(
             plan.files()
-                .keys()
-                .map(crate::RepoPath::as_str)
+                .iter()
+                .map(|file| file.path().as_str())
                 .collect::<Vec<_>>(),
             ["config.json"]
         );
