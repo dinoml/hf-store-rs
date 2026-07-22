@@ -12,6 +12,9 @@ use crate::{CommitId, RepoPath};
 
 use super::filter::RepositorySelection;
 use super::key::{BlobDigest, SelectionId};
+use super::local_dir_completion::{
+    LocalDirCompletionError, LocalDirCompletionFile, LocalDirCompletionWriter,
+};
 use super::local_dir_layout::HubLocalDirLayout;
 use super::local_dir_materialization::{
     Cancellation, ExistingFilePolicy, LocalDirDestinationInspection, LocalDirFileDisposition,
@@ -350,13 +353,34 @@ impl LocalDirReconciler {
                 return Ok(LocalDirReconciliationOutcome::NeedsTransport(demand));
             }
         };
-        let report = materialize_files(&materializer, plan, prepared, policy, cancellation)?;
+        let completion = LocalDirCompletionWriter::new(
+            plan.layout.clone(),
+            Arc::clone(&self.root),
+            self.effects.clone(),
+        )
+        .map_err(LocalDirReconciliationError::completion)?;
+        completion
+            .publish_in_progress(plan.commit(), plan.selection_id())
+            .map_err(LocalDirReconciliationError::completion)?;
+        let report = materialize_files(&materializer, plan, prepared, policy, cancellation)
+            .map_err(LocalDirReconciliationError::with_change)?;
         validate_all(
             &materializer,
             plan,
             cancellation,
             report.destination_bytes_written != 0,
-        )?;
+        )
+        .map_err(LocalDirReconciliationError::with_change)?;
+        let completed_files = report
+            .files()
+            .iter()
+            .map(|file| {
+                LocalDirCompletionFile::new(file.path().clone(), file.size(), file.digest())
+            })
+            .collect::<Vec<_>>();
+        completion
+            .publish_complete(plan.commit(), plan.selection_id(), &completed_files)
+            .map_err(|source| LocalDirReconciliationError::completion(source).with_change())?;
         Ok(LocalDirReconciliationOutcome::Reconciled(report))
     }
 
@@ -735,6 +759,7 @@ enum LocalDirReconciliationErrorKind {
     LockWait(SanitizedIo),
     Source(LocalDirSourceError),
     Materialization(LocalDirMaterializationError),
+    Completion(LocalDirCompletionError),
     Conflict,
     Cancelled,
     FinalValidation,
@@ -778,6 +803,19 @@ impl LocalDirReconciliationError {
             LocalDirReconciliationErrorKind::Materialization(source),
             may_have_changed,
         )
+    }
+
+    fn completion(source: LocalDirCompletionError) -> Self {
+        let may_have_changed = source.may_have_published();
+        Self::new(
+            LocalDirReconciliationErrorKind::Completion(source),
+            may_have_changed,
+        )
+    }
+
+    fn with_change(mut self) -> Self {
+        self.may_have_changed = true;
+        self
     }
 
     fn conflict(may_have_changed: bool) -> Self {
@@ -867,6 +905,9 @@ impl Display for LocalDirReconciliationError {
             LocalDirReconciliationErrorKind::Materialization(_) => {
                 "local-dir selected file reconciliation failed"
             }
+            LocalDirReconciliationErrorKind::Completion(_) => {
+                "local-dir completion state publication failed"
+            }
             LocalDirReconciliationErrorKind::Conflict => {
                 "local-dir destination conflicts with the selected files"
             }
@@ -888,6 +929,7 @@ impl Error for LocalDirReconciliationError {
             LocalDirReconciliationErrorKind::Plan(source) => Some(source),
             LocalDirReconciliationErrorKind::Source(source) => Some(source),
             LocalDirReconciliationErrorKind::Materialization(source) => Some(source),
+            LocalDirReconciliationErrorKind::Completion(source) => Some(source),
             LocalDirReconciliationErrorKind::Lock(_)
             | LocalDirReconciliationErrorKind::LockWait(_)
             | LocalDirReconciliationErrorKind::Conflict
@@ -919,6 +961,7 @@ mod tests {
 
     use crate::cache::filter::RepositoryFilter;
     use crate::cache::hub_metadata::HubTreeEntry;
+    use crate::cache::metadata::{LocalDirStateRecord, decode_record};
     use crate::cache::publication::{
         NoPublicationFaults, OsFileSystem, PublicationFaults, PublicationPoint,
         SequenceOperationIds, SystemClock,
@@ -1002,6 +1045,14 @@ mod tests {
                 .ok_or_else(|| io::Error::other("test destination has no parent"))?;
             fs::create_dir_all(parent)?;
             fs::write(destination, bytes)
+        }
+
+        fn completion(&self) -> Result<Option<LocalDirStateRecord>, Box<dyn Error>> {
+            let path = self.layout.coordination_state_path();
+            if !path.try_exists()? {
+                return Ok(None);
+            }
+            Ok(Some(decode_record(&fs::read(path)?)?))
         }
     }
 
@@ -1180,6 +1231,13 @@ mod tests {
         assert_eq!(fs::metadata(first_path)?.modified()?, before);
         assert_eq!(result.commit(), plan.commit());
         assert_eq!(result.selection_id(), plan.selection_id());
+        let completion = fixture
+            .completion()?
+            .ok_or("successful reconciliation did not publish completion")?;
+        assert!(completion.is_complete());
+        assert_eq!(completion.commit(), plan.commit().as_str());
+        assert_eq!(completion.selection_id(), plan.selection_id().to_string());
+        assert_eq!(completion.files().len(), 2);
         Ok(())
     }
 
@@ -1291,6 +1349,37 @@ mod tests {
         assert_eq!(demand.selection_id(), plan.selection_id());
         assert!(!fixture.destination(first.path()).try_exists()?);
         assert!(!fixture.destination(second.path()).try_exists()?);
+        assert!(fixture.completion()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_file_copy_leaves_in_progress_state_instead_of_false_completion()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new()?;
+        let target = Fixture::target("model.bin", FIRST)?;
+        let plan = fixture.plan(vec![target.clone()])?;
+        let mut candidates = CandidateMap::default().with_owned(&target, b"wrong bytes");
+
+        let error = fixture
+            .reconciler(Arc::new(YieldWait::default()))
+            .reconcile(
+                &plan,
+                &mut candidates,
+                ExistingFilePolicy::Reject,
+                &super::super::local_dir_materialization::NeverCancelled,
+            )
+            .expect_err("invalid candidate unexpectedly completed reconciliation");
+
+        assert!(error.may_have_changed());
+        let state = fixture
+            .completion()?
+            .ok_or("reconciliation did not invalidate completion before copying")?;
+        assert!(state.is_in_progress());
+        assert_eq!(state.commit(), plan.commit().as_str());
+        assert_eq!(state.selection_id(), plan.selection_id().to_string());
+        assert!(state.files().is_empty());
+        assert!(!fixture.destination(target.path()).try_exists()?);
         Ok(())
     }
 
@@ -1737,11 +1826,11 @@ mod tests {
                     occurrence
                 };
                 assert_eq!(visible, expected_visible, "point={point:?}, n={occurrence}");
-                assert_eq!(
-                    error.may_have_changed(),
-                    expected_visible > 0,
-                    "point={point:?}, n={occurrence}"
-                );
+                assert!(error.may_have_changed(), "point={point:?}, n={occurrence}");
+                let state = fixture
+                    .completion()?
+                    .ok_or("replacement failure lost the in-progress state")?;
+                assert!(state.is_in_progress(), "point={point:?}, n={occurrence}");
             }
         }
         Ok(())

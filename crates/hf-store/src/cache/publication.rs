@@ -45,6 +45,8 @@ pub(super) enum PublicationPoint {
     AfterBlobPublish,
     BeforeAtomicReplace,
     AfterAtomicReplace,
+    BeforeCompletionReplace,
+    AfterCompletionReplace,
 }
 
 pub(super) trait PublicationFaults: Debug + Send + Sync {

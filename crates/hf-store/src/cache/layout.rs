@@ -71,6 +71,14 @@ impl CacheLayout {
         &self.cache_root
     }
 
+    pub(super) const fn origin_key(&self) -> &OriginKey {
+        &self.origin
+    }
+
+    pub(super) const fn repository_key(&self) -> &RepositoryKey {
+        &self.repository
+    }
+
     pub(super) fn origin_directory(&self) -> PathBuf {
         self.cache_root
             .join("origins")

@@ -587,6 +587,165 @@ impl CacheRecord for SnapshotManifestRecord {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LocalDirFileRecord {
+    path: String,
+    sha256: String,
+    size: u64,
+}
+
+impl LocalDirFileRecord {
+    pub(super) fn new(path: &RepoPath, digest: BlobDigest, size: u64) -> Self {
+        Self {
+            path: path.as_str().to_owned(),
+            sha256: digest.to_string(),
+            size,
+        }
+    }
+
+    pub(super) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(super) fn digest(&self) -> Result<BlobDigest, ValidationError> {
+        BlobDigest::parse(&self.sha256)
+    }
+
+    pub(super) const fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<RepoPath, ValidationError> {
+        let path = RepoPath::parse(&self.path)?;
+        let _digest = self.digest()?;
+        Ok(path)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalDirStateKind {
+    InProgress,
+    Complete,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LocalDirStateRecord {
+    origin_key: String,
+    repository_key: String,
+    commit: String,
+    selection_id: String,
+    state: LocalDirStateKind,
+    files: Vec<LocalDirFileRecord>,
+}
+
+impl LocalDirStateRecord {
+    pub(super) fn in_progress(
+        origin: &OriginKey,
+        repository: &RepositoryKey,
+        commit: &CommitId,
+        selection: &SelectionId,
+    ) -> Result<Self, ValidationError> {
+        Self::new(
+            origin,
+            repository,
+            commit,
+            selection,
+            LocalDirStateKind::InProgress,
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn complete(
+        origin: &OriginKey,
+        repository: &RepositoryKey,
+        commit: &CommitId,
+        selection: &SelectionId,
+        mut files: Vec<LocalDirFileRecord>,
+    ) -> Result<Self, ValidationError> {
+        files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        Self::new(
+            origin,
+            repository,
+            commit,
+            selection,
+            LocalDirStateKind::Complete,
+            files,
+        )
+    }
+
+    fn new(
+        origin: &OriginKey,
+        repository: &RepositoryKey,
+        commit: &CommitId,
+        selection: &SelectionId,
+        state: LocalDirStateKind,
+        files: Vec<LocalDirFileRecord>,
+    ) -> Result<Self, ValidationError> {
+        let record = Self {
+            origin_key: origin.to_string(),
+            repository_key: repository.to_string(),
+            commit: commit.as_str().to_owned(),
+            selection_id: selection.to_string(),
+            state,
+            files,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub(super) const fn is_in_progress(&self) -> bool {
+        matches!(self.state, LocalDirStateKind::InProgress)
+    }
+
+    pub(super) const fn is_complete(&self) -> bool {
+        matches!(self.state, LocalDirStateKind::Complete)
+    }
+
+    pub(super) fn files(&self) -> &[LocalDirFileRecord] {
+        &self.files
+    }
+
+    pub(super) fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub(super) fn selection_id(&self) -> &str {
+        &self.selection_id
+    }
+}
+
+impl CacheRecord for LocalDirStateRecord {
+    const KIND: &'static str = "local_dir_state";
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_sha256_hex(&self.origin_key, "local directory origin key")?;
+        validate_sha256_hex(&self.repository_key, "local directory repository key")?;
+        let _commit = CommitId::parse(&self.commit)?;
+        validate_sha256_hex(&self.selection_id, "local directory selection identifier")?;
+        let paths = self
+            .files
+            .iter()
+            .map(LocalDirFileRecord::validate)
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_order_and_selection(self.files.iter().map(LocalDirFileRecord::path), &paths)?;
+        match self.state {
+            LocalDirStateKind::InProgress if self.files.is_empty() => Ok(()),
+            LocalDirStateKind::InProgress => Err(record_malformed("local directory state")),
+            LocalDirStateKind::Complete => {
+                let selection = SelectionId::derive(&paths)?;
+                if selection.to_string() == self.selection_id {
+                    Ok(())
+                } else {
+                    Err(record_malformed("local directory state"))
+                }
+            }
+        }
+    }
+}
+
 fn validate_remote_files(files: &[RemoteFileRecord]) -> Result<(), ValidationError> {
     let paths = files
         .iter()
@@ -708,7 +867,91 @@ mod tests {
             &selection,
             vec![SnapshotFileRecord::new(&path, digest, 7, Some(hub_blob))],
         )?)?;
+        assert_round_trip(&LocalDirStateRecord::in_progress(
+            &origin_key,
+            &repository_key,
+            &commit,
+            &selection,
+        )?)?;
+        assert_round_trip(&LocalDirStateRecord::complete(
+            &origin_key,
+            &repository_key,
+            &commit,
+            &selection,
+            vec![LocalDirFileRecord::new(&path, digest, 7)],
+        )?)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn local_dir_state_has_stable_in_progress_and_complete_encodings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let origin = OriginKey::derive(&endpoint)?;
+        let repository = RepositoryKey::derive(&origin, &spec)?;
+        let commit = CommitId::parse(COMMIT)?;
+        let path = RepoPath::parse("weights/model.bin")?;
+        let selection = SelectionId::derive(std::slice::from_ref(&path))?;
+        let digest = BlobDigest::for_bytes(b"payload");
+
+        let in_progress =
+            LocalDirStateRecord::in_progress(&origin, &repository, &commit, &selection)?;
+        let complete = LocalDirStateRecord::complete(
+            &origin,
+            &repository,
+            &commit,
+            &selection,
+            vec![LocalDirFileRecord::new(&path, digest, 7)],
+        )?;
+
+        assert!(in_progress.is_in_progress());
+        assert!(in_progress.files().is_empty());
+        assert!(complete.is_complete());
+        assert_eq!(complete.files()[0].path(), path.as_str());
+        assert_eq!(complete.files()[0].digest()?, digest);
+        assert_eq!(complete.files()[0].size(), 7);
+        let encoded = String::from_utf8(encode_record(&complete)?)?;
+        assert!(encoded.contains("\"record_kind\":\"local_dir_state\""));
+        assert!(encoded.contains("\"state\":\"complete\""));
+        assert!(encoded.contains("\"path\":\"weights/model.bin\""));
+        assert!(!encoded.contains("hub_blob_key"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_dir_state_rejects_files_in_progress_and_selection_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = Endpoint::hugging_face();
+        let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let origin = OriginKey::derive(&endpoint)?;
+        let repository = RepositoryKey::derive(&origin, &spec)?;
+        let commit = CommitId::parse(COMMIT)?;
+        let selected = RepoPath::parse("selected.bin")?;
+        let other = RepoPath::parse("other.bin")?;
+        let selection = SelectionId::derive(std::slice::from_ref(&selected))?;
+        let file = LocalDirFileRecord::new(&other, BlobDigest::for_bytes(b"other"), 5);
+
+        LocalDirStateRecord::complete(&origin, &repository, &commit, &selection, vec![file])
+            .expect_err("accepted files that did not match the selection identity");
+
+        let malformed = format!(
+            concat!(
+                "{{\"format_version\":1,\"record_kind\":\"local_dir_state\",\"payload\":{{",
+                "\"origin_key\":\"{}\",\"repository_key\":\"{}\",",
+                "\"commit\":\"{}\",\"selection_id\":\"{}\",",
+                "\"state\":\"in_progress\",\"files\":[{{\"path\":\"other.bin\",",
+                "\"sha256\":\"{}\",\"size\":5}}]}}}}"
+            ),
+            origin,
+            repository,
+            commit,
+            selection,
+            BlobDigest::for_bytes(b"other")
+        );
+        decode_record::<LocalDirStateRecord>(malformed.as_bytes())
+            .expect_err("decoded an in-progress state containing completion files");
         Ok(())
     }
 
