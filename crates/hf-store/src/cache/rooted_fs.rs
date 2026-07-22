@@ -159,6 +159,7 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         staging: &Path,
         destination: &Path,
     ) -> io::Result<CreateOnceOutcome>;
+    fn install_staged_replace(&self, staging: &Path, destination: &Path) -> io::Result<()>;
     fn create_once(
         &self,
         path: &Path,
@@ -503,6 +504,28 @@ impl RootedFileSystem for CacheRoot {
         }
     }
 
+    fn install_staged_replace(&self, staging: &Path, destination: &Path) -> io::Result<()> {
+        ensure_distinct_staging(destination, staging)?;
+        match self.entry_kind(staging)? {
+            RootedEntryKind::RegularFile => {}
+            RootedEntryKind::Missing | RootedEntryKind::Directory | RootedEntryKind::Other => {
+                return Err(invalid_data("cache staging entry is not a regular file"));
+            }
+        }
+        match self.entry_kind(destination)? {
+            RootedEntryKind::Missing | RootedEntryKind::RegularFile => {}
+            RootedEntryKind::Directory | RootedEntryKind::Other => {
+                return Err(invalid_data(
+                    "cache replacement destination is not a regular file",
+                ));
+            }
+        }
+        let (staging_parent, staging_name) = self.open_parent_and_name(staging, false)?;
+        let (destination_parent, destination_name) =
+            self.open_parent_and_name(destination, true)?;
+        staging_parent.rename(staging_name, &destination_parent, destination_name)
+    }
+
     fn create_once(
         &self,
         path: &Path,
@@ -570,13 +593,7 @@ impl RootedFileSystem for CacheRoot {
         let staged = file.write_all(bytes).and_then(|()| file.sync_all());
         drop(file);
         let replacement = staged
-            .and_then(|()| {
-                let (staging_parent, staging_name) =
-                    self.open_parent_and_name(staging_path, false)?;
-                let (destination_parent, destination_name) =
-                    self.open_parent_and_name(path, true)?;
-                staging_parent.rename(staging_name, &destination_parent, destination_name)
-            })
+            .and_then(|()| self.install_staged_replace(staging_path, path))
             .and_then(|()| match self.read_regular_bounded(path, bytes.len())? {
                 RootedRead::Bytes(actual) if actual == bytes => Ok(()),
                 RootedRead::Missing | RootedRead::Other | RootedRead::Bytes(_) => Err(
@@ -712,7 +729,7 @@ fn validate_relative_symlink_target(destination: &Path, target: &Path) -> io::Re
     Ok(())
 }
 
-fn staging_path(path: &Path, staging: &StagingName) -> io::Result<PathBuf> {
+pub(super) fn staging_path(path: &Path, staging: &StagingName) -> io::Result<PathBuf> {
     let Some(parent) = path.parent() else {
         return Err(invalid_input("cache path has no parent"));
     };
@@ -761,7 +778,7 @@ fn invalid_data(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io;
+    use std::io::{self, Write as _};
     use std::path::Path;
 
     use tempfile::TempDir;
@@ -835,6 +852,292 @@ mod tests {
             root.read_regular_bounded(path, 32)?,
             RootedRead::Bytes(b"new-complete".to_vec())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_installs_a_regular_file_at_a_missing_destination() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let staging = Path::new("staging/model.bin");
+        let destination = Path::new("models/model.bin");
+        stage_regular(&root, staging, b"validated-model")?;
+
+        root.install_staged_replace(staging, destination)?;
+
+        assert_eq!(
+            fs::read(fixture.cache.join(destination))?,
+            b"validated-model"
+        );
+        assert!(!fixture.cache.join(staging).try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_atomically_replaces_a_regular_destination() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let staging = Path::new("staging/config.json");
+        let destination = Path::new("models/config.json");
+        root.replace(
+            destination,
+            b"old-complete",
+            &StagingName::new("old-config")?,
+        )?;
+        stage_regular(&root, staging, b"new-complete")?;
+
+        root.install_staged_replace(staging, destination)?;
+
+        assert_eq!(fs::read(fixture.cache.join(destination))?, b"new-complete");
+        assert!(!fixture.cache.join(staging).try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_an_identical_path_without_mutating_it() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let path = Path::new("staging/model.bin");
+        stage_regular(&root, path, b"validated-model")?;
+
+        let error = root
+            .install_staged_replace(path, path)
+            .expect_err("staging and destination must be distinct");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(fixture.cache.join(path))?, b"validated-model");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_missing_staging_without_mutating_destination() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let destination = Path::new("models/model.bin");
+        root.replace(destination, b"old", &StagingName::new("old-model")?)?;
+
+        let error = root
+            .install_staged_replace(Path::new("staging/missing"), destination)
+            .expect_err("missing staging must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(fixture.cache.join(destination))?, b"old");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_directory_staging_without_mutating_destination() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let staging = Path::new("staging/directory");
+        let destination = Path::new("models/model.bin");
+        root.ensure_dir(staging)?;
+        root.replace(destination, b"old", &StagingName::new("old-model")?)?;
+
+        let error = root
+            .install_staged_replace(staging, destination)
+            .expect_err("directory staging must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(fixture.cache.join(destination))?, b"old");
+        assert!(fixture.cache.join(staging).is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_a_directory_destination_without_mutating_it() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let staging = Path::new("staging/model.bin");
+        let destination = Path::new("models/model.bin");
+        stage_regular(&root, staging, b"new")?;
+        root.ensure_dir(destination)?;
+
+        let error = root
+            .install_staged_replace(staging, destination)
+            .expect_err("directory destination must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(fixture.cache.join(destination).is_dir());
+        assert_eq!(fs::read(fixture.cache.join(staging))?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_a_link_staging_entry_without_following_it() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("outside-staging");
+        let staging = fixture.cache.join("staging-link");
+        let destination = Path::new("models/model.bin");
+        fs::write(&outside, b"outside")?;
+        if !create_file_link(&outside, &staging)? {
+            return Ok(());
+        }
+        root.replace(destination, b"old", &StagingName::new("old-model")?)?;
+
+        let error = root
+            .install_staged_replace(Path::new("staging-link"), destination)
+            .expect_err("linked staging must be rejected");
+
+        assert!(super::is_unsafe_cache_path_error(&error));
+        assert_eq!(fs::read(outside)?, b"outside");
+        assert_eq!(fs::read(fixture.cache.join(destination))?, b"old");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_a_link_destination_without_following_it() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("outside-destination");
+        let destination = fixture.cache.join("destination-link");
+        let staging = Path::new("staging/model.bin");
+        fs::write(&outside, b"outside")?;
+        if !create_file_link(&outside, &destination)? {
+            return Ok(());
+        }
+        stage_regular(&root, staging, b"new")?;
+
+        let error = root
+            .install_staged_replace(staging, Path::new("destination-link"))
+            .expect_err("linked destination must be rejected");
+
+        assert!(super::is_unsafe_cache_path_error(&error));
+        assert_eq!(fs::read(outside)?, b"outside");
+        assert_eq!(fs::read(fixture.cache.join(staging))?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_a_linked_destination_ancestor_without_escaping() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("outside-destination");
+        let linked_parent = fixture.cache.join("linked-parent");
+        let staging = Path::new("staging/model.bin");
+        fs::create_dir(&outside)?;
+        if !create_dir_link(&outside, &linked_parent)? {
+            return Ok(());
+        }
+        stage_regular(&root, staging, b"new")?;
+
+        let error = root
+            .install_staged_replace(staging, Path::new("linked-parent/model.bin"))
+            .expect_err("linked destination ancestor must be rejected");
+
+        assert!(super::is_unsafe_cache_path_error(&error));
+        assert!(!outside.join("model.bin").try_exists()?);
+        assert_eq!(fs::read(fixture.cache.join(staging))?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_a_linked_staging_ancestor_without_escaping() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("outside-staging");
+        let linked_parent = fixture.cache.join("linked-staging");
+        let destination = Path::new("models/model.bin");
+        fs::create_dir(&outside)?;
+        fs::write(outside.join("model.bin"), b"outside")?;
+        if !create_dir_link(&outside, &linked_parent)? {
+            return Ok(());
+        }
+        root.replace(destination, b"old", &StagingName::new("old-model")?)?;
+
+        let error = root
+            .install_staged_replace(Path::new("linked-staging/model.bin"), destination)
+            .expect_err("linked staging ancestor must be rejected");
+
+        assert!(super::is_unsafe_cache_path_error(&error));
+        assert_eq!(fs::read(outside.join("model.bin"))?, b"outside");
+        assert_eq!(fs::read(fixture.cache.join(destination))?, b"old");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_parent_components_without_mutating_outside_paths() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("outside-destination");
+        let staging = Path::new("staging/model.bin");
+        fs::write(&outside, b"outside")?;
+        stage_regular(&root, staging, b"new")?;
+
+        let error = root
+            .install_staged_replace(staging, Path::new("../outside-destination"))
+            .expect_err("parent traversal must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(outside)?, b"outside");
+        assert_eq!(fs::read(fixture.cache.join(staging))?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_replace_rejects_parent_components_in_staging_without_escaping() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("outside-staging");
+        let destination = Path::new("models/model.bin");
+        fs::write(&outside, b"outside")?;
+        root.replace(destination, b"old", &StagingName::new("old-model")?)?;
+
+        let error = root
+            .install_staged_replace(Path::new("../outside-staging"), destination)
+            .expect_err("staging parent traversal must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(outside)?, b"outside");
+        assert_eq!(fs::read(fixture.cache.join(destination))?, b"old");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_replace_rejects_a_special_destination_without_mutating_it() -> io::Result<()> {
+        use std::os::unix::net::UnixListener;
+
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let staging = Path::new("staging/model.bin");
+        let destination = Path::new("model.socket");
+        stage_regular(&root, staging, b"new")?;
+        let _listener = UnixListener::bind(fixture.cache.join(destination))?;
+
+        let error = root
+            .install_staged_replace(staging, destination)
+            .expect_err("special destination must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(fixture.cache.join(staging))?, b"new");
+        assert!(fixture.cache.join(destination).try_exists()?);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_replace_rejects_a_reparse_destination_without_mutating_its_target() -> io::Result<()>
+    {
+        let fixture = Fixture::new()?;
+        let root = fixture.root()?;
+        let outside = fixture.base.path().join("junction-target");
+        let junction = fixture.cache.join("destination-junction");
+        let staging = Path::new("staging/model.bin");
+        fs::create_dir(&outside)?;
+        fs::write(outside.join("sentinel"), b"outside")?;
+        create_dir_junction(&outside, &junction)?;
+        stage_regular(&root, staging, b"new")?;
+
+        let error = root
+            .install_staged_replace(staging, Path::new("destination-junction"))
+            .expect_err("reparse destination must be rejected");
+
+        assert!(super::is_unsafe_cache_path_error(&error));
+        assert_eq!(fs::read(outside.join("sentinel"))?, b"outside");
+        assert_eq!(fs::read(fixture.cache.join(staging))?, b"new");
+        fs::remove_dir(junction)?;
         Ok(())
     }
 
@@ -1188,6 +1491,12 @@ mod tests {
         assert!(super::is_unsafe_cache_path_error(&error));
         assert!(!fixture.cache.join(destination).try_exists()?);
         Ok(())
+    }
+
+    fn stage_regular(root: &CacheRoot, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut file = root.create_new(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
     }
 
     struct Fixture {

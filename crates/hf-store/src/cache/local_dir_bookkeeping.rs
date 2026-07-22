@@ -983,6 +983,10 @@ mod tests {
             self.inner.install_staged_create_once(staging, destination)
         }
 
+        fn install_staged_replace(&self, staging: &Path, destination: &Path) -> io::Result<()> {
+            self.inner.install_staged_replace(staging, destination)
+        }
+
         fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {
             self.inner.replace(path, bytes, staging)
         }
@@ -1090,6 +1094,10 @@ mod tests {
             destination: &Path,
         ) -> io::Result<CreateOnceOutcome> {
             self.inner.install_staged_create_once(staging, destination)
+        }
+
+        fn install_staged_replace(&self, staging: &Path, destination: &Path) -> io::Result<()> {
+            self.inner.install_staged_replace(staging, destination)
         }
 
         fn replace(&self, path: &Path, bytes: &[u8], staging: &StagingName) -> io::Result<()> {

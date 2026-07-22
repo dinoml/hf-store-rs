@@ -2419,6 +2419,10 @@ mod tests {
             self.inner.install_staged_create_once(staging, destination)
         }
 
+        fn install_staged_replace(&self, staging: &Path, destination: &Path) -> io::Result<()> {
+            self.inner.install_staged_replace(staging, destination)
+        }
+
         fn create_once(
             &self,
             path: &Path,

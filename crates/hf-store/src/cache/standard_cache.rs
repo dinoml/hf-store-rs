@@ -2018,6 +2018,10 @@ mod tests {
             Ok(outcome)
         }
 
+        fn install_staged_replace(&self, staging: &Path, destination: &Path) -> io::Result<()> {
+            self.inner.install_staged_replace(staging, destination)
+        }
+
         fn create_once(
             &self,
             path: &Path,
