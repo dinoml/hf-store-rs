@@ -101,7 +101,6 @@ jobs:
           ref: 36fd32c84d630f455a23b9a3bc4dc7b76d19cdde
           path: .conformance/huggingface_hub
           persist-credentials: false
-          fetch-depth: 0
 
       - name: Install Python 3.13
         uses: actions/setup-python@v6
@@ -180,7 +179,6 @@ jobs:
           ref: 36fd32c84d630f455a23b9a3bc4dc7b76d19cdde
           path: .conformance/huggingface_hub
           persist-credentials: false
-          fetch-depth: 0
 
       - name: Install Python 3.13
         uses: actions/setup-python@v6
@@ -262,7 +260,6 @@ jobs:
           ref: 36fd32c84d630f455a23b9a3bc4dc7b76d19cdde
           path: .conformance/huggingface_hub
           persist-credentials: false
-          fetch-depth: 0
 
       - name: Install Python 3.13
         uses: actions/setup-python@v6
