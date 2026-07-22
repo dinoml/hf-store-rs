@@ -345,6 +345,24 @@ fn write_response(stream: &mut TcpStream, response: &ScriptedResponse) -> io::Re
                 return Err(source);
             }
         }
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let mut drain = [0_u8; 64];
+        loop {
+            match stream.read(&mut drain) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(source)
+                    if expected_disconnect_error(source.kind())
+                        || matches!(
+                            source.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) =>
+                {
+                    break;
+                }
+                Err(source) => return Err(source),
+            }
+        }
     }
     Ok(())
 }
