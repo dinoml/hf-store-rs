@@ -3,10 +3,13 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use url::Url;
 
-use crate::AuthToken;
+use crate::{AuthToken, Endpoint};
+
+const MAX_REDIRECTS: usize = 10;
 
 pub(crate) type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -207,6 +210,91 @@ pub(crate) trait Transport: Debug + Send + Sync {
     ) -> TransportFuture<'_, Result<TransportResponse, TransportError>>;
 }
 
+#[derive(Clone)]
+pub(crate) struct RedirectFollower {
+    transport: Arc<dyn Transport>,
+    endpoint: Url,
+}
+
+impl RedirectFollower {
+    pub(crate) fn new(
+        endpoint: &Endpoint,
+        transport: Arc<dyn Transport>,
+    ) -> Result<Self, TransportError> {
+        let endpoint =
+            Url::parse(endpoint.as_str()).map_err(|_source| TransportError::protocol())?;
+        Ok(Self {
+            transport,
+            endpoint,
+        })
+    }
+
+    pub(crate) fn send(
+        &self,
+        request: TransportRequest,
+    ) -> TransportFuture<'_, Result<TransportResponse, TransportError>> {
+        Box::pin(self.follow(request))
+    }
+
+    async fn follow(&self, request: TransportRequest) -> Result<TransportResponse, TransportError> {
+        let method = request.method;
+        let authorization = request.authorization.clone();
+        let range = request.range.clone();
+        let if_range = request.if_range.clone();
+        let mut target = request.target;
+        let mut visited = std::collections::BTreeSet::new();
+        for redirect_count in 0..=MAX_REDIRECTS {
+            if !visited.insert(target.as_str().to_owned()) {
+                return Err(TransportError::redirect());
+            }
+            let mut next_request = TransportRequest::new(method, target.clone())?;
+            if let Some(range) = range.clone() {
+                next_request = next_request.with_range(range, if_range.clone())?;
+            }
+            if same_origin(&target, &self.endpoint) {
+                if target.scheme() != "https" && authorization.is_some() {
+                    return Err(TransportError::authentication());
+                }
+                if let Some(token) = authorization.clone() {
+                    next_request = next_request.with_authorization(token);
+                }
+            }
+            let response = self.transport.send(next_request).await?;
+            if !is_redirect(response.status()) {
+                return Ok(response);
+            }
+            if redirect_count == MAX_REDIRECTS {
+                return Err(TransportError::redirect());
+            }
+            let location = response
+                .headers()
+                .get("location")
+                .ok_or_else(TransportError::redirect)?;
+            let next = target
+                .join(location)
+                .map_err(|_source| TransportError::redirect())?;
+            if !matches!(next.scheme(), "http" | "https")
+                || next.host_str().is_none()
+                || !next.username().is_empty()
+                || next.password().is_some()
+                || (target.scheme() == "https" && next.scheme() != "https")
+            {
+                return Err(TransportError::redirect());
+            }
+            target = next;
+        }
+        Err(TransportError::redirect())
+    }
+}
+
+impl Debug for RedirectFollower {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedirectFollower")
+            .finish_non_exhaustive()
+    }
+}
+
 pub(crate) struct TransportError {
     kind: TransportErrorKind,
     backtrace: Backtrace,
@@ -215,8 +303,10 @@ pub(crate) struct TransportError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransportErrorKind {
     Unavailable,
+    Authentication,
     Connection,
     Protocol,
+    Redirect,
     Body,
 }
 
@@ -229,12 +319,20 @@ impl TransportError {
         Self::new(TransportErrorKind::Connection)
     }
 
+    pub(crate) fn authentication() -> Self {
+        Self::new(TransportErrorKind::Authentication)
+    }
+
     pub(crate) fn protocol() -> Self {
         Self::new(TransportErrorKind::Protocol)
     }
 
     pub(crate) fn body() -> Self {
         Self::new(TransportErrorKind::Body)
+    }
+
+    pub(crate) fn redirect() -> Self {
+        Self::new(TransportErrorKind::Redirect)
     }
 
     fn new(kind: TransportErrorKind) -> Self {
@@ -252,12 +350,20 @@ impl TransportError {
         self.kind == TransportErrorKind::Connection
     }
 
+    pub(crate) fn is_authentication(&self) -> bool {
+        self.kind == TransportErrorKind::Authentication
+    }
+
     pub(crate) fn is_protocol(&self) -> bool {
         self.kind == TransportErrorKind::Protocol
     }
 
     pub(crate) fn is_body(&self) -> bool {
         self.kind == TransportErrorKind::Body
+    }
+
+    pub(crate) fn is_redirect(&self) -> bool {
+        self.kind == TransportErrorKind::Redirect
     }
 
     pub(crate) const fn backtrace(&self) -> &Backtrace {
@@ -278,8 +384,10 @@ impl Display for TransportError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         let message = match self.kind {
             TransportErrorKind::Unavailable => "network backend is unavailable",
+            TransportErrorKind::Authentication => "transport authentication is not permitted",
             TransportErrorKind::Connection => "transport connection failed",
             TransportErrorKind::Protocol => "transport response violated the protocol",
+            TransportErrorKind::Redirect => "transport redirect was rejected",
             TransportErrorKind::Body => "transport response body failed",
         };
         formatter.write_str(message)
@@ -295,8 +403,19 @@ fn safe_header_value(value: &str) -> bool {
             .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
 }
 
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
 
@@ -337,6 +456,38 @@ mod tests {
                     )
                 });
             Box::pin(std::future::ready(result))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RedirectScript {
+        responses: Mutex<VecDeque<TransportResponse>>,
+        observed: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+
+    impl Transport for RedirectScript {
+        fn send(
+            &self,
+            request: TransportRequest,
+        ) -> TransportFuture<'_, Result<TransportResponse, TransportError>> {
+            let observed = self
+                .observed
+                .lock()
+                .map_err(|_poisoned| TransportError::connection())
+                .map(|mut observed| {
+                    observed.push((
+                        request.target().as_str().to_owned(),
+                        request.authorization().is_some(),
+                    ));
+                });
+            let response = observed.and_then(|()| {
+                self.responses
+                    .lock()
+                    .map_err(|_poisoned| TransportError::connection())?
+                    .pop_front()
+                    .ok_or_else(TransportError::connection)
+            });
+            Box::pin(std::future::ready(response))
         }
     }
 
@@ -383,6 +534,115 @@ mod tests {
                 .is_protocol()
         );
         Ok(())
+    }
+
+    #[test]
+    fn redirects_retain_bearer_only_for_the_exact_endpoint_origin() -> Result<(), Box<dyn Error>> {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let script = RedirectScript {
+            responses: Mutex::new(VecDeque::from([
+                response(302, Some("/trusted"))?,
+                response(302, Some("https://cdn.example/file?signed=secret"))?,
+                response(200, None)?,
+            ])),
+            observed: Arc::clone(&observed),
+        };
+        let endpoint = Endpoint::parse("https://hub.example:443")?;
+        let follower = RedirectFollower::new(&endpoint, Arc::new(script))?;
+        let request = TransportRequest::new(
+            TransportMethod::Get,
+            Url::parse("https://hub.example/start")?,
+        )?
+        .with_authorization(AuthToken::new(SECRET)?);
+
+        assert_eq!(run_ready(follower.send(request))?.status(), 200);
+        let requests = observed
+            .lock()
+            .map_err(|_poisoned| "redirect observation lock poisoned")?;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].1);
+        assert!(requests[1].1);
+        assert!(!requests[2].1);
+        assert!(requests[2].0.contains("signed=secret"));
+        assert!(!format!("{follower:?}").contains(SECRET));
+        Ok(())
+    }
+
+    #[test]
+    fn redirects_reject_downgrades_loops_and_excessive_hops_without_leaking_urls()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = Endpoint::parse("https://hub.example")?;
+        let cases = [
+            (vec![response(302, Some("http://hub.example/plain"))?], 1),
+            (
+                vec![
+                    response(302, Some("/again?signed=secret"))?,
+                    response(302, Some("/again?signed=secret"))?,
+                ],
+                2,
+            ),
+            (
+                (0..=MAX_REDIRECTS)
+                    .map(|index| response(302, Some(&format!("/hop-{index}"))))
+                    .collect::<Result<Vec<_>, _>>()?,
+                MAX_REDIRECTS + 1,
+            ),
+        ];
+        for (responses, expected_calls) in cases {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let follower = RedirectFollower::new(
+                &endpoint,
+                Arc::new(RedirectScript {
+                    responses: Mutex::new(responses.into()),
+                    observed: Arc::clone(&observed),
+                }),
+            )?;
+            let request = TransportRequest::new(
+                TransportMethod::Get,
+                Url::parse("https://hub.example/start")?,
+            )?
+            .with_authorization(AuthToken::new(SECRET)?);
+            let error = run_ready(follower.send(request))
+                .expect_err("unsafe redirect sequence was accepted");
+            assert!(error.is_redirect());
+            assert_eq!(
+                observed
+                    .lock()
+                    .map_err(|_poisoned| "redirect observation lock poisoned")?
+                    .len(),
+                expected_calls
+            );
+            assert!(!format!("{error:?}").contains(SECRET));
+            assert!(!error.to_string().contains(SECRET));
+        }
+
+        let http_endpoint = Endpoint::parse("http://hub.example")?;
+        let follower = RedirectFollower::new(
+            &http_endpoint,
+            Arc::new(RedirectScript {
+                responses: Mutex::new(VecDeque::new()),
+                observed: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )?;
+        let request = TransportRequest::new(
+            TransportMethod::Get,
+            Url::parse("http://hub.example/start")?,
+        )?
+        .with_authorization(AuthToken::new(SECRET)?);
+        assert!(
+            run_ready(follower.send(request))
+                .expect_err("sent bearer authentication over plaintext HTTP")
+                .is_authentication()
+        );
+        Ok(())
+    }
+
+    fn response(status: u16, location: Option<&str>) -> Result<TransportResponse, TransportError> {
+        let headers = match location {
+            Some(location) => TransportHeaders::new([("location", location)])?,
+            None => TransportHeaders::default(),
+        };
+        TransportResponse::new(status, headers, Box::new(MemoryBody(None)))
     }
 
     fn run_ready<T>(mut future: TransportFuture<'_, T>) -> T {
