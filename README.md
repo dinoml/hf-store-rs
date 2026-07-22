@@ -13,8 +13,12 @@ without understanding cache internals. The CLI is a thin adapter over the same
 library contracts, not the application integration boundary.
 
 > [!IMPORTANT]
-> This repository is a pre-alpha bootstrap. Version `0.0.0` does not yet fetch
-> repositories and makes no compatibility or stability claim.
+> This repository is pre-alpha. Version `0.0.0` does not yet provide a
+> transport-backed public fetch API or a stability guarantee. Its private
+> shared-cache adapter is conformance-tested specifically against
+> `huggingface_hub` v1.24.0 at commit
+> `36fd32c84d630f455a23b9a3bc4dc7b76d19cdde`; compatibility with other versions
+> is not implied.
 
 ## Intended scope
 
