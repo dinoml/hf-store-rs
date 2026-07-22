@@ -52,6 +52,11 @@ mod test_http_fixture;
 
 #[allow(
     dead_code,
+    reason = "the private transfer state machine is being completed before acquisition is public"
+)]
+mod transfer;
+#[allow(
+    dead_code,
     reason = "private transport seams are being built before the public HubStore service"
 )]
 mod transport;
