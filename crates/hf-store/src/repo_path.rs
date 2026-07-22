@@ -126,3 +126,39 @@ fn is_windows_reserved_name(component: &str) -> bool {
 fn path_error(kind: ValidationErrorKind) -> ValidationError {
     ValidationError::new("repository path", kind)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_untrusted_paths_never_escape_or_leak_diagnostics() {
+        let alphabet = b"abcXYZ019./\\:*? <>\0\r\n";
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        for _case in 0..10_000 {
+            let length = usize::try_from(state & 31).unwrap_or(0);
+            let mut value = String::with_capacity(length);
+            for _index in 0..length {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let generated = state.to_le_bytes()[0];
+                value.push(char::from(alphabet[usize::from(generated) % alphabet.len()]));
+            }
+            match RepoPath::parse(&value) {
+                Ok(path) => {
+                    assert_eq!(path.as_str(), value);
+                    assert!(!path.as_str().starts_with('/'));
+                    assert!(!path.as_str().contains(['\\', '\0']));
+                    assert!(path.as_str().split('/').all(|component| {
+                        !component.is_empty() && !matches!(component, "." | "..")
+                    }));
+                }
+                Err(error) => {
+                    assert!(!error.to_string().contains(&value) || value.is_empty());
+                    assert!(!format!("{error:?}").contains(&value) || value.is_empty());
+                }
+            }
+        }
+    }
+}

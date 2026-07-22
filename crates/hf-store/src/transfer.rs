@@ -428,6 +428,49 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
 
+    #[test]
+    fn generated_range_responses_accept_only_exact_state_transitions() {
+        for expected_size in 2_u64..512 {
+            let offset = 1 + (expected_size * 17 % (expected_size - 1));
+            let remaining = expected_size - offset;
+            let valid_range = format!("bytes {offset}-{}/{expected_size}", expected_size - 1);
+            assert_eq!(
+                validate_file_response(
+                    206,
+                    Some(&remaining.to_string()),
+                    Some(&valid_range),
+                    Some(offset),
+                    expected_size,
+                )
+                .ok(),
+                Some(BodyDisposition::Resume {
+                    offset,
+                    expected_body_bytes: remaining,
+                })
+            );
+
+            let invalid = [
+                format!("bytes 0-{}/{expected_size}", expected_size - 1),
+                format!("bytes {offset}-{}/{expected_size}", expected_size - 2),
+                format!("bytes {offset}-{}/{}", expected_size - 1, expected_size + 1),
+                format!("bytes {offset}-{}/*", expected_size - 1),
+            ];
+            for range in invalid {
+                assert!(
+                    validate_file_response(
+                        206,
+                        Some(&remaining.to_string()),
+                        Some(&range),
+                        Some(offset),
+                        expected_size,
+                    )
+                    .is_err(),
+                    "accepted generated invalid range shape"
+                );
+            }
+        }
+    }
+
     use crate::transport::{TransportError, TransportFuture};
 
     use super::*;

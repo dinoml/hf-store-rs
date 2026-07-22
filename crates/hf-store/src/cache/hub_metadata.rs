@@ -663,4 +663,20 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn generated_upstream_tree_bytes_never_escape_the_parser_contract() {
+        let mut state = 0x3c6e_f372_fe94_f82b_u64;
+        for length in 0..1024_usize {
+            let mut bytes = Vec::with_capacity(length);
+            for _index in 0..length {
+                state = state.rotate_left(9) ^ 0xa54f_f53a_5f1d_36f1;
+                bytes.push(state.to_le_bytes()[0]);
+            }
+            if let Err(error) = decode_tree(&bytes) {
+                let rendered = format!("{error:?} {error}");
+                assert!(!rendered.contains("hf_secret"));
+            }
+        }
+    }
 }

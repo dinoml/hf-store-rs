@@ -423,6 +423,43 @@ mod tests {
 
     const SECRET: &str = "hf_secret_transport_abstraction_sentinel";
 
+    #[test]
+    fn generated_redirect_chains_enforce_the_exact_hop_limit() -> Result<(), Box<dyn Error>> {
+        let endpoint = Endpoint::parse("https://hub.example")?;
+        for hops in 0..=MAX_REDIRECTS + 2 {
+            let mut responses = (0..hops)
+                .map(|index| response(302, Some(&format!("/hop-{index}"))))
+                .collect::<Result<Vec<_>, _>>()?;
+            responses.push(response(200, None)?);
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let follower = RedirectFollower::new(
+                &endpoint,
+                Arc::new(RedirectScript {
+                    responses: Mutex::new(responses.into()),
+                    observed: Arc::clone(&observed),
+                }),
+            )?;
+            let request = TransportRequest::new(
+                TransportMethod::Get,
+                Url::parse("https://hub.example/start")?,
+            )?;
+            let result = run_ready(follower.send(request));
+            if hops <= MAX_REDIRECTS {
+                assert_eq!(result?.status(), 200);
+                assert_eq!(
+                    observed
+                        .lock()
+                        .map_err(|_poisoned| "redirect observation lock poisoned")?
+                        .len(),
+                    hops + 1
+                );
+            } else {
+                assert!(result.is_err_and(|error| error.is_redirect()));
+            }
+        }
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct MemoryBody(Option<Box<[u8]>>);
 

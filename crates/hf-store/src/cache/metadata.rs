@@ -1066,6 +1066,31 @@ mod tests {
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
     #[test]
+    fn generated_metadata_bytes_are_always_bounded_and_safely_classified() {
+        let mut state = 0xbb67_ae85_84ca_a73b_u64;
+        for length in 0..512_usize {
+            let mut bytes = Vec::with_capacity(length);
+            for _index in 0..length {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                bytes.push(state.to_le_bytes()[0]);
+            }
+            for error in [
+                decode_record::<RefRecord>(&bytes).err(),
+                decode_record::<RemoteTreeRecord>(&bytes).err(),
+                decode_record::<SnapshotManifestRecord>(&bytes).err(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let rendered = format!("{error:?} {error}");
+                assert!(!rendered.contains("hf_secret"));
+            }
+        }
+    }
+
+    #[test]
     fn every_phase_one_record_round_trips() -> Result<(), Box<dyn std::error::Error>> {
         let endpoint = Endpoint::hugging_face();
         let spec = RepositorySpec::model(RepositoryId::parse("org/repo")?);
