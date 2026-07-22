@@ -31,6 +31,7 @@ use super::rooted_fs::{
 };
 #[cfg(test)]
 use super::rooted_fs::{RootedLockGuard, RootedRead, RootedWrite};
+use super::sanitized_io::SanitizedIo;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_SMALL_RECORD_BYTES: usize = 64 * 1024;
@@ -491,10 +492,10 @@ impl CacheKernel {
                 self.check_fault(PublicationPoint::AfterBlobPublish, true)?;
                 self.root
                     .remove_file(&staging_relative)
-                    .map_err(|source| CacheError::io(source, true))?;
+                    .map_err(|source| CacheError::io(&source, true))?;
                 cleanup.deactivate();
                 self.sync_parent(&destination)
-                    .map_err(|source| CacheError::io(source, true))?;
+                    .map_err(|source| CacheError::io(&source, true))?;
                 Ok(BlobPublication::new(
                     destination,
                     BlobPublicationOutcome::Published,
@@ -656,10 +657,10 @@ impl CacheKernel {
         self.check_fault(PublicationPoint::BeforeAtomicReplace, false)?;
         self.root
             .replace(relative, encoded, &staging)
-            .map_err(|source| CacheError::io(source, true))?;
+            .map_err(|source| CacheError::io(&source, true))?;
         self.check_fault(PublicationPoint::AfterAtomicReplace, true)?;
         self.sync_parent(destination)
-            .map_err(|source| CacheError::io(source, true))
+            .map_err(|source| CacheError::io(&source, true))
     }
 
     fn publish_immutable_record<T>(
@@ -794,12 +795,12 @@ impl CacheKernel {
         let outcome = self
             .root
             .create_once(relative, encoded, &staging)
-            .map_err(|source| CacheError::io(source, true))?;
+            .map_err(|source| CacheError::io(&source, true))?;
         match outcome {
             CreateOnceOutcome::Created => {
                 self.check_fault(PublicationPoint::AfterAtomicReplace, true)?;
                 self.sync_parent(destination)
-                    .map_err(|source| CacheError::io(source, true))
+                    .map_err(|source| CacheError::io(&source, true))
             }
             CreateOnceOutcome::Existing => {
                 let actual = self.read_record::<T>(destination, max_bytes)?;
@@ -851,7 +852,7 @@ impl CacheKernel {
         self.effects
             .faults
             .check(point)
-            .map_err(|source| CacheError::io(source, may_have_published))
+            .map_err(|source| CacheError::io(&source, may_have_published))
     }
 }
 
@@ -890,8 +891,8 @@ pub(super) struct CacheError {
 
 #[derive(Debug)]
 enum CacheErrorKind {
-    Io(io::Error),
-    UnsafePath(io::Error),
+    Io(SanitizedIo),
+    UnsafePath(SanitizedIo),
     Validation(ValidationError),
     Metadata(MetadataError),
     SizeMismatch { expected: u64, actual: u64 },
@@ -910,8 +911,10 @@ impl CacheError {
         }
     }
 
-    fn io(source: io::Error, may_have_published: bool) -> Self {
-        let kind = if is_unsafe_cache_path_error(&source) {
+    fn io(source: &io::Error, may_have_published: bool) -> Self {
+        let unsafe_path = is_unsafe_cache_path_error(source);
+        let source = SanitizedIo::new(source);
+        let kind = if unsafe_path {
             CacheErrorKind::UnsafePath(source)
         } else {
             CacheErrorKind::Io(source)
@@ -975,6 +978,20 @@ impl CacheError {
         )
     }
 
+    #[cfg(test)]
+    fn io_kind(&self) -> Option<io::ErrorKind> {
+        match self.kind.as_ref() {
+            CacheErrorKind::Io(source) | CacheErrorKind::UnsafePath(source) => Some(source.kind()),
+            CacheErrorKind::Validation(_)
+            | CacheErrorKind::Metadata(_)
+            | CacheErrorKind::SizeMismatch { .. }
+            | CacheErrorKind::DigestMismatch
+            | CacheErrorKind::CorruptExistingBlob
+            | CacheErrorKind::ConflictingRecord
+            | CacheErrorKind::RecordTooLarge => None,
+        }
+    }
+
     pub(super) fn is_corrupt_record(&self) -> bool {
         match self.kind.as_ref() {
             CacheErrorKind::Metadata(source) => source.is_corrupt(),
@@ -1034,10 +1051,11 @@ impl Display for CacheError {
 impl Error for CacheError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self.kind.as_ref() {
-            CacheErrorKind::Io(source) | CacheErrorKind::UnsafePath(source) => Some(source),
             CacheErrorKind::Validation(source) => Some(source),
             CacheErrorKind::Metadata(source) => Some(source),
-            CacheErrorKind::SizeMismatch { .. }
+            CacheErrorKind::Io(_)
+            | CacheErrorKind::UnsafePath(_)
+            | CacheErrorKind::SizeMismatch { .. }
             | CacheErrorKind::DigestMismatch
             | CacheErrorKind::CorruptExistingBlob
             | CacheErrorKind::ConflictingRecord
@@ -1048,7 +1066,7 @@ impl Error for CacheError {
 
 impl From<io::Error> for CacheError {
     fn from(source: io::Error) -> Self {
-        Self::io(source, false)
+        Self::io(&source, false)
     }
 }
 
@@ -1350,6 +1368,20 @@ mod tests {
         assert!(size_error.is_size_mismatch());
         assert_eq!(bytes_read.load(Ordering::Acquire), 4);
 
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_reader_errors_are_redacted_without_losing_the_io_kind()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let error = fixture
+            .kernel
+            .publish_blob(SecretReader, 1, BlobDigest::for_bytes(b"x"))
+            .expect_err("accepted a reader failure");
+
+        assert_eq!(error.io_kind(), Some(io::ErrorKind::PermissionDenied));
+        assert_secret_absent_from_error_chain(&error);
         Ok(())
     }
 
@@ -2247,6 +2279,41 @@ mod tests {
         kernel: CacheKernel,
         faults: Arc<FaultController>,
         ids: Arc<SequenceOperationIds>,
+    }
+
+    const SECRET_ERROR_SENTINEL: &str = "hf_secret_signed_url_sentinel";
+
+    struct SecretError;
+
+    impl Debug for SecretError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            formatter.write_str(SECRET_ERROR_SENTINEL)
+        }
+    }
+
+    impl Display for SecretError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            formatter.write_str(SECRET_ERROR_SENTINEL)
+        }
+    }
+
+    impl Error for SecretError {}
+
+    struct SecretReader;
+
+    impl Read for SecretReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, SecretError))
+        }
+    }
+
+    fn assert_secret_absent_from_error_chain(error: &(dyn Error + 'static)) {
+        let mut current = Some(error);
+        while let Some(source) = current {
+            assert!(!source.to_string().contains(SECRET_ERROR_SENTINEL));
+            assert!(!format!("{source:?}").contains(SECRET_ERROR_SENTINEL));
+            current = source.source();
+        }
     }
 
     impl Fixture {

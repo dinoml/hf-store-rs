@@ -16,6 +16,7 @@ use super::hub_metadata::{HubMetadataError, HubTree, HubTreeEntry, decode_ref, d
 use super::key::BlobDigest;
 use super::publication::{CacheDirectory, EntryKind, FileSystem, RegularFileOpen};
 use super::rooted_fs::is_unsafe_cache_path_error;
+use super::sanitized_io::SanitizedIo;
 
 // A standard-cache ref contains one 40-byte commit. Leave limited headroom for
 // detecting malformed records without permitting an unbounded allocation.
@@ -551,8 +552,8 @@ pub(super) struct HubCacheReadError {
 
 #[derive(Debug)]
 enum HubCacheReadErrorKind {
-    Io(io::Error),
-    UnsafeFileSystem(io::Error),
+    Io(SanitizedIo),
+    UnsafeFileSystem(SanitizedIo),
     Validation(ValidationError),
     Missing,
     Incomplete,
@@ -636,6 +637,21 @@ impl HubCacheReadError {
     pub(super) fn backtrace(&self) -> &Backtrace {
         &self.backtrace
     }
+
+    #[cfg(test)]
+    fn io_kind(&self) -> Option<io::ErrorKind> {
+        match self.kind.as_ref() {
+            HubCacheReadErrorKind::Io(source) | HubCacheReadErrorKind::UnsafeFileSystem(source) => {
+                Some(source.kind())
+            }
+            HubCacheReadErrorKind::Validation(_)
+            | HubCacheReadErrorKind::Missing
+            | HubCacheReadErrorKind::Incomplete
+            | HubCacheReadErrorKind::Corrupt(_)
+            | HubCacheReadErrorKind::UnsupportedVersion(_)
+            | HubCacheReadErrorKind::Unsafe(_) => None,
+        }
+    }
 }
 
 impl Display for HubCacheReadError {
@@ -659,9 +675,6 @@ impl Display for HubCacheReadError {
 impl Error for HubCacheReadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self.kind.as_ref() {
-            HubCacheReadErrorKind::Io(source) | HubCacheReadErrorKind::UnsafeFileSystem(source) => {
-                Some(source)
-            }
             HubCacheReadErrorKind::Validation(source) | HubCacheReadErrorKind::Unsafe(source) => {
                 Some(source)
             }
@@ -669,14 +682,18 @@ impl Error for HubCacheReadError {
             | HubCacheReadErrorKind::UnsupportedVersion(source) => Some(source),
             HubCacheReadErrorKind::Missing
             | HubCacheReadErrorKind::Incomplete
-            | HubCacheReadErrorKind::Corrupt(None) => None,
+            | HubCacheReadErrorKind::Corrupt(None)
+            | HubCacheReadErrorKind::Io(_)
+            | HubCacheReadErrorKind::UnsafeFileSystem(_) => None,
         }
     }
 }
 
 impl From<io::Error> for HubCacheReadError {
     fn from(source: io::Error) -> Self {
-        if is_unsafe_cache_path_error(&source) {
+        let unsafe_path = is_unsafe_cache_path_error(&source);
+        let source = SanitizedIo::new(&source);
+        if unsafe_path {
             Self::new(HubCacheReadErrorKind::UnsafeFileSystem(source))
         } else {
             Self::new(HubCacheReadErrorKind::Io(source))
@@ -924,6 +941,92 @@ mod tests {
 
         assert!(error.is_corrupt());
         assert!(!read_attempted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn arbitrary_directory_and_reader_errors_are_redacted_without_losing_the_io_kind() {
+        for return_reader in [false, true] {
+            let directory = SecretDirectory { return_reader };
+            let error = HubCacheReader::read_regular_record(
+                &directory,
+                Path::new("trees/secret.json"),
+                1,
+                MissingRecord::Incomplete,
+            )
+            .expect_err("accepted an injected I/O failure");
+
+            assert_eq!(error.io_kind(), Some(io::ErrorKind::PermissionDenied));
+            assert_secret_absent_from_error_chain(&error);
+        }
+    }
+
+    const SECRET_ERROR_SENTINEL: &str = "hf_secret_signed_url_sentinel";
+
+    struct SecretError;
+
+    impl fmt::Debug for SecretError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            formatter.write_str(SECRET_ERROR_SENTINEL)
+        }
+    }
+
+    impl Display for SecretError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            formatter.write_str(SECRET_ERROR_SENTINEL)
+        }
+    }
+
+    impl Error for SecretError {}
+
+    struct SecretReader;
+
+    impl Read for SecretReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(secret_io_error())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SecretDirectory {
+        return_reader: bool,
+    }
+
+    impl CacheDirectory for SecretDirectory {
+        fn open_dir_nofollow(&self, _path: &Path) -> io::Result<Arc<dyn CacheDirectory>> {
+            Err(io::Error::other("nested directory open is not supported"))
+        }
+
+        fn open_regular(&self, _path: &Path) -> io::Result<RegularFileOpen> {
+            if self.return_reader {
+                Ok(RegularFileOpen::File {
+                    reader: Box::new(SecretReader),
+                    size: 1,
+                })
+            } else {
+                Err(secret_io_error())
+            }
+        }
+
+        fn entry_kind(&self, _path: &Path) -> io::Result<EntryKind> {
+            Ok(EntryKind::RegularFile)
+        }
+
+        fn read_link(&self, _path: &Path) -> io::Result<PathBuf> {
+            Err(io::Error::other("link reads are not supported"))
+        }
+    }
+
+    fn secret_io_error() -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, SecretError)
+    }
+
+    fn assert_secret_absent_from_error_chain(error: &(dyn Error + 'static)) {
+        let mut current = Some(error);
+        while let Some(source) = current {
+            assert!(!source.to_string().contains(SECRET_ERROR_SENTINEL));
+            assert!(!format!("{source:?}").contains(SECRET_ERROR_SENTINEL));
+            current = source.source();
+        }
     }
 
     #[test]

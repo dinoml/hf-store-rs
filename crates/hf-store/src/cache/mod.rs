@@ -9,4 +9,5 @@ mod local_dir_layout;
 mod metadata;
 mod publication;
 mod rooted_fs;
+mod sanitized_io;
 mod standard_cache;
