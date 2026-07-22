@@ -15,7 +15,8 @@ use super::local_dir_reconciliation::{
     LocalDirCandidateSet, LocalDirSourceError, PreparedLocalDirSource,
 };
 use super::metadata::{SnapshotFileRecord, SnapshotManifestRecord};
-use super::publication::{CacheError, CacheKernel, Effects};
+use super::publication::{CacheError, CacheKernel, Effects, SnapshotLease};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub(super) struct CompatibleSnapshotImporter {
@@ -127,6 +128,9 @@ impl CompatibleCacheOffline {
     ) -> Result<CompatibleSnapshot, CompatibleCacheError> {
         let selection = ExactSelection::new(paths)?;
         let index = self.reader.read_index(revision)?;
+        let lease = self
+            .sidecar
+            .acquire_snapshot_lease(index.commit(), &selection.id)?;
         let manifest = self
             .sidecar
             .read_snapshot_manifest(index.commit(), &selection.id)?;
@@ -162,6 +166,7 @@ impl CompatibleCacheOffline {
             commit: index.commit().clone(),
             selection: selection.id,
             files: files.into_boxed_slice(),
+            lease,
         })
     }
 
@@ -319,12 +324,23 @@ fn open_shared_cache(
     Ok((reader, sidecar))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct CompatibleSnapshot {
     commit: CommitId,
     selection: SelectionId,
     files: Box<[CompatibleSnapshotFile]>,
+    lease: Arc<SnapshotLease>,
 }
+
+impl PartialEq for CompatibleSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.commit == other.commit
+            && self.selection == other.selection
+            && self.files == other.files
+    }
+}
+
+impl Eq for CompatibleSnapshot {}
 
 impl CompatibleSnapshot {
     pub(super) const fn commit(&self) -> &CommitId {
@@ -337,6 +353,10 @@ impl CompatibleSnapshot {
 
     pub(super) fn files(&self) -> &[CompatibleSnapshotFile] {
         &self.files
+    }
+
+    pub(super) fn lease(&self) -> &Arc<SnapshotLease> {
+        &self.lease
     }
 }
 
@@ -541,7 +561,6 @@ impl From<ValidationError> for CompatibleCacheError {
 mod tests {
     use std::fs;
     use std::io;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use tempfile::TempDir;

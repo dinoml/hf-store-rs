@@ -389,6 +389,23 @@ pub(super) struct OwnedSnapshotFile {
     size: u64,
 }
 
+#[derive(Debug)]
+pub(super) struct SnapshotLease {
+    _guard: Box<dyn RootedLockGuard>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct OwnedSnapshotRead {
+    files: Vec<OwnedSnapshotFile>,
+    lease: Arc<SnapshotLease>,
+}
+
+impl OwnedSnapshotRead {
+    pub(super) fn into_parts(self) -> (Vec<OwnedSnapshotFile>, Arc<SnapshotLease>) {
+        (self.files, self.lease)
+    }
+}
+
 impl OwnedSnapshotFile {
     pub(super) const fn path(&self) -> &RepoPath {
         &self.path
@@ -834,7 +851,7 @@ impl CacheKernel {
         commit: &CommitId,
         selection: &SelectionId,
         files: &[(RepoPath, BlobDigest, u64)],
-    ) -> Result<Vec<OwnedSnapshotFile>, CacheError> {
+    ) -> Result<OwnedSnapshotRead, CacheError> {
         let lock_path = self.layout.snapshot_lock(commit, selection);
         self.ensure_parent(&lock_path)?;
         let _guard = self.root.lock_exclusive(self.relative_path(&lock_path)?)?;
@@ -888,7 +905,7 @@ impl CacheKernel {
         &self,
         revision: &Revision,
         paths: &[RepoPath],
-    ) -> Result<Vec<OwnedSnapshotFile>, CacheError> {
+    ) -> Result<OwnedSnapshotRead, CacheError> {
         let commit = match CommitId::parse(revision.as_str()) {
             Ok(commit) => commit,
             Err(_symbolic) => self.read_ref(revision)?,
@@ -897,6 +914,11 @@ impl CacheKernel {
         paths.sort_unstable();
         paths.dedup();
         let selection = SelectionId::derive(&paths)?;
+        let lease_path = self.layout.snapshot_lease(&commit, &selection);
+        self.ensure_parent(&lease_path)?;
+        let lease = Arc::new(SnapshotLease {
+            _guard: self.root.lock_shared(self.relative_path(&lease_path)?)?,
+        });
         let manifest = self.read_snapshot_manifest(&commit, &selection)?;
         if manifest.files().len() != paths.len() {
             return Err(CacheError::conflicting_record());
@@ -921,7 +943,31 @@ impl CacheKernel {
                 size,
             });
         }
-        Ok(files)
+        Ok(OwnedSnapshotRead { files, lease })
+    }
+
+    pub(super) fn acquire_snapshot_lease(
+        &self,
+        commit: &CommitId,
+        selection: &SelectionId,
+    ) -> Result<Arc<SnapshotLease>, CacheError> {
+        let lease_path = self.layout.snapshot_lease(commit, selection);
+        self.ensure_parent(&lease_path)?;
+        Ok(Arc::new(SnapshotLease {
+            _guard: self.root.lock_shared(self.relative_path(&lease_path)?)?,
+        }))
+    }
+
+    pub(super) fn try_snapshot_maintenance_lease(
+        &self,
+        commit: &CommitId,
+        selection: &SelectionId,
+    ) -> Result<super::rooted_fs::RootedLockAttempt, CacheError> {
+        let lease_path = self.layout.snapshot_lease(commit, selection);
+        self.ensure_parent(&lease_path)?;
+        Ok(self
+            .root
+            .try_lock_exclusive(self.relative_path(&lease_path)?)?)
     }
 
     pub(super) fn new_partial_record(
@@ -1894,6 +1940,47 @@ mod tests {
         assert_eq!(std::fs::read(publication.path())?, payload);
         assert!(fixture.kernel.staging_entries()?.is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_reader_lease_blocks_exclusive_maintenance_until_last_handle_drops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let payload = b"leased snapshot";
+        let digest = BlobDigest::for_bytes(payload);
+        fixture
+            .kernel
+            .publish_blob(Cursor::new(payload), u64::try_from(payload.len())?, digest)?;
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let path = RepoPath::parse("model.bin")?;
+        let selection = SelectionId::derive(std::slice::from_ref(&path))?;
+        let snapshot = fixture.kernel.publish_owned_snapshot(
+            &commit,
+            &selection,
+            &[(path, digest, payload.len() as u64)],
+        )?;
+        assert!(matches!(
+            fixture
+                .kernel
+                .try_snapshot_maintenance_lease(&commit, &selection)?,
+            RootedLockAttempt::Contended
+        ));
+        let cloned = snapshot.clone();
+        drop(snapshot);
+        assert!(matches!(
+            fixture
+                .kernel
+                .try_snapshot_maintenance_lease(&commit, &selection)?,
+            RootedLockAttempt::Contended
+        ));
+        drop(cloned);
+        assert!(matches!(
+            fixture
+                .kernel
+                .try_snapshot_maintenance_lease(&commit, &selection)?,
+            RootedLockAttempt::Acquired(_)
+        ));
         Ok(())
     }
 

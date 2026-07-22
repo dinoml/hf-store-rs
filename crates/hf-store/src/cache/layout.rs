@@ -220,6 +220,13 @@ impl CacheLayout {
             .join(format!("{commit}-{selection}.lock"))
     }
 
+    pub(super) fn snapshot_lease(&self, commit: &CommitId, selection: &SelectionId) -> PathBuf {
+        self.repository_directory()
+            .join("leases")
+            .join("snapshots")
+            .join(format!("{commit}-{selection}.lease"))
+    }
+
     pub(super) fn hub_blob_binding_record(
         &self,
         hub_blob_key: &HubBlobKey,

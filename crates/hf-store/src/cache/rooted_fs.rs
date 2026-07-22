@@ -135,7 +135,7 @@ impl RootedWrite for cap_std::fs::File {
     }
 }
 
-pub(super) trait RootedLockGuard: fmt::Debug + Send {}
+pub(super) trait RootedLockGuard: fmt::Debug + Send + Sync {}
 
 #[derive(Debug)]
 pub(super) enum RootedLockAttempt {
@@ -307,6 +307,9 @@ pub(super) trait RootedFileSystem: fmt::Debug + Send + Sync {
         staging_path: &Path,
     ) -> io::Result<()>;
     fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>>;
+    fn lock_shared(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
+        self.lock_exclusive(path)
+    }
     fn try_lock_exclusive(&self, _path: &Path) -> io::Result<RootedLockAttempt> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -694,6 +697,12 @@ impl RootedFileSystem for CacheRoot {
     fn lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
         let file = self.open_lock_file(path)?;
         fs4::FileExt::lock(&file)?;
+        Ok(Box::new(OsRootedLockGuard { _file: file }))
+    }
+
+    fn lock_shared(&self, path: &Path) -> io::Result<Box<dyn RootedLockGuard>> {
+        let file = self.open_lock_file(path)?;
+        fs4::FileExt::lock_shared(&file)?;
         Ok(Box::new(OsRootedLockGuard { _file: file }))
     }
 

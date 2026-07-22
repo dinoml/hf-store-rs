@@ -17,6 +17,7 @@ pub struct Snapshot {
     selection: SelectionId,
     files: Box<[SnapshotFile]>,
     reused: bool,
+    _lease_owner: AcquiredSnapshot,
 }
 
 impl Snapshot {
@@ -41,6 +42,7 @@ impl Snapshot {
             selection: *acquired.selection(),
             files,
             reused,
+            _lease_owner: acquired.clone(),
         }
     }
 

@@ -15,7 +15,9 @@ use crate::{CommitId, Endpoint, FetchPlan, RepoPath, RepositorySpec, Revision};
 use super::CacheView;
 use super::compatible_cache::{CompatibleCacheError, CompatibleCacheOffline, CompatibleSnapshot};
 use super::key::{BlobDigest, SelectionId};
-use super::publication::{CacheError, CacheKernel, Effects, OwnedSnapshotFile};
+use super::publication::{
+    CacheError, CacheKernel, Effects, OwnedSnapshotFile, OwnedSnapshotRead, SnapshotLease,
+};
 use super::standard_cache::StandardCacheWriter;
 
 #[derive(Clone, Debug)]
@@ -278,10 +280,12 @@ pub(crate) struct AcquiredSnapshot {
     commit: CommitId,
     selection: SelectionId,
     files: Box<[AcquiredSnapshotFile]>,
+    lease: Arc<SnapshotLease>,
 }
 
 impl AcquiredSnapshot {
-    fn from_owned(commit: CommitId, selection: SelectionId, files: Vec<OwnedSnapshotFile>) -> Self {
+    fn from_owned(commit: CommitId, selection: SelectionId, snapshot: OwnedSnapshotRead) -> Self {
+        let (files, lease) = snapshot.into_parts();
         Self {
             commit,
             selection,
@@ -290,6 +294,7 @@ impl AcquiredSnapshot {
                 .map(AcquiredSnapshotFile::from)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            lease,
         }
     }
 
@@ -323,6 +328,7 @@ impl From<CompatibleSnapshot> for AcquiredSnapshot {
             commit: snapshot.commit().clone(),
             selection: *snapshot.selection(),
             files,
+            lease: Arc::clone(snapshot.lease()),
         }
     }
 }
