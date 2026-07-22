@@ -831,6 +831,138 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "network")]
+    #[test]
+    fn automatic_download_reports_fixture_retry_exhaustion_without_publication()
+    -> Result<(), Box<dyn Error>> {
+        use crate::hub_protocol::HubProtocol;
+        use crate::reqwest_transport::ReqwestTransport;
+        use crate::test_http_fixture::{Exchange, ExpectedRequest, ScriptedHub, ScriptedResponse};
+
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let path = RepoPath::parse("model.bin")?;
+        let request_path = format!("/org/repo/resolve/{}/model.bin", commit.as_str());
+        let fixture = ScriptedHub::start((0..2).map(|_attempt| {
+            Exchange::new(
+                ExpectedRequest::get(&request_path),
+                ScriptedResponse::new(503, b"unavailable".as_slice()),
+            )
+        }))?;
+        let protocol = Arc::new(HubProtocol::new(
+            Endpoint::parse(fixture.endpoint())?,
+            Arc::new(ReqwestTransport::build()?),
+        )?);
+        let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let entry = HubTreeEntry::new(10, "opaque")?;
+        let (_directory, kernel) = kernel()?;
+        let kernel = Arc::new(kernel);
+        let policy = RetryPolicy::new(
+            2,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(2),
+        )
+        .ok_or("invalid retry policy")?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(kernel.download_file(
+            protocol,
+            repository,
+            commit.clone(),
+            path.clone(),
+            entry,
+            None,
+            policy,
+            &NoDelayClock,
+            CancellationToken::new(),
+            Arc::new(crate::progress::NoopProgress),
+        ));
+        let observed = fixture.finish();
+        let error = result.expect_err("retry exhaustion unexpectedly succeeded");
+        assert!(error.is_retryable());
+        assert!(!kernel.partial_data_path(&commit, &path)?.try_exists()?);
+        assert_eq!(observed?.len(), 2);
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn fixture_changed_validator_discards_opaque_resume_before_publication()
+    -> Result<(), Box<dyn Error>> {
+        use crate::hub_protocol::HubProtocol;
+        use crate::reqwest_transport::ReqwestTransport;
+        use crate::test_http_fixture::{Exchange, ExpectedRequest, ScriptedHub, ScriptedResponse};
+
+        let expected = b"opaque bytes";
+        let split = 4_usize;
+        let commit = CommitId::parse("0123456789abcdef0123456789abcdef01234567")?;
+        let path = RepoPath::parse("opaque.bin")?;
+        let entry = HubTreeEntry::new(expected.len() as u64, "opaque-remote-id")?;
+        let (_directory, kernel) = kernel()?;
+        let mut disconnected = DisconnectingBody {
+            chunk: Some(Box::<[u8]>::from(&expected[..split])),
+        };
+        run_ready(kernel.stream_fresh_file_to_blob(
+            &mut disconnected,
+            &commit,
+            &path,
+            &entry,
+            Some("old-etag"),
+            &CancellationToken::new(),
+            &crate::progress::NoopProgress,
+        ))
+        .expect_err("published a disconnected prefix");
+
+        let request_path = format!("/org/repo/resolve/{}/opaque.bin", commit.as_str());
+        let fixture = ScriptedHub::start([Exchange::new(
+            ExpectedRequest::get(&request_path)
+                .header("range", &format!("bytes={split}-"))
+                .header("if-range", "old-etag"),
+            ScriptedResponse::new(206, &expected[split..])
+                .header(
+                    "content-range",
+                    &format!("bytes {split}-{}/{}", expected.len() - 1, expected.len()),
+                )
+                .header("etag", "new-etag"),
+        )])?;
+        let protocol = HubProtocol::new(
+            Endpoint::parse(fixture.endpoint())?,
+            Arc::new(ReqwestTransport::build()?),
+        )?;
+        let repository = RepositorySpec::model(RepositoryId::parse("org/repo")?);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(async {
+            let mut response = protocol
+                .request_file(
+                    &repository,
+                    &commit,
+                    &path,
+                    Some((split as u64, Some("old-etag"))),
+                    None,
+                )
+                .await?;
+            kernel
+                .consume_file_response(
+                    &mut response,
+                    &commit,
+                    &path,
+                    &entry,
+                    Some((split as u64, Some("old-etag"))),
+                    &CancellationToken::new(),
+                    &crate::progress::NoopProgress,
+                )
+                .await
+        });
+        let observed = fixture.finish();
+        let error = result.expect_err("accepted a changed opaque validator");
+        assert!(error.is_validation());
+        assert!(!kernel.partial_data_path(&commit, &path)?.try_exists()?);
+        assert_eq!(observed?.len(), 1);
+        Ok(())
+    }
+
     #[test]
     fn resumed_content_with_the_wrong_identity_is_discarded() -> Result<(), Box<dyn Error>> {
         let (_directory, kernel) = kernel()?;
