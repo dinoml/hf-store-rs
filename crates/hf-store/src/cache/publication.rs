@@ -26,11 +26,12 @@ use super::metadata::{
     decode_record, encode_record,
 };
 use super::rooted_fs::{
-    CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedRegularFile,
-    RootedWrite, StagingName, is_reparse_point, is_unsafe_cache_path_error, unsafe_cache_path,
+    CacheRoot, CreateOnceOutcome, RootedEntryKind, RootedFileSystem, RootedLockGuard,
+    RootedRegularFile, RootedWrite, StagingName, is_reparse_point, is_unsafe_cache_path_error,
+    unsafe_cache_path,
 };
 #[cfg(test)]
-use super::rooted_fs::{RootedLockAttempt, RootedLockGuard, RootedRead};
+use super::rooted_fs::{RootedLockAttempt, RootedRead};
 use super::sanitized_io::SanitizedIo;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -576,6 +577,17 @@ impl CacheKernel {
         path: &RepoPath,
     ) -> Result<PathBuf, CacheError> {
         Ok(self.layout.partial_data(commit, path)?)
+    }
+
+    pub(super) fn lock_partial(
+        &self,
+        commit: &CommitId,
+        path: &RepoPath,
+    ) -> Result<Box<dyn RootedLockGuard>, CacheError> {
+        let lock = self.layout.partial_lock(commit, path)?;
+        self.ensure_parent(&lock)?;
+        let relative = self.relative_path(&lock)?;
+        Ok(self.root.lock_exclusive(relative)?)
     }
 
     pub(super) fn partial_data_size(
