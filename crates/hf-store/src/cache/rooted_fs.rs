@@ -543,7 +543,7 @@ fn normal_components(path: &Path) -> io::Result<Vec<&std::ffi::OsStr>> {
 
 #[cfg(unix)]
 fn sync_open_directory(directory: &Dir) -> io::Result<()> {
-    directory.try_clone()?.into_std_file().sync_all()
+    directory.open(".")?.sync_all()
 }
 
 #[cfg(not(unix))]

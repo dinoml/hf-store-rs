@@ -1418,7 +1418,7 @@ mod tests {
             .read_snapshot_file(&index, &crate::RepoPath::parse("config.json")?)
             .expect_err("followed a final symlink installed between classification and open");
 
-        assert!(error.is_corrupt());
+        assert!(error.is_unsafe());
         Ok(())
     }
 

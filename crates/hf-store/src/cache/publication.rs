@@ -2064,7 +2064,7 @@ mod tests {
             .kernel
             .publish_blob(Cursor::new(payload), u64::try_from(payload.len())?, digest)
             .expect_err("an immutable blob destination symlink must be rejected");
-        assert!(error.is_corrupt_existing_blob());
+        assert!(error.is_unsafe());
         assert!(
             std::fs::symlink_metadata(&destination)?
                 .file_type()
