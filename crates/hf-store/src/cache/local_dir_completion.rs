@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -279,6 +279,14 @@ pub(super) struct LocalDirOfflineSnapshot {
 }
 
 impl LocalDirOfflineSnapshot {
+    pub(super) const fn commit(&self) -> &CommitId {
+        &self.commit
+    }
+
+    pub(super) const fn selection(&self) -> &SelectionId {
+        &self.selection
+    }
+
     pub(super) const fn files(&self) -> &[LocalDirOfflineFile] {
         &self.files
     }
@@ -308,6 +316,14 @@ impl LocalDirOfflineFile {
 
     pub(super) const fn digest(&self) -> BlobDigest {
         self.digest
+    }
+
+    pub(super) fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub(super) const fn size(&self) -> u64 {
+        self.size
     }
 }
 

@@ -3,21 +3,29 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(feature = "network")]
+use crate::AuthToken;
 use crate::error::{CacheFailure, HubOperationError};
 #[cfg(feature = "network")]
 use crate::progress::ProgressObserver;
 #[cfg(feature = "network")]
 use crate::transfer::{RetryPolicy, TokioRetryClock};
-#[cfg(feature = "network")]
-use crate::{AuthToken, CancellationToken};
-use crate::{CommitId, Endpoint, FetchPlan, RepoPath, RepositorySpec, Revision};
+use crate::{CancellationToken, CommitId, Endpoint, FetchPlan, RepoPath, RepositorySpec, Revision};
 
 use super::CacheView;
 use super::compatible_cache::{CompatibleCacheError, CompatibleCacheOffline, CompatibleSnapshot};
 use super::key::{BlobDigest, SelectionId};
+use super::local_dir_completion::{LocalDirOfflineError, LocalDirOfflineReader};
+use super::local_dir_layout::HubLocalDirLayout;
+use super::local_dir_materialization::{ExistingFilePolicy, LocalDirFileTarget};
+use super::local_dir_reconciliation::{
+    LocalDirReconciler, LocalDirReconciliationOutcome, LocalDirReconciliationPlan,
+    OwnedBlobCandidates, ThreadYieldWait,
+};
 use super::publication::{
     CacheError, CacheKernel, Effects, OwnedSnapshotFile, OwnedSnapshotRead, SnapshotLease,
 };
+use super::rooted_fs::{CacheRoot, RootedFileSystem};
 use super::standard_cache::StandardCacheWriter;
 
 #[derive(Clone, Debug)]
@@ -134,6 +142,85 @@ impl AcquisitionCache {
             CacheView::Owned => self.activate_owned(plan, digests),
             CacheView::Compatible => self.activate_compatible(plan, digests),
         }
+    }
+
+    pub(crate) fn materialize_local_dir(
+        &self,
+        plan: &FetchPlan,
+        snapshot: &AcquiredSnapshot,
+        destination: &Path,
+        replace_existing: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<MaterializedLocalDir, HubOperationError> {
+        std::fs::create_dir_all(destination)
+            .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?;
+        let layout = HubLocalDirLayout::new(destination, plan.endpoint(), plan.repository())
+            .map_err(HubOperationError::validation)?;
+        let root: Arc<dyn RootedFileSystem> = Arc::new(
+            CacheRoot::open(destination)
+                .map_err(|_source| HubOperationError::cache(CacheFailure::Io))?,
+        );
+        let targets = plan
+            .files()
+            .iter()
+            .map(|file| {
+                let digest = snapshot
+                    .files()
+                    .iter()
+                    .find(|cached| cached.path() == file.path())
+                    .map(AcquiredSnapshotFile::digest)
+                    .ok_or_else(|| HubOperationError::cache(CacheFailure::Incomplete))?;
+                Ok(LocalDirFileTarget::new(
+                    file.path().clone(),
+                    file.entry().clone(),
+                    digest,
+                ))
+            })
+            .collect::<Result<Vec<_>, HubOperationError>>()?;
+        let reconciliation = LocalDirReconciliationPlan::new(
+            layout.clone(),
+            plan.commit().clone(),
+            plan.selection(),
+            targets,
+        )
+        .map_err(map_local_dir_error)?;
+        let reconciler =
+            LocalDirReconciler::new(root, Effects::production(), Arc::new(ThreadYieldWait));
+        let mut candidates = OwnedBlobCandidates::new(self.transfer.as_ref().clone());
+        let policy = if replace_existing {
+            ExistingFilePolicy::ReplaceRegularFile
+        } else {
+            ExistingFilePolicy::Reject
+        };
+        let report = match reconciler
+            .reconcile(&reconciliation, &mut candidates, policy, cancellation)
+            .map_err(map_local_dir_error)?
+        {
+            LocalDirReconciliationOutcome::Reconciled(report) => report,
+            LocalDirReconciliationOutcome::NeedsTransport(_demand) => {
+                return Err(HubOperationError::cache(CacheFailure::Incomplete));
+            }
+        };
+        let files = report
+            .files()
+            .iter()
+            .map(|file| {
+                Ok(MaterializedLocalDirFile {
+                    path: file.path().clone(),
+                    local_path: layout
+                        .file_path(file.path())
+                        .map_err(HubOperationError::validation)?,
+                    digest: file.digest(),
+                    size: file.size(),
+                })
+            })
+            .collect::<Result<Vec<_>, HubOperationError>>()?;
+        Ok(MaterializedLocalDir {
+            root: destination.to_path_buf(),
+            commit: report.commit().clone(),
+            selection: *report.selection_id(),
+            files: files.into_boxed_slice(),
+        })
     }
 
     fn activate_owned(
@@ -273,6 +360,45 @@ impl OfflineCache {
                 .map_err(map_compatible_error),
         }
     }
+
+    pub(crate) fn open_local_dir(
+        root: &Path,
+        endpoint: &Endpoint,
+        repository: &RepositorySpec,
+        commit: &CommitId,
+        paths: &[RepoPath],
+    ) -> Result<MaterializedLocalDir, HubOperationError> {
+        let layout = HubLocalDirLayout::new(root, endpoint, repository)
+            .map_err(HubOperationError::validation)?;
+        let rooted: Arc<dyn RootedFileSystem> = Arc::new(
+            CacheRoot::open(root).map_err(|_source| HubOperationError::cache(CacheFailure::Io))?,
+        );
+        let mut selected = paths.to_vec();
+        selected.sort_unstable();
+        selected.dedup();
+        let selection = SelectionId::derive(&selected).map_err(HubOperationError::validation)?;
+        let snapshot = LocalDirOfflineReader::new(layout, rooted)
+            .map_err(map_local_dir_offline_error)?
+            .open(commit, &selection)
+            .map_err(map_local_dir_offline_error)?;
+        let files = snapshot
+            .files()
+            .iter()
+            .map(|file| MaterializedLocalDirFile {
+                path: file.path().clone(),
+                local_path: file.destination().to_path_buf(),
+                digest: file.digest(),
+                size: file.size(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(MaterializedLocalDir {
+            root: root.to_path_buf(),
+            commit: snapshot.commit().clone(),
+            selection: *snapshot.selection(),
+            files,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +467,22 @@ pub(crate) struct AcquiredSnapshotFile {
     size: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializedLocalDir {
+    pub(crate) root: PathBuf,
+    pub(crate) commit: CommitId,
+    pub(crate) selection: SelectionId,
+    pub(crate) files: Box<[MaterializedLocalDirFile]>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializedLocalDirFile {
+    pub(crate) path: RepoPath,
+    pub(crate) local_path: PathBuf,
+    pub(crate) digest: BlobDigest,
+    pub(crate) size: u64,
+}
+
 impl From<OwnedSnapshotFile> for AcquiredSnapshotFile {
     fn from(file: OwnedSnapshotFile) -> Self {
         Self {
@@ -402,4 +544,35 @@ fn map_cache_error(error: CacheError) -> HubOperationError {
         CacheFailure::Io
     };
     HubOperationError::cache(failure)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the private detailed cause is deliberately consumed at the public classification boundary"
+)]
+fn map_local_dir_offline_error(error: LocalDirOfflineError) -> HubOperationError {
+    let failure = if error.is_incomplete() || error.is_stale() {
+        CacheFailure::Incomplete
+    } else {
+        CacheFailure::Corrupt
+    };
+    HubOperationError::cache(failure)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the private detailed cause is deliberately consumed at the public classification boundary"
+)]
+fn map_local_dir_error(
+    error: super::local_dir_reconciliation::LocalDirReconciliationError,
+) -> HubOperationError {
+    if error.is_cancelled() {
+        HubOperationError::cancelled()
+    } else if error.is_plan_invalid() {
+        HubOperationError::protocol()
+    } else if error.is_conflict() || error.is_final_validation() {
+        HubOperationError::cache(CacheFailure::Corrupt)
+    } else {
+        HubOperationError::cache(CacheFailure::Io)
+    }
 }

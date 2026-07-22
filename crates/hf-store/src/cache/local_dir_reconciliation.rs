@@ -104,6 +104,16 @@ pub(super) trait LockWait: Debug + Send + Sync {
     fn wait(&self, cancellation: &dyn Cancellation) -> io::Result<()>;
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ThreadYieldWait;
+
+impl LockWait for ThreadYieldWait {
+    fn wait(&self, _cancellation: &dyn Cancellation) -> io::Result<()> {
+        std::thread::yield_now();
+        Ok(())
+    }
+}
+
 /// Supplies already-local validated bytes without owning a network transport.
 pub(super) trait LocalDirCandidateSet: Debug + Send {
     fn prepare_local(

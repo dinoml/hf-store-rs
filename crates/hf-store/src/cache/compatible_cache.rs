@@ -128,12 +128,18 @@ impl CompatibleCacheOffline {
     ) -> Result<CompatibleSnapshot, CompatibleCacheError> {
         let selection = ExactSelection::new(paths)?;
         let index = self.reader.read_index(revision)?;
-        let lease = self
-            .sidecar
-            .acquire_snapshot_lease(index.commit(), &selection.id)?;
         let manifest = self
             .sidecar
             .read_snapshot_manifest(index.commit(), &selection.id)?;
+        let lease = self
+            .sidecar
+            .acquire_snapshot_lease(index.commit(), &selection.id)?;
+        let leased_manifest = self
+            .sidecar
+            .read_snapshot_manifest(index.commit(), &selection.id)?;
+        if leased_manifest != manifest {
+            return Err(CompatibleCacheError::corrupt());
+        }
         if manifest.files().len() != selection.paths.len() {
             return Err(CompatibleCacheError::corrupt());
         }

@@ -34,6 +34,12 @@ impl Cancellation for NeverCancelled {
     }
 }
 
+impl Cancellation for crate::CancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct LocalDirFileTarget {
     path: RepoPath,

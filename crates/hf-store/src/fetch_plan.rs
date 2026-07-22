@@ -91,6 +91,10 @@ impl FetchPlan {
     pub(crate) const fn tree(&self) -> &HubTree {
         &self.tree
     }
+
+    pub(crate) const fn selection(&self) -> &RepositorySelection {
+        &self.selection
+    }
 }
 
 impl PlannedFile {

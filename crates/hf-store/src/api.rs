@@ -4,6 +4,7 @@ use std::sync::Arc;
 #[cfg(feature = "network")]
 use std::sync::Mutex;
 
+use crate::LocalDirectory;
 #[cfg(feature = "network")]
 use crate::cache::AcquisitionCache;
 use crate::cache::{CacheView, OfflineCache, RepositoryFilter};
@@ -245,6 +246,17 @@ pub struct HubStore {
     transport: Mutex<Option<Arc<dyn Transport>>>,
 }
 
+#[cfg(feature = "network")]
+struct CompletedAcquisition {
+    repository: RepositorySpec,
+    requested_revision: Revision,
+    plan: Arc<FetchPlan>,
+    cache: Arc<AcquisitionCache>,
+    acquired: crate::cache::AcquiredSnapshot,
+    reused: bool,
+    cancellation: CancellationToken,
+}
+
 impl HubStore {
     /// Starts a builder using the canonical Hugging Face endpoint.
     #[must_use]
@@ -286,6 +298,60 @@ impl HubStore {
         request: FetchRequest,
         options: FetchOptions,
     ) -> Result<Snapshot, HubOperationError> {
+        let completed = self.acquire(request, options).await?;
+        Ok(Snapshot::from_acquired(
+            self.endpoint.clone(),
+            completed.repository,
+            completed.requested_revision,
+            &completed.acquired,
+            completed.reused,
+        ))
+    }
+
+    /// Acquires a snapshot and independently reconciles it into a caller-owned directory.
+    ///
+    /// Existing unrelated files are preserved. A differing selected regular file
+    /// is rejected unless `replace_existing` is true; links, directories, and
+    /// other special entries are always rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified planning, transfer, cache, cancellation, or local
+    /// destination conflict error.
+    #[cfg(feature = "network")]
+    pub async fn fetch_to_local_dir(
+        &self,
+        request: FetchRequest,
+        options: FetchOptions,
+        destination: impl AsRef<Path>,
+        replace_existing: bool,
+    ) -> Result<LocalDirectory, HubOperationError> {
+        let completed = self.acquire(request, options).await?;
+        let materialized = completed.cache.materialize_local_dir(
+            completed.plan.as_ref(),
+            &completed.acquired,
+            destination.as_ref(),
+            replace_existing,
+            &completed.cancellation,
+        )?;
+        Ok(LocalDirectory::from_materialized(
+            self.endpoint.clone(),
+            completed.repository,
+            completed.requested_revision,
+            materialized,
+        ))
+    }
+
+    #[cfg(feature = "network")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acquisition orchestration keeps planning, cache reuse, bounded transfer, and activation policy visible in one boundary"
+    )]
+    async fn acquire(
+        &self,
+        request: FetchRequest,
+        options: FetchOptions,
+    ) -> Result<CompletedAcquisition, HubOperationError> {
         use std::collections::BTreeMap;
         use std::time::Duration;
 
@@ -316,14 +382,16 @@ impl HubStore {
             self.cache_mode.view(),
         )?);
         match cache.open_plan(plan.as_ref()) {
-            Ok(snapshot) => {
-                return Ok(Snapshot::from_acquired(
-                    self.endpoint.clone(),
-                    request.repository,
-                    request.revision,
-                    &snapshot,
-                    true,
-                ));
+            Ok(acquired) => {
+                return Ok(CompletedAcquisition {
+                    repository: request.repository,
+                    requested_revision: request.revision,
+                    plan,
+                    cache,
+                    acquired,
+                    reused: true,
+                    cancellation: options.cancellation,
+                });
             }
             Err(error)
                 if matches!(
@@ -332,7 +400,6 @@ impl HubStore {
                 ) => {}
             Err(error) => return Err(error),
         }
-
         let retry_policy = crate::transfer::RetryPolicy::new(
             options.max_attempts,
             Duration::from_millis(200),
@@ -377,13 +444,15 @@ impl HubStore {
         .await?;
         let digests = downloaded.into_iter().collect::<BTreeMap<_, _>>();
         let acquired = cache.activate(plan.as_ref(), &digests)?;
-        Ok(Snapshot::from_acquired(
-            self.endpoint.clone(),
-            request.repository,
-            request.revision,
-            &acquired,
-            false,
-        ))
+        Ok(CompletedAcquisition {
+            repository: request.repository,
+            requested_revision: request.revision,
+            plan,
+            cache,
+            acquired,
+            reused: false,
+            cancellation: options.cancellation,
+        })
     }
 
     /// Reports an unavailable network backend in cache-only builds.
@@ -507,6 +576,41 @@ impl OfflineStore {
         ))
     }
 
+    /// Opens and fully revalidates a completed caller-owned local directory.
+    ///
+    /// The exact immutable commit and selected path set must match the
+    /// completion record written by [`HubStore::fetch_to_local_dir`]. No cache
+    /// root or transport capability is consulted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified cache error when completion metadata is absent or
+    /// stale, or when any selected file no longer matches its recorded size and
+    /// digest.
+    pub fn open_local_dir(
+        &self,
+        destination: impl AsRef<Path>,
+        repository: &RepositorySpec,
+        commit: &crate::CommitId,
+        paths: &[RepoPath],
+    ) -> Result<LocalDirectory, HubOperationError> {
+        let materialized = OfflineCache::open_local_dir(
+            destination.as_ref(),
+            &self.endpoint,
+            repository,
+            commit,
+            paths,
+        )?;
+        let requested_revision =
+            Revision::parse(commit.as_str()).map_err(HubOperationError::validation)?;
+        Ok(LocalDirectory::from_materialized(
+            self.endpoint.clone(),
+            repository.clone(),
+            requested_revision,
+            materialized,
+        ))
+    }
+
     /// Returns the configured cache root.
     #[must_use]
     pub fn cache_root(&self) -> &Path {
@@ -582,6 +686,10 @@ mod tests {
 
     #[cfg(feature = "network")]
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end fixture proves online acquisition, independent local materialization, and both offline reopen paths"
+    )]
     fn public_fetch_downloads_then_reuses_a_complete_snapshot_without_file_body_bytes()
     -> Result<(), Box<dyn Error>> {
         use crate::cache::BlobDigest;
@@ -645,21 +753,31 @@ mod tests {
         assert_eq!(std::fs::read(file.local_path())?, bytes);
         assert_eq!(file.sha256(), digest);
 
-        let second = runtime.block_on(store.fetch(request()?, FetchOptions::default()))?;
-        assert!(second.was_reused());
-        assert_eq!(second.commit().as_str(), COMMIT);
-        assert_eq!(
-            std::fs::read(
-                second
-                    .file(&path)
-                    .ok_or("reused file missing")?
-                    .local_path()
-            )?,
-            bytes
-        );
+        let local_root = directory.path().join("local-dir");
+        let local = runtime.block_on(store.fetch_to_local_dir(
+            request()?,
+            FetchOptions::default(),
+            &local_root,
+            false,
+        ))?;
+        assert_eq!(local.commit().as_str(), COMMIT);
+        assert_eq!(local.root(), local_root);
+        assert_eq!(std::fs::read(local.files()[0].local_path())?, bytes);
+        assert_ne!(local.files()[0].local_path(), file.local_path());
         let offline = OfflineStore::new(directory.path())
             .endpoint(first.endpoint().clone())
             .cache_mode(CacheMode::Owned);
+        let reopened_local = offline.open_local_dir(
+            &local_root,
+            first.repository(),
+            first.commit(),
+            std::slice::from_ref(&path),
+        )?;
+        assert_eq!(reopened_local.selection_id(), local.selection_id());
+        assert_eq!(
+            std::fs::read(reopened_local.files()[0].local_path())?,
+            bytes
+        );
         let offline_snapshot = offline.open(
             first.repository(),
             &Revision::parse("main")?,
@@ -676,6 +794,16 @@ mod tests {
             )?,
             bytes
         );
+        std::fs::write(local.files()[0].local_path(), b"changed")?;
+        let stale = offline
+            .open_local_dir(
+                &local_root,
+                first.repository(),
+                first.commit(),
+                std::slice::from_ref(&path),
+            )
+            .expect_err("modified local directory unexpectedly remained complete");
+        assert!(stale.is_cache());
         assert_eq!(fixture.finish()?.len(), 5);
         Ok(())
     }
