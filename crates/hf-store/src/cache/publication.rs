@@ -38,6 +38,10 @@ const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_SMALL_RECORD_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
+fn has_json_extension(name: &str) -> bool {
+    Path::new(name).extension() == Some(std::ffi::OsStr::new("json"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PublicationPoint {
     AfterStagingCreate,
@@ -403,6 +407,14 @@ pub(super) struct CacheInventoryEntry {
     pub(super) relative_path: Box<str>,
     pub(super) namespace: Box<str>,
     pub(super) kind: RootedEntryKind,
+    pub(super) metadata_state: CacheInventoryMetadataState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CacheInventoryMetadataState {
+    Recognized,
+    Corrupt,
+    Unsupported,
 }
 
 #[derive(Clone, Debug)]
@@ -491,12 +503,65 @@ impl CacheKernel {
                 relative_path: child.to_string_lossy().replace('\\', "/").into(),
                 namespace: namespace.into(),
                 kind,
+                metadata_state: self.inventory_metadata_state(&child, namespace, kind)?,
             });
             if kind == RootedEntryKind::Directory {
                 self.walk_inventory(&child, namespace, entries)?;
             }
         }
         Ok(())
+    }
+
+    fn inventory_metadata_state(
+        &self,
+        path: &Path,
+        namespace: &str,
+        kind: RootedEntryKind,
+    ) -> Result<CacheInventoryMetadataState, CacheError> {
+        if kind != RootedEntryKind::RegularFile {
+            return Ok(CacheInventoryMetadataState::Recognized);
+        }
+        let name = path.file_name().and_then(std::ffi::OsStr::to_str);
+        let state = match (namespace, name) {
+            ("refs", Some(name)) if has_json_extension(name) => {
+                Self::decode_inventory::<RefRecord>(
+                    self.root
+                        .read_regular_bounded(path, MAX_SMALL_RECORD_BYTES)?,
+                )
+            }
+            ("trees", Some(name)) if has_json_extension(name) => {
+                Self::decode_inventory::<super::metadata::RemoteTreeRecord>(
+                    self.root
+                        .read_regular_bounded(path, MAX_MANIFEST_RECORD_BYTES)?,
+                )
+            }
+            ("snapshots", Some("manifest.json")) => {
+                Self::decode_inventory::<SnapshotManifestRecord>(
+                    self.root
+                        .read_regular_bounded(path, MAX_MANIFEST_RECORD_BYTES)?,
+                )
+            }
+            ("partials", Some(name)) if has_json_extension(name) => {
+                Self::decode_inventory::<PartialTransferRecord>(
+                    self.root
+                        .read_regular_bounded(path, MAX_SMALL_RECORD_BYTES)?,
+                )
+            }
+            _ => return Ok(CacheInventoryMetadataState::Recognized),
+        };
+        Ok(state)
+    }
+
+    fn decode_inventory<T: CacheRecord>(
+        read: super::rooted_fs::RootedRead,
+    ) -> CacheInventoryMetadataState {
+        match read.bytes().as_deref().map(decode_record::<T>) {
+            Some(Ok(_record)) => CacheInventoryMetadataState::Recognized,
+            Some(Err(error)) if error.is_unknown_version() => {
+                CacheInventoryMetadataState::Unsupported
+            }
+            Some(Err(_)) | None => CacheInventoryMetadataState::Corrupt,
+        }
     }
     pub(super) fn new(
         root: impl AsRef<Path>,
@@ -603,7 +668,7 @@ impl CacheKernel {
                     expected_size,
                     expected_digest,
                 )?;
-                self.root.remove_file(&staging_relative)?;
+                self.remove_staging_if_present(&staging_relative, false)?;
                 cleanup.deactivate();
                 return Ok(BlobPublication::new(
                     destination,
@@ -630,9 +695,7 @@ impl CacheKernel {
                 )
                 .map_err(CacheError::with_may_have_published)?;
                 self.check_fault(PublicationPoint::AfterBlobPublish, true)?;
-                self.root
-                    .remove_file(&staging_relative)
-                    .map_err(|source| CacheError::io(&source, true))?;
+                self.remove_staging_if_present(&staging_relative, true)?;
                 cleanup.deactivate();
                 self.sync_parent(&destination)
                     .map_err(|source| CacheError::io(&source, true))?;
@@ -648,13 +711,25 @@ impl CacheKernel {
                     expected_size,
                     expected_digest,
                 )?;
-                self.root.remove_file(&staging_relative)?;
+                self.remove_staging_if_present(&staging_relative, false)?;
                 cleanup.deactivate();
                 Ok(BlobPublication::new(
                     destination,
                     BlobPublicationOutcome::Reused,
                 ))
             }
+        }
+    }
+
+    fn remove_staging_if_present(
+        &self,
+        path: &Path,
+        may_have_published: bool,
+    ) -> Result<(), CacheError> {
+        match self.root.remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CacheError::io(&error, may_have_published)),
         }
     }
 

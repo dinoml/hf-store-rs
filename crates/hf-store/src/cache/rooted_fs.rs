@@ -80,6 +80,15 @@ pub(super) enum RootedRead {
     Bytes(Vec<u8>),
 }
 
+impl RootedRead {
+    pub(super) fn bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::Missing | Self::Other => None,
+        }
+    }
+}
+
 /// The outcome of create-once publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CreateOnceOutcome {

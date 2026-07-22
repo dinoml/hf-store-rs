@@ -327,8 +327,23 @@ impl OfflineCache {
             .map(|entry| InventoryRecord {
                 relative_path: entry.relative_path,
                 namespace: entry.namespace,
-                is_directory: entry.kind == super::rooted_fs::RootedEntryKind::Directory,
-                is_unsafe: entry.kind == super::rooted_fs::RootedEntryKind::Other,
+                kind: match entry.kind {
+                    super::rooted_fs::RootedEntryKind::Directory => InventoryRecordKind::Directory,
+                    super::rooted_fs::RootedEntryKind::Other => InventoryRecordKind::Unsafe,
+                    super::rooted_fs::RootedEntryKind::Missing
+                    | super::rooted_fs::RootedEntryKind::RegularFile => InventoryRecordKind::File,
+                },
+                metadata: match entry.metadata_state {
+                    super::publication::CacheInventoryMetadataState::Recognized => {
+                        InventoryRecordMetadata::Recognized
+                    }
+                    super::publication::CacheInventoryMetadataState::Corrupt => {
+                        InventoryRecordMetadata::Corrupt
+                    }
+                    super::publication::CacheInventoryMetadataState::Unsupported => {
+                        InventoryRecordMetadata::Unsupported
+                    }
+                },
             })
             .collect())
     }
@@ -423,8 +438,22 @@ impl OfflineCache {
 pub(crate) struct InventoryRecord {
     pub(crate) relative_path: Box<str>,
     pub(crate) namespace: Box<str>,
-    pub(crate) is_directory: bool,
-    pub(crate) is_unsafe: bool,
+    pub(crate) kind: InventoryRecordKind,
+    pub(crate) metadata: InventoryRecordMetadata,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryRecordKind {
+    File,
+    Directory,
+    Unsafe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryRecordMetadata {
+    Recognized,
+    Corrupt,
+    Unsupported,
 }
 
 #[derive(Clone, Debug)]

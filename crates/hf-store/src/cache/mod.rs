@@ -3,8 +3,8 @@ mod compatible_cache;
 pub(crate) use acquisition::AcquiredSnapshotFileForm;
 #[cfg(feature = "network")]
 pub(crate) use acquisition::AcquisitionCache;
-pub(crate) use acquisition::InventoryRecord;
 pub(crate) use acquisition::{AcquiredSnapshot, AcquiredSnapshotFile, OfflineCache};
+pub(crate) use acquisition::{InventoryRecord, InventoryRecordKind, InventoryRecordMetadata};
 pub(crate) use acquisition::{MaterializedLocalDir, MaterializedLocalDirFile};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CacheView {

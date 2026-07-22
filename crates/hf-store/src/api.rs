@@ -880,6 +880,12 @@ mod tests {
             )
             .expect_err("modified local directory unexpectedly remained complete");
         assert!(stale.is_cache());
+        std::fs::write(first.directory().join("manifest.json"), b"{not-json")?;
+        let corrupt_inventory = offline.inspect_repository(first.repository())?;
+        assert!(corrupt_inventory.entries().iter().any(|entry| {
+            entry.path().contains("manifest.json")
+                && entry.state() == crate::InventoryState::Corrupt
+        }));
         assert_eq!(fixture.finish()?.len(), 5);
         Ok(())
     }

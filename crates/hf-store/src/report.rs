@@ -17,6 +17,10 @@ pub enum InventoryState {
     Trash,
     /// A link, reparse point, or special entry blocks safe classification.
     Unsafe,
+    /// Recognized metadata is malformed or inconsistent.
+    Corrupt,
+    /// Recognized metadata uses an unsupported version.
+    UnsupportedVersion,
 }
 
 /// One cache-relative entry in a repository inventory.
@@ -61,8 +65,12 @@ impl CacheInventoryReport {
         let entries = records
             .into_iter()
             .map(|record| {
-                let state = if record.is_unsafe {
+                let state = if record.kind == crate::cache::InventoryRecordKind::Unsafe {
                     InventoryState::Unsafe
+                } else if record.metadata == crate::cache::InventoryRecordMetadata::Unsupported {
+                    InventoryState::UnsupportedVersion
+                } else if record.metadata == crate::cache::InventoryRecordMetadata::Corrupt {
+                    InventoryState::Corrupt
                 } else {
                     match record.namespace.as_ref() {
                         "staging" => InventoryState::Staging,
@@ -74,7 +82,7 @@ impl CacheInventoryReport {
                 InventoryEntry {
                     path: record.relative_path,
                     state,
-                    directory: record.is_directory,
+                    directory: record.kind == crate::cache::InventoryRecordKind::Directory,
                 }
             })
             .collect();
